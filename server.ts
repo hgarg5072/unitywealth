@@ -10,7 +10,7 @@ import axios from "axios";
 import { Resend } from "resend";
 import { OAuth2Client } from "google-auth-library";
 import { parseStringPromise } from 'xml2js';
-import { GoogleGenAI } from "@google/genai";
+import https from "https";
 import crypto from "crypto";
 import { initializeApp, getApps, cert } from "firebase-admin/app";
 import { getFirestore, FieldValue } from "firebase-admin/firestore";
@@ -43,18 +43,66 @@ const firestore = getFirestoreInstance();
 
 const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
 
-function getAIClient() {
-  if (!process.env.GEMINI_API_KEY) {
+const ipv4HttpsAgent = new https.Agent({ family: 4, keepAlive: true });
+
+async function callGeminiJSON(parts: any[]): Promise<string> {
+  const apiKey = (process.env.GEMINI_API_KEY || "").trim();
+  if (!apiKey) {
     throw new Error("GEMINI_API_KEY is not configured");
   }
-  return new GoogleGenAI({
-    apiKey: process.env.GEMINI_API_KEY,
-    httpOptions: {
-      headers: {
-        'x-goog-api-client': 'aistudio-build',
+
+  const modelsToTry = [
+    {
+      model: "gemini-2.5-flash",
+      generationConfig: {
+        responseMimeType: "application/json",
+        temperature: 0.1,
+        thinkingConfig: { thinkingBudget: 0 }
+      }
+    },
+    {
+      model: "gemini-2.0-flash",
+      generationConfig: {
+        responseMimeType: "application/json",
+        temperature: 0.1
       }
     }
-  });
+  ];
+
+  let lastErr: any = null;
+  for (const candidate of modelsToTry) {
+    try {
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${candidate.model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+      const response = await axios.post(
+        url,
+        {
+          contents: [{ role: "user", parts }],
+          generationConfig: candidate.generationConfig
+        },
+        {
+          timeout: 55000,
+          httpsAgent: ipv4HttpsAgent,
+          maxBodyLength: Infinity,
+          maxContentLength: Infinity,
+          headers: { "Content-Type": "application/json" }
+        }
+      );
+      const outText = response.data?.candidates?.[0]?.content?.parts
+        ?.map((p: any) => p.text || "")
+        .join("") || "";
+      if (outText) return outText;
+      throw new Error(`Empty response from ${candidate.model}`);
+    } catch (err: any) {
+      const status = err?.response?.status;
+      const apiMsg = err?.response?.data?.error?.message || err.message;
+      console.warn(`[Gemini] ${candidate.model} failed (${status || "ERR"}): ${apiMsg}`);
+      lastErr = new Error(apiMsg);
+      if (status === 400 && /API key not valid/i.test(String(apiMsg))) {
+        throw lastErr;
+      }
+    }
+  }
+  throw lastErr || new Error("Gemini request failed");
 }
 
 async function startServer() {
@@ -567,13 +615,8 @@ async function startServer() {
       }
     });
 
-    const result = await getAIClient().models.generateContent({
-      model: "gemini-flash-latest",
-      contents: { parts: promptParts },
-      config: { responseMimeType: "application/json" }
-    });
-
-    const holdings = JSON.parse(result.text || "[]");
+    const rawJson = await callGeminiJSON(promptParts);
+    const holdings = JSON.parse((rawJson || "[]").replace(/```json/g, "").replace(/```/g, "").trim());
     
     // Bulk add to DB
     if (holdings.length > 0) {
@@ -1888,14 +1931,7 @@ BROKER, TICKER & CURRENCY RULES:
         promptParts[0].text += `\n\nFile Content:\n${String(content).slice(0, 350000)}`;
       }
 
-      const result = await getAIClient().models.generateContent({
-        model: "gemini-flash-latest",
-        contents: { parts: promptParts },
-        config: {
-          responseMimeType: "application/json"
-        }
-      });
-      const text = result.text;
+      const text = await callGeminiJSON(promptParts);
       const cleaned = (text || "").replace(/```json/g, "").replace(/```/g, "").trim();
       const parsed = JSON.parse(cleaned);
 
@@ -2056,6 +2092,8 @@ BROKER, TICKER & CURRENCY RULES:
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
+    // Pre-warm AMFI NAV cache in background
+    getAmfiData().catch((err) => console.warn("[AMFI] Background warmup failed:", err.message));
     
     // Background Monitoring: Check all households every 4 hours
     setInterval(() => {
