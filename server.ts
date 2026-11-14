@@ -53,7 +53,7 @@ async function callGeminiJSON(parts: any[]): Promise<string> {
 
   const modelsToTry = [
     {
-      model: "gemini-2.5-flash",
+      model: "gemini-3.8-flash",
       generationConfig: {
         responseMimeType: "application/json",
         temperature: 0.1,
@@ -61,7 +61,14 @@ async function callGeminiJSON(parts: any[]): Promise<string> {
       }
     },
     {
-      model: "gemini-2.0-flash",
+      model: "gemini-3.8-flash",
+      generationConfig: {
+        responseMimeType: "application/json",
+        temperature: 0.1
+      }
+    },
+    {
+      model: "gemini-flash-latest",
       generationConfig: {
         responseMimeType: "application/json",
         temperature: 0.1
