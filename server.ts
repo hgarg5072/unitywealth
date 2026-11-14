@@ -12,16 +12,29 @@ import { OAuth2Client } from "google-auth-library";
 import { parseStringPromise } from 'xml2js';
 import { GoogleGenAI } from "@google/genai";
 import crypto from "crypto";
-import { initializeApp, getApps } from "firebase-admin/app";
+import { initializeApp, getApps, cert } from "firebase-admin/app";
 import { getFirestore, FieldValue } from "firebase-admin/firestore";
 import firebaseConfig from "./firebase-applet-config.json";
 
 // Initialize Firebase Admin (Lazy helper)
 function getFirestoreInstance() {
   if (getApps().length === 0) {
-    initializeApp({
-      projectId: firebaseConfig.projectId,
-    });
+    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+      try {
+        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+        initializeApp({
+          credential: cert(serviceAccount),
+          projectId: firebaseConfig.projectId,
+        });
+      } catch (e) {
+        console.error("[Firestore] Invalid FIREBASE_SERVICE_ACCOUNT JSON, falling back:", e);
+        initializeApp({ projectId: firebaseConfig.projectId });
+      }
+    } else {
+      initializeApp({
+        projectId: firebaseConfig.projectId,
+      });
+    }
   }
   return getFirestore(firebaseConfig.firestoreDatabaseId);
 }
@@ -900,112 +913,147 @@ async function startServer() {
     }
   }
 
+  const YAHOO_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Accept': 'application/json'
+  };
+
+  const stockQuoteCache = new Map<string, { price: number; ts: number }>();
+  const QUOTE_CACHE_TTL_MS = 60 * 1000;
+
+  function toYahooSymbol(raw: string): string {
+    let sym = raw.trim().toUpperCase();
+    if (sym.includes(':')) {
+      const [exch, ticker] = sym.split(':');
+      if (exch === 'NSE') return `${ticker}.NS`;
+      if (exch === 'BSE') return `${ticker}.BO`;
+      return ticker;
+    }
+    if (sym.endsWith('.NSE')) return sym.replace(/\.NSE$/, '.NS');
+    if (sym.endsWith('.BSE')) return sym.replace(/\.BSE$/, '.BO');
+    if (sym.endsWith('.US')) return sym.replace(/\.US$/, '');
+    if (sym === 'BTC' || sym === 'BITCOIN') return 'BTC-USD';
+    if (sym === 'ETH' || sym === 'ETHEREUM') return 'ETH-USD';
+    return sym;
+  }
+
+  async function fetchYahooChartPrice(yahooSym: string): Promise<number | null> {
+    const hosts = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
+    for (const host of hosts) {
+      try {
+        const res = await axios.get(
+          `https://${host}/v8/finance/chart/${encodeURIComponent(yahooSym)}?interval=1d&range=1d`,
+          { timeout: 6000, headers: YAHOO_HEADERS }
+        );
+        const price = res.data?.chart?.result?.[0]?.meta?.regularMarketPrice;
+        if (typeof price === 'number' && price > 0) {
+          return price;
+        }
+      } catch {
+        // try next host
+      }
+    }
+    return null;
+  }
+
+  async function fetchYahooPriceForSymbol(symbol: string): Promise<number | null> {
+    const yahooSym = toYahooSymbol(symbol);
+    let price = await fetchYahooChartPrice(yahooSym);
+    if (!price && yahooSym.endsWith('.NS')) {
+      price = await fetchYahooChartPrice(yahooSym.replace(/\.NS$/, '.BO'));
+    }
+    return price;
+  }
+
   async function fetchLiveStockPrices(symbols: string[]) {
     if (symbols.length === 0) return {};
-    
+
+    const now = Date.now();
     const priceMap: Record<string, number> = {};
-    const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
-    const AV_KEY = process.env.ALPHAVANTAGE_API_KEY;
+    const uncached: string[] = [];
 
-    // Grouping
-    const indiaStocks = symbols.filter(s => {
-      const u = s.toUpperCase();
-      return u.endsWith('.NS') || u.endsWith('.BO') || u.includes(':NSE') || u.includes(':BSE');
-    });
-
-    console.log(`[fetchLiveStockPrices] Symbols: ${symbols.join(', ')}. Finnhub: ${FINNHUB_KEY ? 'Present' : 'MISSING'}. AlphaVantage: ${AV_KEY ? 'Present' : 'MISSING'}`);
-    
-    const potentialUS = symbols.filter(s => !indiaStocks.includes(s));
-    
-    const fetchTasks: Promise<void>[] = [];
-
-    // --- Task A: Alpha Vantage (For Indian Stocks) ---
-    if (indiaStocks.length > 0) {
-      if (!AV_KEY) {
-        console.warn("[AlphaVantage] API Key missing. Skipping India stocks.");
+    for (const sym of symbols) {
+      const cached = stockQuoteCache.get(sym.toUpperCase());
+      if (cached && now - cached.ts < QUOTE_CACHE_TTL_MS) {
+        priceMap[sym] = cached.price;
       } else {
-        fetchTasks.push((async () => {
-          for (const symbol of indiaStocks) {
-            try {
-              let avSym = symbol.toUpperCase();
-              // Normalize common formats to Alpha Vantage preferred ones
-              if (avSym.endsWith('.NS')) avSym = avSym.replace('.NS', '.NSE');
-              if (avSym.endsWith('.BO')) avSym = avSym.replace('.BO', '.BSE');
-              
-              // If it's already like 'NSE:RELIANCE', it might work too, 
-              // but AV usually prefers TICKET.NSE. Let's try to handle both.
-              if (avSym.includes(':')) {
-                const [exch, ticker] = avSym.split(':');
-                if (exch === 'NSE') avSym = `${ticker}.NSE`;
-                else if (exch === 'BSE') avSym = `${ticker}.BSE`;
-              }
-              
-              console.log(`[AlphaVantage] Fetching ${avSym} (original: ${symbol})`);
-              const res = await axios.get(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${avSym}&apikey=${AV_KEY}`);
-              
-              if (res.data?.["Note"]) {
-                console.warn(`[AlphaVantage] Rate limit hit for ${symbol}`);
-                break; 
-              }
-
-              const quote = res.data?.["Global Quote"];
-              const priceStr = quote?.["05. price"];
-              
-              if (priceStr) {
-                const price = parseFloat(priceStr);
-                priceMap[symbol] = price;
-                console.log(`[AlphaVantage] Success: ${symbol} = ${price}`);
-              } else {
-                // Try one more internal format if the first one fails
-                let fallbackSym = avSym;
-                if (avSym.endsWith('.NSE')) fallbackSym = avSym.replace('.NSE', '.NS');
-                if (avSym.endsWith('.BSE')) fallbackSym = avSym.replace('.BSE', '.BO');
-                
-                if (fallbackSym !== avSym) {
-                   console.log(`[AlphaVantage] Retrying with ${fallbackSym}...`);
-                   const res2 = await axios.get(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${fallbackSym}&apikey=${AV_KEY}`);
-                   const p2 = res2.data?.["Global Quote"]?.["05. price"];
-                   if (p2) {
-                     priceMap[symbol] = parseFloat(p2);
-                     console.log(`[AlphaVantage] Success on fallback: ${symbol} = ${priceMap[symbol]}`);
-                   }
-                }
-              }
-              
-              await new Promise(r => setTimeout(r, 600)); // slightly longer delay
-            } catch (e: any) {
-              console.error(`[AlphaVantage] Error for ${symbol}:`, e.message);
-            }
-          }
-        })());
+        uncached.push(sym);
       }
     }
 
-    // --- Task B: Finnhub (US Stocks & Crypto) ---
-    if (potentialUS.length > 0 && FINNHUB_KEY) {
-      console.log(`[Finnhub] Fetching ${potentialUS.length} symbols...`);
-      const pTasks = potentialUS.map(async (symbol) => {
-        try {
-          let sym = symbol.toUpperCase().replace('.US', '');
-          // Basic Crypto Mapping for Finnhub
-          if (sym === 'BTC' || sym === 'BITCOIN') sym = 'BINANCE:BTCUSDT';
-          else if (sym === 'ETH' || sym === 'ETHEREUM') sym = 'BINANCE:ETHUSDT';
-          
-          const res = await axios.get(`https://finnhub.io/api/v1/quote?symbol=${sym}&token=${FINNHUB_KEY}`, { 
-            timeout: 5000,
-            headers: { 'User-Agent': 'Mozilla/5.0' }
-          });
-          if (res.data?.c && res.data.c !== 0) {
-            priceMap[symbol] = res.data.c;
-          }
-        } catch (e) {
-          console.warn(`[Finnhub] Failed for ${symbol}: ${e.message}`);
-        }
-      });
-      fetchTasks.push(Promise.all(pTasks).then(() => {}));
-    }
+    if (uncached.length === 0) return priceMap;
 
-    await Promise.all(fetchTasks);
+    const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
+    const AV_KEY = process.env.ALPHAVANTAGE_API_KEY;
+
+    const isIndiaSymbol = (s: string) => {
+      const u = s.toUpperCase();
+      return u.endsWith('.NS') || u.endsWith('.BO') || u.endsWith('.NSE') || u.endsWith('.BSE') || u.includes(':NSE') || u.includes(':BSE');
+    };
+
+    const indiaStocks = uncached.filter(isIndiaSymbol);
+    const potentialUS = uncached.filter(s => !isIndiaSymbol(s));
+
+    console.log(`[fetchLiveStockPrices] Symbols: ${uncached.join(', ')}. Finnhub: ${FINNHUB_KEY ? 'Present' : 'MISSING'}. Yahoo: Active.`);
+
+    // --- Task A: Yahoo Finance for Indian Stocks (.NS / .BO), with optional AlphaVantage fallback ---
+    const indiaTask = (async () => {
+      await Promise.all(indiaStocks.map(async (symbol) => {
+        const yPrice = await fetchYahooPriceForSymbol(symbol);
+        if (yPrice) {
+          priceMap[symbol] = yPrice;
+          stockQuoteCache.set(symbol.toUpperCase(), { price: yPrice, ts: Date.now() });
+          return;
+        }
+        if (AV_KEY) {
+          try {
+            let avSym = toYahooSymbol(symbol).replace(/\.NS$/, '.BSE').replace(/\.BO$/, '.BSE');
+            const res = await axios.get(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(avSym)}&apikey=${AV_KEY}`, { timeout: 6000 });
+            const priceStr = res.data?.["Global Quote"]?.["05. price"];
+            if (priceStr && parseFloat(priceStr) > 0) {
+              const p = parseFloat(priceStr);
+              priceMap[symbol] = p;
+              stockQuoteCache.set(symbol.toUpperCase(), { price: p, ts: Date.now() });
+            }
+          } catch (e: any) {
+            console.warn(`[AlphaVantage] Fallback failed for ${symbol}: ${e.message}`);
+          }
+        }
+      }));
+    })();
+
+    // --- Task B: Finnhub primary for US Stocks & Crypto, with Yahoo Finance automatic fallback ---
+    const usTask = (async () => {
+      await Promise.all(potentialUS.map(async (symbol) => {
+        if (FINNHUB_KEY) {
+          try {
+            let sym = symbol.toUpperCase().replace(/\.US$/, '');
+            if (sym === 'BTC' || sym === 'BITCOIN') sym = 'BINANCE:BTCUSDT';
+            else if (sym === 'ETH' || sym === 'ETHEREUM') sym = 'BINANCE:ETHUSDT';
+
+            const res = await axios.get(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(sym)}&token=${FINNHUB_KEY}`, {
+              timeout: 5000,
+              headers: { 'User-Agent': 'Mozilla/5.0' }
+            });
+            if (res.data?.c && res.data.c > 0) {
+              priceMap[symbol] = res.data.c;
+              stockQuoteCache.set(symbol.toUpperCase(), { price: res.data.c, ts: Date.now() });
+              return;
+            }
+          } catch (e: any) {
+            console.warn(`[Finnhub] Failed for ${symbol}: ${e.message}`);
+          }
+        }
+        // Fallback to Yahoo Finance (also handles cases where an Indian ticker was entered without suffix or US ETF missed)
+        const yPrice = await fetchYahooPriceForSymbol(symbol);
+        if (yPrice) {
+          priceMap[symbol] = yPrice;
+          stockQuoteCache.set(symbol.toUpperCase(), { price: yPrice, ts: Date.now() });
+        }
+      }));
+    })();
+
+    await Promise.all([indiaTask, usTask]);
 
     console.log(`Live Stock Fetch: Found ${Object.keys(priceMap).length} of ${symbols.length} symbols.`);
     return priceMap;
@@ -1029,57 +1077,75 @@ async function startServer() {
   });
 
   app.get("/api/tickers/search", async (req, res) => {
-    const { q, h: householdId } = req.query;
+    const { q } = req.query;
     if (!q) return res.json([]);
     
     try {
-      const db = getDB();
-      const household = householdId ? db.households[householdId as string] : null;
-      
       const results: any[] = [];
       const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
 
-      // 1. Finnhub Search (Strong for US and some international)
-      if (FINNHUB_KEY) {
-        try {
-          const fRes = await axios.get(`https://finnhub.io/api/v1/search?q=${encodeURIComponent(q as string)}&token=${FINNHUB_KEY}`);
-          const fQuotes = (fRes.data.result || [])
-            .filter((quote: any) => ['Common Stock', 'ETF', 'REIT', 'ADR'].includes(quote.type))
-            .map((quote: any) => ({
-              symbol: quote.symbol,
-              shortname: quote.description,
-              exchDisp: quote.displaySymbol.includes('.') ? quote.displaySymbol.split('.')[1] : 'US',
-              typeDisp: quote.type,
-              currentPrice: 0,
-              isIndia: quote.symbol.endsWith('.NS') || quote.symbol.endsWith('.BO')
-            }));
-          results.push(...fQuotes);
-        } catch(e) { console.warn("Finnhub search failed"); }
-      }
+      // Run Yahoo Finance Search (best for NSE/BSE .NS/.BO + global ETFs) and Finnhub Search in parallel
+      const [yahooQuotes, finnhubQuotes] = await Promise.all([
+        (async () => {
+          try {
+            const yRes = await axios.get(
+              `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q as string)}&quotesCount=12&newsCount=0`,
+              { timeout: 6000, headers: YAHOO_HEADERS }
+            );
+            return (yRes.data?.quotes || [])
+              .filter((qt: any) => qt.symbol && ['EQUITY', 'ETF', 'INDEX', 'CRYPTOCURRENCY'].includes(qt.quoteType))
+              .map((qt: any) => {
+                const sym = String(qt.symbol);
+                const isIndia = sym.endsWith('.NS') || sym.endsWith('.BO') || qt.exchange === 'NSI' || qt.exchange === 'BSE';
+                return {
+                  symbol: sym,
+                  shortname: qt.shortname || qt.longname || sym,
+                  exchDisp: qt.exchDisp || (sym.endsWith('.NS') ? 'NSE' : sym.endsWith('.BO') ? 'BSE' : (qt.exchange || 'US')),
+                  typeDisp: qt.quoteType,
+                  currentPrice: 0,
+                  isIndia
+                };
+              });
+          } catch (e: any) {
+            console.warn("Yahoo search failed:", e.message);
+            return [];
+          }
+        })(),
+        (async () => {
+          if (!FINNHUB_KEY) return [];
+          try {
+            const fRes = await axios.get(
+              `https://finnhub.io/api/v1/search?q=${encodeURIComponent(q as string)}&token=${FINNHUB_KEY}`,
+              { timeout: 5000 }
+            );
+            return (fRes.data?.result || [])
+              .filter((quote: any) => ['Common Stock', 'ETF', 'REIT', 'ADR'].includes(quote.type))
+              .slice(0, 8)
+              .map((quote: any) => ({
+                symbol: toYahooSymbol(quote.symbol),
+                shortname: quote.description,
+                exchDisp: quote.displaySymbol?.includes('.') ? quote.displaySymbol.split('.')[1] : 'US',
+                typeDisp: quote.type,
+                currentPrice: 0,
+                isIndia: quote.symbol.endsWith('.NS') || quote.symbol.endsWith('.BO')
+              }));
+          } catch {
+            console.warn("Finnhub search failed");
+            return [];
+          }
+        })()
+      ]);
 
-      // 2. Alpha Vantage Search (Good for international)
-      const AV_KEY = process.env.ALPHAVANTAGE_API_KEY;
-      if (AV_KEY && results.length < 5) {
-        try {
-          const avRes = await axios.get(`https://www.alphavantage.co/query?function=SYMBOL_SEARCH&keywords=${encodeURIComponent(q as string)}&apikey=${AV_KEY}`);
-          const avQuotes = (avRes.data.bestMatches || []).map((m: any) => ({
-            symbol: m["1. symbol"],
-            shortname: m["2. name"],
-            exchDisp: m["4. region"],
-            typeDisp: m["3. type"],
-            currentPrice: 0,
-            isIndia: m["1. symbol"].endsWith('.BSE') || m["1. symbol"].endsWith('.NSE') || m["4. region"] === 'India'
-          }));
-          results.push(...avQuotes);
-        } catch(e) { console.warn("Alpha Vantage search failed"); }
-      }
+      results.push(...yahooQuotes, ...finnhubQuotes);
 
       // De-duplicate by symbol
-      const uniqueResults = results.reduce((acc, current) => {
-        const x = acc.find((item: any) => item.symbol === current.symbol);
-        if (!x) return acc.concat([current]);
-        else return acc;
-      }, []).slice(0, 10);
+      const seen = new Set<string>();
+      const uniqueResults = results.filter((item) => {
+        const key = item.symbol.toUpperCase();
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+      }).slice(0, 10);
 
       // Fetch prices for search results
       if (uniqueResults.length > 0) {
@@ -1104,8 +1170,14 @@ async function startServer() {
 
   app.get("/api/quote/:symbol", async (req, res) => {
     const { symbol } = req.params;
-    const { h: householdId } = req.query;
     try {
+      // Check AMFI first in case symbol is an AMFI scheme code
+      const mfData = await getAmfiData();
+      const mf = mfData.find(m => m.symbol === symbol);
+      if (mf) {
+        return res.json({ symbol, price: mf.currentPrice, provider: 'AMFI' });
+      }
+
       const priceMap = await fetchLiveStockPrices([symbol]);
       if (priceMap[symbol]) {
         res.json({ symbol, price: priceMap[symbol] });
@@ -1117,34 +1189,135 @@ async function startServer() {
     }
   });
 
-  app.delete("/api/portfolio/holding/:holdingId", (req, res) => {
-    const db = getDB();
-    const { holdingId } = req.params;
-    const initialCount = db.holdings.length;
-    db.holdings = db.holdings.filter((h: any) => h.id !== holdingId);
-    
-    if (db.holdings.length < initialCount) {
-      saveDB(db);
-      res.json({ success: true });
-    } else {
-      res.status(404).json({ error: "Holding not found" });
+  function findAmfiMatch(mfData: any[], holding: any) {
+    const ticker = String(holding.ticker || '').trim();
+    const orig = String(holding.originalName || '').trim();
+    const exact = mfData.find(m => m.symbol === ticker || (orig && m.shortname === orig) || (ticker && m.shortname === ticker));
+    if (exact) return exact;
+
+    const target = (orig || ticker).toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+    if (!target || target.length < 6) return null;
+    return mfData.find(m => {
+      const mName = String(m.shortname || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+      return mName === target;
+    }) || null;
+  }
+
+  app.post("/api/portfolio/refresh", async (req, res) => {
+    const householdId = (req.query.householdId as string) || req.body?.householdId;
+    const clientHoldings: any[] | undefined = Array.isArray(req.body?.holdings) ? req.body.holdings : undefined;
+
+    try {
+      let holdingsToRefresh: any[] = clientHoldings || [];
+
+      if (holdingsToRefresh.length === 0 && householdId) {
+        try {
+          const snap = await firestore.collection('holdings').where('householdId', '==', householdId).get();
+          holdingsToRefresh = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+        } catch {
+          const db = getDB();
+          holdingsToRefresh = db.holdings.filter((h: any) => h.householdId === householdId);
+        }
+      }
+
+      const mfData = await getAmfiData();
+      const updates: Record<string, { currentPrice: number; provider: string }> = {};
+      const stockHoldings: any[] = [];
+
+      for (const h of holdingsToRefresh) {
+        const mf = findAmfiMatch(mfData, h);
+        if (mf && mf.currentPrice > 0) {
+          updates[h.id] = { currentPrice: mf.currentPrice, provider: 'AMFI' };
+        } else if (h.ticker && h.ticker !== 'MANUAL') {
+          stockHoldings.push(h);
+        }
+      }
+
+      if (stockHoldings.length > 0) {
+        const uniqueSymbols = Array.from(new Set(stockHoldings.map(h => String(h.ticker))));
+        const stockPrices = await fetchLiveStockPrices(uniqueSymbols);
+        for (const h of stockHoldings) {
+          if (stockPrices[h.ticker]) {
+            updates[h.id] = { currentPrice: stockPrices[h.ticker], provider: 'Market-Live' };
+          }
+        }
+      }
+
+      // Best-effort server-side persistence (Firestore if credentials exist, plus local db.json)
+      if (Object.keys(updates).length > 0) {
+        try {
+          const batch = firestore.batch();
+          const now = Date.now();
+          for (const [id, u] of Object.entries(updates)) {
+            batch.update(firestore.collection('holdings').doc(id), {
+              currentPrice: u.currentPrice,
+              priceUpdatedAt: now
+            });
+          }
+          await batch.commit();
+        } catch {
+          // Client-side writeBatch in App.tsx handles Firestore updates when server lacks ADC
+        }
+
+        const db = getDB();
+        let changed = false;
+        for (const h of db.holdings) {
+          if (updates[h.id]) {
+            h.currentPrice = updates[h.id].currentPrice;
+            h.provider = updates[h.id].provider;
+            h.priceUpdatedAt = Date.now();
+            changed = true;
+          }
+        }
+        if (changed) saveDB(db);
+      }
+
+      res.json({ success: true, updates, count: Object.keys(updates).length });
+    } catch (e: any) {
+      console.error("Portfolio refresh error:", e);
+      res.status(500).json({ error: e.message || "Failed to refresh portfolio" });
     }
   });
 
-  app.patch("/api/portfolio/holding/:holdingId", (req, res) => {
+  app.delete("/api/portfolio/holding/:holdingId", async (req, res) => {
+    const { holdingId } = req.params;
+    try {
+      await firestore.collection('holdings').doc(holdingId).delete();
+    } catch {
+      // Ignore if server lacks Firestore ADC; client deletes directly
+    }
     const db = getDB();
+    const initialCount = db.holdings.length;
+    db.holdings = db.holdings.filter((h: any) => h.id !== holdingId);
+    if (db.holdings.length < initialCount) {
+      saveDB(db);
+    }
+    res.json({ success: true });
+  });
+
+  app.patch("/api/portfolio/holding/:holdingId", async (req, res) => {
     const { holdingId } = req.params;
     const { quantity, currentPrice } = req.body;
-    
+    const patchData: any = { priceUpdatedAt: Date.now() };
+    if (quantity !== undefined) patchData.quantity = Number(quantity);
+    if (currentPrice !== undefined) patchData.currentPrice = Number(currentPrice);
+
+    try {
+      await firestore.collection('holdings').doc(holdingId).update(patchData);
+    } catch {
+      // Ignore if server lacks Firestore ADC; client updates directly
+    }
+
+    const db = getDB();
     const holding = db.holdings.find((h: any) => h.id === holdingId);
     if (holding) {
       if (quantity !== undefined) holding.quantity = Number(quantity);
       if (currentPrice !== undefined) holding.currentPrice = Number(currentPrice);
+      holding.priceUpdatedAt = patchData.priceUpdatedAt;
       saveDB(db);
-      res.json(holding);
-    } else {
-      res.status(404).json({ error: "Holding not found" });
+      return res.json(holding);
     }
+    res.json({ id: holdingId, ...patchData });
   });
 
   app.get("/api/portfolio/:householdId", async (req, res) => {

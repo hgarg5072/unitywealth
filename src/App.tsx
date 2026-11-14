@@ -75,6 +75,7 @@ import {
   setDoc, 
   deleteDoc,
   addDoc,
+  writeBatch,
   serverTimestamp
 } from 'firebase/firestore';
 import { auth, db } from './lib/firebase';
@@ -353,30 +354,63 @@ export default function App() {
         const holdings = await res.json();
         console.log("Extracted holdings:", holdings);
         
-        const saveRes = await fetch('/api/portfolio/bulk-add', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            userId: targetUserId,
-            householdId: user.householdId,
-            holdings
-          }),
-        });
-
-        const saveText = await saveRes.text();
-        let saveResult;
-        try {
-          saveResult = JSON.parse(saveText);
-        } catch (err) {
-          console.error("Non-JSON from bulk-add:", saveText);
-          throw new Error("Server returned an invalid response (not JSON) during portfolio update.");
-        }
-
-        if (saveRes.ok) {
+        if (targetUserId === user.id && user.householdId) {
+          const existingQuery = query(
+            collection(db, 'holdings'),
+            where('userId', '==', targetUserId),
+            where('householdId', '==', user.householdId)
+          );
+          const existingSnap = await getDocs(existingQuery);
+          const batch = writeBatch(db);
+          existingSnap.docs.forEach((docSnap) => {
+            const d = docSnap.data();
+            if (d.source === 'PDF' || d.provider === 'CAMS') {
+              batch.delete(docSnap.ref);
+            }
+          });
+          holdings.forEach((h: any) => {
+            const id = "h_" + Math.random().toString(36).slice(2, 11);
+            batch.set(doc(db, 'holdings', id), {
+              userId: targetUserId,
+              householdId: user.householdId,
+              ticker: String(h.schemeName || 'MF').slice(0, 50),
+              quantity: Number(h.units) || 0,
+              assetClass: h.assetClass || 'Mutual Fund',
+              currency: h.currency === 'USD' ? 'USD' : 'INR',
+              provider: 'CAMS',
+              source: 'PDF',
+              currentPrice: Number(h.nav) || 0,
+              originalName: h.originalName || h.schemeName || '',
+              syncedAt: Date.now()
+            });
+          });
+          await batch.commit();
           setNotification({ message: 'Portfolio refreshed successfully!', type: 'refreshed' });
-          // fetchData() removed - listeners will handle updates automatically
         } else {
-          setNotification({ message: saveResult.error || 'Failed to save imported holdings.', type: 'error' });
+          const saveRes = await fetch('/api/portfolio/bulk-add', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              userId: targetUserId,
+              householdId: user.householdId,
+              holdings
+            }),
+          });
+
+          const saveText = await saveRes.text();
+          let saveResult;
+          try {
+            saveResult = JSON.parse(saveText);
+          } catch (err) {
+            console.error("Non-JSON from bulk-add:", saveText);
+            throw new Error("Server returned an invalid response (not JSON) during portfolio update.");
+          }
+
+          if (saveRes.ok) {
+            setNotification({ message: 'Portfolio refreshed successfully!', type: 'refreshed' });
+          } else {
+            setNotification({ message: saveResult.error || 'Failed to save imported holdings.', type: 'error' });
+          }
         }
       } catch (parseError: any) {
         console.error("Upload process error:", parseError);
@@ -630,24 +664,27 @@ export default function App() {
     }
     setIsSaving(true);
     try {
-      const res = await fetch('/api/portfolio/add-manual', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      const upperTicker = (manualTicker || 'MANUAL').toUpperCase().slice(0, 50);
+      let resolvedCurrency: Currency = manualCurrency || 'USD';
+      if (upperTicker.endsWith('.NS') || upperTicker.endsWith('.BO')) {
+        resolvedCurrency = 'INR';
+      }
+
+      if (dashboardView === user.id) {
+        const id = "h_" + Math.random().toString(36).slice(2, 11);
+        await setDoc(doc(db, 'holdings', id), {
           userId: dashboardView,
           householdId: user.householdId,
-          ticker: manualTicker || 'MANUAL',
-          originalName: manualName,
-          quantity: manualQty,
-          currentPrice: manualPrice || 0,
-          assetClass: manualAssetClass,
-          currency: manualCurrency,
-          provider: manualProvider,
-          source: manualSource
-        }),
-      });
-      if (res.ok) {
-        // fetchData() removed - listeners handle updates
+          ticker: upperTicker,
+          originalName: manualName || upperTicker,
+          quantity: parseFloat(manualQty) || 0,
+          assetClass: manualAssetClass || 'Equity',
+          currency: resolvedCurrency,
+          provider: manualProvider || 'Manual',
+          source: manualSource || 'Manual',
+          currentPrice: parseFloat(manualPrice) || 0,
+          syncedAt: Date.now()
+        });
         setShowManualEntryModal(false);
         setManualTicker('');
         setManualName('');
@@ -655,9 +692,35 @@ export default function App() {
         setManualPrice('');
         setManualSource('Manual');
       } else {
-        alert("Failed to add entry");
+        const res = await fetch('/api/portfolio/add-manual', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            userId: dashboardView,
+            householdId: user.householdId,
+            ticker: upperTicker,
+            originalName: manualName,
+            quantity: manualQty,
+            currentPrice: manualPrice || 0,
+            assetClass: manualAssetClass,
+            currency: resolvedCurrency,
+            provider: manualProvider,
+            source: manualSource
+          }),
+        });
+        if (res.ok) {
+          setShowManualEntryModal(false);
+          setManualTicker('');
+          setManualName('');
+          setManualQty('');
+          setManualPrice('');
+          setManualSource('Manual');
+        } else {
+          alert("Failed to add entry");
+        }
       }
     } catch (e) {
+      console.error("Add manual entry failed:", e);
       alert("Error adding entry");
     } finally {
       setIsSaving(false);
@@ -796,14 +859,44 @@ export default function App() {
     if (!user?.householdId) return;
     setIsSaving(true);
     try {
+      const currentHoldings = data?.holdings || [];
       const res = await fetch(`/api/portfolio/refresh?householdId=${user.householdId}`, {
-        method: 'POST'
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          householdId: user.householdId,
+          holdings: currentHoldings.map(h => ({
+            id: h.id,
+            ticker: h.ticker,
+            originalName: h.originalName
+          }))
+        })
       });
       if (res.ok) {
-        // fetchData() removed - listeners will handle updates
+        const payload = await res.json();
+        const updates = payload?.updates || {};
+        const entries = Object.entries(updates) as [string, { currentPrice: number }][];
+        if (entries.length > 0) {
+          const batch = writeBatch(db);
+          const now = Date.now();
+          entries.forEach(([id, u]) => {
+            if (typeof u.currentPrice === 'number' && u.currentPrice > 0) {
+              batch.update(doc(db, 'holdings', id), {
+                currentPrice: u.currentPrice,
+                priceUpdatedAt: now
+              });
+            }
+          });
+          await batch.commit();
+        }
+        await fetchFxRates();
+        setNotification({ message: `Refreshed live prices (${entries.length} updated)!`, type: 'refreshed' });
+      } else {
+        setNotification({ message: 'Failed to refresh live prices.', type: 'error' });
       }
     } catch (e) {
       console.error(e);
+      setNotification({ message: 'Error refreshing prices.', type: 'error' });
     } finally {
       setIsSaving(false);
     }
@@ -2305,13 +2398,12 @@ function DetailViewModal({
   const deleteHolding = async (id: string) => {
     setIsProcessing(true);
     try {
-      const res = await fetch(`/api/portfolio/holding/${id}`, { method: 'DELETE' });
-      if (res.ok) {
-        setNotification({ message: 'Holding deleted', type: 'success' });
-        setDeletingId(null);
-        // onRefresh() removed - listeners will handle updates
-      }
+      await deleteDoc(doc(db, 'holdings', id));
+      fetch(`/api/portfolio/holding/${id}`, { method: 'DELETE' }).catch(() => {});
+      setNotification({ message: 'Holding deleted', type: 'success' });
+      setDeletingId(null);
     } catch (e) {
+      console.error("Delete holding error:", e);
       setNotification({ message: 'Delete failed', type: 'error' });
     } finally {
       setIsProcessing(false);
@@ -2325,20 +2417,25 @@ function DetailViewModal({
     }
     setIsProcessing(true);
     try {
-      const res = await fetch(`/api/portfolio/holding/${id}`, {
+      const nextQty = parseFloat(editVal);
+      const nextPrice = parseFloat(editPrice);
+      const patch: Record<string, number> = {
+        quantity: nextQty,
+        priceUpdatedAt: Date.now()
+      };
+      if (!isNaN(nextPrice)) {
+        patch.currentPrice = nextPrice;
+      }
+      await updateDoc(doc(db, 'holdings', id), patch);
+      fetch(`/api/portfolio/holding/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          quantity: parseFloat(editVal),
-          currentPrice: parseFloat(editPrice)
-        })
-      });
-      if (res.ok) {
-        setEditingId(null);
-        setNotification({ message: 'Quantity updated', type: 'success' });
-        // onRefresh() removed - listeners will handle updates
-      }
+        body: JSON.stringify({ quantity: nextQty, currentPrice: nextPrice })
+      }).catch(() => {});
+      setEditingId(null);
+      setNotification({ message: 'Quantity updated', type: 'success' });
     } catch (e) {
+      console.error("Update holding error:", e);
       setNotification({ message: 'Update failed', type: 'error' });
     } finally {
       setIsProcessing(false);
