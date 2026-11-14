@@ -2009,7 +2009,7 @@ BROKER, TICKER & CURRENCY RULES:
           }
         }
 
-        const isinMatch = `${item.isin || ""} ${origName}`.match(/\b([A-Z]{2}[A-Z0-9]{10})\b/i);
+        const isinMatch = `${item.isin || ""} ${origName}`.match(/\b([A-Z]{2}[A-Z0-9]{9}[0-9])\b/i);
         const isin = isinMatch ? isinMatch[1].toUpperCase() : "";
         const dedupKey = `${rowProvider}|${currency}|${isin || rawTicker.toUpperCase()}|${assetClass}`;
 
