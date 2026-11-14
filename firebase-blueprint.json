@@ -1,0 +1,85 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile and authentication mappings",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "email": { "type": "string" },
+        "name": { "type": "string" },
+        "householdId": { "type": "string" },
+        "googleId": { "type": "string" },
+        "provider": { "type": "string" },
+        "isManual": { "type": "boolean" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["email", "name"]
+    },
+    "Household": {
+      "title": "Household",
+      "description": "A group of users sharing a portfolio",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "members": { "type": "array", "items": { "type": "string" } },
+        "settings": { "type": "object" },
+        "targets": { "type": "object" }
+      },
+      "required": ["name", "members", "targets"]
+    },
+    "Holding": {
+      "title": "Holding",
+      "description": "An individual investment position",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "userId": { "type": "string" },
+        "householdId": { "type": "string" },
+        "ticker": { "type": "string" },
+        "quantity": { "type": "number" },
+        "assetClass": { "type": "string" },
+        "currency": { "type": "string" },
+        "provider": { "type": "string" },
+        "source": { "type": "string" },
+        "currentPrice": { "type": "number" },
+        "originalName": { "type": "string" },
+        "syncedAt": { "type": "number" },
+        "priceUpdatedAt": { "type": "number" }
+      },
+      "required": ["userId", "householdId", "ticker", "quantity"]
+    },
+    "Invite": {
+      "title": "Invite",
+      "description": "Invitation to join a household",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "fromUserId": { "type": "string" },
+        "toEmail": { "type": "string" },
+        "householdId": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "accepted", "declined"] }
+      },
+      "required": ["fromUserId", "toEmail", "householdId", "status"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Global user profiles"
+    },
+    "/households/{householdId}": {
+      "schema": "Household",
+      "description": "Family portfolio groups"
+    },
+    "/holdings/{holdingId}": {
+      "schema": "Holding",
+      "description": "Investment positions across all households"
+    },
+    "/invites/{inviteId}": {
+      "schema": "Invite",
+      "description": "Pending family invitations"
+    }
+  }
+}

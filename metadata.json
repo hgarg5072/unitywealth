@@ -1,0 +1,6 @@
+{
+  "name": "UnityWealth",
+  "description": "Cross-border investment aggregator for families with drift analysis and portfolio sync.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

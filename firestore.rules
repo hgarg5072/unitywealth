@@ -1,0 +1,149 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // 0. Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Phase 3: Primitives ---
+    
+    function isSignedIn() {
+      return request.auth != null;
+    }
+    
+    function incoming() {
+      return request.resource.data;
+    }
+    
+    function existing() {
+      return resource.data;
+    }
+    
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Helper to check household membership safely
+    function isHouseholdMember(hId) {
+      return isSignedIn() && isValidId(hId) && 
+             exists(/databases/$(database)/documents/households/$(hId)) &&
+             request.auth.uid in get(/databases/$(database)/documents/households/$(hId)).data.members;
+    }
+
+    // --- Phase 4: Validation Helpers ---
+
+    function isValidUser(data) {
+      return data.email is string && data.email.size() <= 200 &&
+             data.name is string && data.name.size() <= 100 &&
+             (!('householdId' in data) || data.householdId == null || isValidId(data.householdId));
+    }
+
+    function isValidHousehold(data) {
+      return data.name is string && data.name.size() <= 100 &&
+             data.members is list && data.members.size() > 0 && data.members.size() <= 20 &&
+             data.targets is map;
+    }
+
+    function isValidHolding(data) {
+      return isValidId(data.userId) &&
+             isValidId(data.householdId) &&
+             data.ticker is string && data.ticker.size() <= 50 &&
+             data.quantity is number &&
+             data.assetClass is string &&
+             data.currency is string && data.currency.size() == 3;
+    }
+
+    function isValidInvite(data) {
+      return isValidId(data.fromUserId) &&
+             data.toEmail is string && data.toEmail.size() <= 200 &&
+             isValidId(data.householdId) &&
+             data.status in ['pending', 'accepted', 'declined'];
+    }
+
+    // --- Collection Matches ---
+
+    match /users/{userId} {
+      // Allow user to read own profile, or members of the same household to read (for names/emails)
+      allow get: if isOwner(userId) || (
+        isSignedIn() && 
+        'householdId' in existing() && 
+        existing().householdId != null &&
+        isHouseholdMember(existing().householdId)
+      );
+      
+      allow create: if isOwner(userId) && isValidUser(incoming()) && 
+                    incoming().keys().hasAll(['email', 'name']) &&
+                    (request.auth.token.email == null || incoming().email == request.auth.token.email || incoming().email == request.auth.token.email.lower());
+      
+      allow update: if isOwner(userId) && isValidUser(incoming()) &&
+                    incoming().email == existing().email && // Email immutable
+                    // Prevent self-assignment of roles or bypassing household logic
+                    (!incoming().diff(existing()).affectedKeys().hasAny(['role', 'isAdmin']));
+    }
+
+    match /households/{householdId} {
+      allow get: if isHouseholdMember(householdId);
+      allow list: if isSignedIn() && request.auth.uid in resource.data.members;
+      
+      allow create: if isSignedIn() && isValidHousehold(incoming()) &&
+                    request.auth.uid in incoming().members;
+                    
+      allow update: if isHouseholdMember(householdId) && isValidHousehold(incoming()) && (
+        // Action: Update targets, settings, or name
+        incoming().diff(existing()).affectedKeys().hasOnly(['targets', 'settings', 'name']) ||
+        // Action: Member management (simplified)
+        incoming().diff(existing()).affectedKeys().hasOnly(['members'])
+      );
+    }
+
+    match /holdings/{holdingId} {
+      // Use local check for existing document
+      allow get: if isSignedIn() && isHouseholdMember(existing().householdId);
+      
+      // RELATIONAL GUARD: list MUST filter by householdId. 
+      // Rule enforces that user can only list holdings for a household they belong to.
+      allow list: if isSignedIn() && 
+                    resource.data.householdId != null && 
+                    isHouseholdMember(resource.data.householdId);
+
+      allow create: if isSignedIn() && isValidHolding(incoming()) &&
+                    isHouseholdMember(incoming().householdId) &&
+                    incoming().userId == request.auth.uid &&
+                    // Verify relational consistency: user doc must exist and match household
+                    exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+                    get(/databases/$(database)/documents/users/$(request.auth.uid)).data.householdId == incoming().householdId;
+                    
+      allow update: if isSignedIn() && 
+                    isHouseholdMember(existing().householdId) &&
+                    isValidHolding(incoming()) &&
+                    incoming().userId == existing().userId &&
+                    incoming().householdId == existing().householdId &&
+                    incoming().diff(existing()).affectedKeys().hasOnly(['quantity', 'currentPrice', 'priceUpdatedAt', 'syncedAt']);
+                    
+      allow delete: if isSignedIn() && isHouseholdMember(existing().householdId);
+    }
+
+    match /invites/{inviteId} {
+      allow get: if isSignedIn() && (request.auth.uid == resource.data.fromUserId || request.auth.token.email == resource.data.toEmail);
+      allow list: if isSignedIn() && (resource.data.fromUserId == request.auth.uid || resource.data.toEmail == request.auth.token.email);
+      
+      allow create: if isSignedIn() && isValidInvite(incoming()) &&
+                    incoming().fromUserId == request.auth.uid &&
+                    incoming().status == 'pending' &&
+                    isHouseholdMember(incoming().householdId);
+                    
+      allow update: if isSignedIn() && (
+        // Target user accepting/declining
+        (request.auth.token.email == existing().toEmail && incoming().diff(existing()).affectedKeys().hasOnly(['status'])) ||
+        // Sender cancelling
+        (request.auth.uid == existing().fromUserId && incoming().diff(existing()).affectedKeys().hasOnly(['status']))
+      );
+    }
+  }
+}
