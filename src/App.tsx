@@ -128,7 +128,9 @@ function shortenAssetName(name: string): string {
     [/^Canara Robeco\b/i, 'Canara'],
     [/^DSP BlackRock\b/i, 'DSP'],
     [/^WhiteOak Capital\b/i, 'WhiteOak'],
+    [/^Invesco India\b/i, 'Invesco'],
     [/^Bandhan\b/i, 'Bandhan'],
+    [/\bDeveloped World Overseas Equity Passive\b/gi, 'Developed World'],
     [/\bInternational\b/gi, 'Intl'],
     [/\bOpportunities\b/gi, 'Opp'],
     [/\bInfrastructure\b/gi, 'Infra'],
@@ -150,6 +152,19 @@ function shortenAssetName(name: string): string {
   return clean.replace(/\s*[\-–—,]+\s*$/, '').replace(/\s{2,}/g, ' ').trim();
 }
 
+function getHoldingOwnerId(h: Pick<Holding, 'userId' | 'ownerId'>): string {
+  return h.ownerId || h.userId;
+}
+
+function generateClientInviteCode(): string {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let out = '';
+  for (let i = 0; i < 6; i++) {
+    out += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return out;
+}
+
 export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [data, setData] = useState<DashboardData | null>(null);
@@ -160,6 +175,24 @@ export default function App() {
   const [loading, setLoading] = useState(true);
   const [showSyncModal, setShowSyncModal] = useState(false);
   const [showDeviceModal, setShowDeviceModal] = useState(false);
+  const [showJoinByCodeModal, setShowJoinByCodeModal] = useState(false);
+  const [joinCodeInput, setJoinCodeInput] = useState('');
+  const [isJoiningFamily, setIsJoiningFamily] = useState(false);
+  const [householdInviteCode, setHouseholdInviteCode] = useState<string>('');
+  const [copiedInviteField, setCopiedInviteField] = useState<'code' | 'link' | null>(null);
+  const [pendingInviteCode, setPendingInviteCode] = useState<string>(() => {
+    try {
+      const params = new URLSearchParams(window.location.search);
+      const urlCode = (params.get('invite') || params.get('join') || '').trim().toUpperCase().replace(/^UW[\-\s]*/i, '');
+      if (urlCode) {
+        sessionStorage.setItem('uw_pending_invite', urlCode);
+        return urlCode;
+      }
+      return sessionStorage.getItem('uw_pending_invite') || '';
+    } catch {
+      return '';
+    }
+  });
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [invites, setInvites] = useState<Invite[]>([]);
   const [notification, setNotification] = useState<{message: string, type: 'success' | 'refreshed' | 'error'} | null>(null);
@@ -251,6 +284,7 @@ export default function App() {
   useEffect(() => {
     if (!user?.householdId) {
       setHousehold(null);
+      setHouseholdInviteCode('');
       return;
     }
 
@@ -261,21 +295,92 @@ export default function App() {
       }
       const hhData = hhSnap.data();
       
-      // Fetch members data
-      const membersData = await Promise.all(
+      // Fetch real authenticated members data
+      const realMembersData = await Promise.all(
         (hhData.members || []).map(async (mId: string) => {
-          const uDoc = await getDoc(doc(db, 'users', mId));
-          return uDoc.exists() ? { id: mId, ...uDoc.data() } : null;
+          try {
+            const uDoc = await getDoc(doc(db, 'users', mId));
+            return uDoc.exists() ? { id: mId, ...uDoc.data() } : null;
+          } catch {
+            return null;
+          }
         })
       );
 
-      setHousehold({ ...hhData, id: hhSnap.id, membersData: membersData.filter(Boolean) });
+      // Merge any manually-tracked family profiles stored in household settings
+      const manualMembers: any[] = Array.isArray(hhData.settings?.manualMembers) ? hhData.settings.manualMembers : [];
+      const seenIds = new Set<string>();
+      const mergedMembers: any[] = [];
+      [...realMembersData.filter(Boolean), ...manualMembers].forEach((m: any) => {
+        if (m?.id && !seenIds.has(m.id)) {
+          seenIds.add(m.id);
+          mergedMembers.push(m);
+        }
+      });
+
+      const storedCode = hhData.settings?.inviteCode || '';
+      if (storedCode) {
+        setHouseholdInviteCode(storedCode);
+      }
+
+      setHousehold({ ...hhData, id: hhSnap.id, membersData: mergedMembers });
     }, (err) => {
       if (auth.currentUser) handleFirestoreError(err, OperationType.GET, `households/${user.householdId}`);
     });
 
     return () => unsubHH();
   }, [user?.householdId]);
+
+  // Ensure household has a persistent 6-char invite code & keep server invite registry synced
+  useEffect(() => {
+    if (!user?.householdId || !household?.id || !auth.currentUser) return;
+    let cancelled = false;
+
+    const syncHouseholdInviteCode = async () => {
+      try {
+        const fbUser = auth.currentUser;
+        if (!fbUser) return;
+        const idToken = await fbUser.getIdToken();
+        let preferredCode = household.settings?.inviteCode || '';
+        if (!preferredCode) {
+          preferredCode = generateClientInviteCode();
+          await updateDoc(doc(db, 'households', household.id), {
+            settings: {
+              ...(household.settings || {}),
+              inviteCode: preferredCode
+            }
+          });
+        }
+        const res = await fetch('/api/household/invite-code', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`
+          },
+          body: JSON.stringify({
+            householdId: household.id,
+            householdName: household.name,
+            inviterName: user.name,
+            refreshToken: fbUser.refreshToken,
+            preferredCode
+          })
+        });
+        if (res.ok && !cancelled) {
+          const info = await res.json();
+          if (info.code) {
+            setHouseholdInviteCode(info.code);
+          }
+        }
+      } catch (err) {
+        console.warn('Invite code sync warning:', err);
+      }
+    };
+
+    syncHouseholdInviteCode();
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.householdId, household?.id, household?.name, household?.settings?.inviteCode]);
 
   // Listener for Holdings Data
   useEffect(() => {
@@ -407,25 +512,42 @@ export default function App() {
           holdings.map((h: any) => String(h.provider || detectedProvider || 'CAMS'))
         );
         
-        if (targetUserId === user.id && user.householdId) {
-          const existingQuery = query(
-            collection(db, 'holdings'),
-            where('userId', '==', targetUserId),
-            where('householdId', '==', user.householdId)
-          );
-          const existingSnap = await getDocs(existingQuery);
+        if (user.householdId && auth.currentUser) {
+          // Ensure user's Firestore profile doc has householdId synced (required by holdings create rule)
+          const uRef = doc(db, 'users', user.id);
+          const uSnap = await getDoc(uRef);
+          if (!uSnap.exists()) {
+            await setDoc(uRef, {
+              email: (user.email || auth.currentUser.email || '').toLowerCase(),
+              name: user.name || auth.currentUser.displayName || 'Investor',
+              householdId: user.householdId,
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp()
+            });
+          } else if (uSnap.data()?.householdId !== user.householdId) {
+            await updateDoc(uRef, { householdId: user.householdId });
+          }
+
           const batch = writeBatch(db);
-          existingSnap.docs.forEach((docSnap) => {
-            const d = docSnap.data();
-            const docProvider = String(d.provider || 'CAMS');
-            if (d.source === 'PDF' && incomingProviders.has(docProvider)) {
-              batch.delete(docSnap.ref);
+          (data?.holdings || []).forEach((existingH) => {
+            const existingOwner = getHoldingOwnerId(existingH);
+            const docProvider = String(existingH.provider || 'CAMS');
+            if (
+              existingOwner === targetUserId &&
+              existingH.source === 'PDF' &&
+              incomingProviders.has(docProvider) &&
+              existingH.id &&
+              !String(existingH.id).startsWith('placeholder-')
+            ) {
+              batch.delete(doc(db, 'holdings', existingH.id));
             }
           });
+
           holdings.forEach((h: any) => {
             const id = "h_" + Math.random().toString(36).slice(2, 11);
             batch.set(doc(db, 'holdings', id), {
-              userId: targetUserId,
+              userId: user.id,
+              ownerId: targetUserId,
               householdId: user.householdId,
               ticker: String(h.ticker || h.schemeName || 'MF').slice(0, 50),
               quantity: Number(h.units) || 0,
@@ -439,8 +561,9 @@ export default function App() {
             });
           });
           await batch.commit();
+          const targetMemberName = data?.household?.membersData?.find((m: any) => m.id === targetUserId)?.name;
           setNotification({
-            message: `Imported ${holdings.length} ${holdings.length === 1 ? 'holding' : 'holdings'} from ${detectedProvider} with live prices!`,
+            message: `Imported ${holdings.length} ${holdings.length === 1 ? 'holding' : 'holdings'} from ${detectedProvider}${targetMemberName ? ` for ${targetMemberName}` : ''} with live prices!`,
             type: 'refreshed'
           });
         } else {
@@ -603,13 +726,17 @@ export default function App() {
 
   const createHousehold = async (name: string) => {
     if (!user) return;
+    const trimmedName = (name || '').trim() || `${user.name.split(' ')[0]}'s Family`;
     setLoading(true);
     try {
       const hhId = "h_" + Math.random().toString(36).substr(2, 9);
+      const inviteCode = generateClientInviteCode();
       const householdData = {
-        name,
+        name: trimmedName,
         members: [user.id],
-        settings: {},
+        settings: {
+          inviteCode
+        },
         targets: {
            assetSplit: { Equity: 0.70, Debt: 0.30 },
            equitySplit: { Indian: 0.60, Foreign: 0.40 },
@@ -620,6 +747,7 @@ export default function App() {
       };
       await setDoc(doc(db, 'households', hhId), householdData);
       await updateDoc(doc(db, 'users', user.id), { householdId: hhId });
+      setHouseholdInviteCode(inviteCode);
       setUser(prev => prev ? { ...prev, householdId: hhId } : null);
     } catch (e: any) {
       handleFirestoreError(e, OperationType.CREATE, 'households');
@@ -628,31 +756,139 @@ export default function App() {
     }
   };
 
+  const clearPendingInviteParam = () => {
+    setPendingInviteCode('');
+    try {
+      sessionStorage.removeItem('uw_pending_invite');
+      const url = new URL(window.location.href);
+      if (url.searchParams.has('invite') || url.searchParams.has('join')) {
+        url.searchParams.delete('invite');
+        url.searchParams.delete('join');
+        window.history.replaceState({}, '', url.pathname + url.search);
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const redeemInviteCode = async (rawCode: string, fallbackHouseholdId?: string, firestoreInviteId?: string) => {
+    if (!user || !auth.currentUser) return;
+    const cleanCode = (rawCode || '').trim().toUpperCase().replace(/^UW[\-\s]*/i, '').replace(/[^A-Z0-9]/g, '');
+    if (!cleanCode && !fallbackHouseholdId) {
+      setNotification({ message: "Please enter a valid Family Invite Code.", type: 'error' });
+      return;
+    }
+
+    setIsJoiningFamily(true);
+    try {
+      const idToken = await auth.currentUser.getIdToken();
+      const oldHouseholdId = user.householdId;
+      const previousOwnHoldings = (data?.holdings || []).filter(
+        (h) => h.userId === user.id && !(h as any).isPlaceholder
+      );
+
+      const res = await fetch('/api/household/redeem-invite', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`
+        },
+        body: JSON.stringify({
+          code: cleanCode || undefined,
+          householdId: fallbackHouseholdId
+        })
+      });
+
+      const payload = await res.json();
+      if (!res.ok) {
+        throw new Error(payload.error || "Failed to join family household");
+      }
+
+      const targetHhId: string = payload.householdId;
+      const targetHhName: string = payload.householdName || "Family Portfolio";
+
+      await updateDoc(doc(db, 'users', user.id), { householdId: targetHhId });
+
+      if (firestoreInviteId) {
+        try {
+          await updateDoc(doc(db, 'invites', firestoreInviteId), { status: 'accepted' });
+        } catch {
+          // non-fatal if invite doc already updated
+        }
+      }
+
+      // If switching from a solo household into a shared family household, migrate user's existing holdings cleanly
+      if (oldHouseholdId && oldHouseholdId !== targetHhId && previousOwnHoldings.length > 0) {
+        try {
+          const migBatch = writeBatch(db);
+          previousOwnHoldings.forEach((oldH) => {
+            const newId = "h_" + Math.random().toString(36).slice(2, 11);
+            migBatch.set(doc(db, 'holdings', newId), {
+              userId: user.id,
+              ownerId: user.id,
+              householdId: targetHhId,
+              ticker: oldH.ticker,
+              quantity: oldH.quantity,
+              assetClass: oldH.assetClass,
+              currency: oldH.currency,
+              provider: oldH.provider || 'Manual',
+              source: oldH.source || 'PDF',
+              currentPrice: oldH.currentPrice || 0,
+              originalName: oldH.originalName || oldH.ticker,
+              syncedAt: Date.now()
+            });
+            if (oldH.id) {
+              migBatch.delete(doc(db, 'holdings', oldH.id));
+            }
+          });
+          await migBatch.commit();
+        } catch (migErr) {
+          console.warn("Holding migration skipped:", migErr);
+        }
+      }
+
+      clearPendingInviteParam();
+      setShowJoinByCodeModal(false);
+      setJoinCodeInput('');
+      setDashboardView('combined');
+      setActiveTab('dashboard');
+      setUser(prev => prev ? { ...prev, householdId: targetHhId } : null);
+      setNotification({ message: `Welcome to ${targetHhName}! Combined family view is now active.`, type: 'success' });
+    } catch (e: any) {
+      console.error("Join family error:", e);
+      setNotification({ message: e.message || "Could not join family portfolio.", type: 'error' });
+    } finally {
+      setIsJoiningFamily(false);
+      setLoading(false);
+    }
+  };
+
   const joinHousehold = async (inviteId: string) => {
     if (!user) return;
-    setLoading(true);
     try {
       const inviteSnap = await getDoc(doc(db, 'invites', inviteId));
       if (!inviteSnap.exists()) throw new Error("Invite not found");
       const invite = inviteSnap.data();
-      
-      const hhRef = doc(db, 'households', invite.householdId);
-      const hhSnap = await getDoc(hhRef);
-      if (!hhSnap.exists()) throw new Error("Household not found");
-      
-      const members = hhSnap.data().members || [];
-      if (!members.includes(user.id)) {
-        await updateDoc(hhRef, { members: [...members, user.id] });
-      }
-      
-      await updateDoc(doc(db, 'users', user.id), { householdId: invite.householdId });
-      await updateDoc(doc(db, 'invites', inviteId), { status: 'accepted' });
-      
-      setUser(prev => prev ? { ...prev, householdId: invite.householdId } : null);
+      await redeemInviteCode(invite.inviteCode || '', invite.householdId, inviteId);
     } catch (e: any) {
-      handleFirestoreError(e, OperationType.UPDATE, 'households/join');
-    } finally {
-      setLoading(false);
+      setNotification({ message: e.message || "Failed to accept invite", type: 'error' });
+    }
+  };
+
+  const copyInviteValue = async (mode: 'code' | 'link') => {
+    const code = householdInviteCode || household?.settings?.inviteCode || '';
+    if (!code) return;
+    const value = mode === 'code' ? code : `${window.location.origin}/?invite=${code}`;
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedInviteField(mode);
+      setNotification({
+        message: mode === 'code' ? `Copied Invite Code: ${code}` : 'Copied shareable Join Family link!',
+        type: 'success'
+      });
+      setTimeout(() => setCopiedInviteField(null), 2500);
+    } catch {
+      setNotification({ message: value, type: 'success' });
     }
   };
 
@@ -670,16 +906,34 @@ export default function App() {
       const hhRef = doc(db, 'households', user.householdId);
       const hhSnap = await getDoc(hhRef);
       if (hhSnap.exists()) {
-        const members = hhSnap.data().members.filter((m: string) => m !== memberId);
-        await updateDoc(hhRef, { members });
+        const hhData = hhSnap.data();
+        const currentMembers: string[] = hhData.members || [];
+        if (currentMembers.includes(memberId)) {
+          await updateDoc(hhRef, { members: currentMembers.filter((m: string) => m !== memberId) });
+        }
+        const currentManual: any[] = hhData.settings?.manualMembers || [];
+        if (currentManual.some((m: any) => m.id === memberId)) {
+          await updateDoc(hhRef, {
+            settings: {
+              ...(hhData.settings || {}),
+              manualMembers: currentManual.filter((m: any) => m.id !== memberId)
+            }
+          });
+        }
       }
       
-      await updateDoc(doc(db, 'users', memberId), { householdId: null });
-      
-      const holdingsQuery = query(collection(db, 'holdings'), where('userId', '==', memberId), where('householdId', '==', user.householdId));
-      const hSnap = await getDocs(holdingsQuery);
-      await Promise.all(hSnap.docs.map(d => deleteDoc(d.ref)));
+      const memberHoldings = (data?.holdings || []).filter(
+        (h) => getHoldingOwnerId(h) === memberId && h.id && !String(h.id).startsWith('placeholder-')
+      );
+      if (memberHoldings.length > 0) {
+        const delBatch = writeBatch(db);
+        memberHoldings.forEach((h) => delBatch.delete(doc(db, 'holdings', h.id)));
+        await delBatch.commit();
+      }
 
+      if (dashboardView === memberId) {
+        setDashboardView('combined');
+      }
       setNotification({ message: 'Member removed successfully', type: 'success' });
     } catch (e: any) {
       handleFirestoreError(e, OperationType.DELETE, 'members');
@@ -734,55 +988,28 @@ export default function App() {
         resolvedCurrency = 'INR';
       }
 
-      if (dashboardView === user.id) {
-        const id = "h_" + Math.random().toString(36).slice(2, 11);
-        await setDoc(doc(db, 'holdings', id), {
-          userId: dashboardView,
-          householdId: user.householdId,
-          ticker: upperTicker,
-          originalName: manualName || upperTicker,
-          quantity: parseFloat(manualQty) || 0,
-          assetClass: manualAssetClass || 'Equity',
-          currency: resolvedCurrency,
-          provider: manualProvider || 'Manual',
-          source: manualSource || 'Manual',
-          currentPrice: parseFloat(manualPrice) || 0,
-          syncedAt: Date.now()
-        });
-        setShowManualEntryModal(false);
-        setManualTicker('');
-        setManualName('');
-        setManualQty('');
-        setManualPrice('');
-        setManualSource('Manual');
-      } else {
-        const res = await fetch('/api/portfolio/add-manual', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            userId: dashboardView,
-            householdId: user.householdId,
-            ticker: upperTicker,
-            originalName: manualName,
-            quantity: manualQty,
-            currentPrice: manualPrice || 0,
-            assetClass: manualAssetClass,
-            currency: resolvedCurrency,
-            provider: manualProvider,
-            source: manualSource
-          }),
-        });
-        if (res.ok) {
-          setShowManualEntryModal(false);
-          setManualTicker('');
-          setManualName('');
-          setManualQty('');
-          setManualPrice('');
-          setManualSource('Manual');
-        } else {
-          alert("Failed to add entry");
-        }
-      }
+      const id = "h_" + Math.random().toString(36).slice(2, 11);
+      await setDoc(doc(db, 'holdings', id), {
+        userId: user.id,
+        ownerId: dashboardView,
+        householdId: user.householdId,
+        ticker: upperTicker,
+        originalName: manualName || upperTicker,
+        quantity: parseFloat(manualQty) || 0,
+        assetClass: manualAssetClass || 'Equity',
+        currency: resolvedCurrency,
+        provider: manualProvider || 'Manual',
+        source: manualSource || 'Manual',
+        currentPrice: parseFloat(manualPrice) || 0,
+        syncedAt: Date.now()
+      });
+      setShowManualEntryModal(false);
+      setManualTicker('');
+      setManualName('');
+      setManualQty('');
+      setManualPrice('');
+      setManualSource('Manual');
+      setNotification({ message: `Added ${manualName || upperTicker} successfully!`, type: 'success' });
     } catch (e) {
       console.error("Add manual entry failed:", e);
       alert("Error adding entry");
@@ -792,61 +1019,90 @@ export default function App() {
   };
 
   const handleAddMemberManual = async () => {
-    if (!user?.householdId || !newMemberName || !newMemberEmail) return;
+    if (!user?.householdId || !newMemberName.trim()) return;
     setIsSaving(true);
     try {
       const id = "u_" + Math.random().toString(36).substr(2, 9);
-      const newUser = { 
-        email: newMemberEmail.toLowerCase(), 
-        name: newMemberName, 
-        householdId: user.householdId,
-        isManual: true 
+      const manualEntry = {
+        id,
+        email: (newMemberEmail || `${newMemberName.trim().toLowerCase().replace(/\s+/g, '.')}@family.local`).toLowerCase(),
+        name: newMemberName.trim(),
+        isManual: true
       };
-      
-      await setDoc(doc(db, 'users', id), newUser);
+
       const hhRef = doc(db, 'households', user.householdId);
       const hhSnap = await getDoc(hhRef);
       if (hhSnap.exists()) {
-        const members = hhSnap.data()?.members || [];
-        await updateDoc(hhRef, { members: [...members, id] });
+        const hhData = hhSnap.data();
+        const prevManual: any[] = Array.isArray(hhData.settings?.manualMembers) ? hhData.settings.manualMembers : [];
+        await updateDoc(hhRef, {
+          settings: {
+            ...(hhData.settings || {}),
+            manualMembers: [...prevManual, manualEntry]
+          }
+        });
       }
-      
+
       setShowAddMemberModal(false);
       setNewMemberName('');
       setNewMemberEmail('');
+      setNotification({ message: `Added ${manualEntry.name} to your household! You can now import their PDFs/CSVs.`, type: 'success' });
     } catch (e: any) {
-      handleFirestoreError(e, OperationType.CREATE, 'users/manual');
+      handleFirestoreError(e, OperationType.UPDATE, 'households/manualMembers');
     } finally {
       setIsSaving(false);
     }
   };
 
   const sendInvite = async () => {
-    if (!user?.householdId || !inviteEmail) return;
+    if (!user?.householdId || !inviteEmail.trim()) return;
     setIsInviting(true);
     try {
-      const inviteId = Date.now().toString();
+      const cleanEmail = inviteEmail.trim().toLowerCase();
+      const codeToShare = householdInviteCode || household?.settings?.inviteCode || generateClientInviteCode();
+      const inviteId = "inv_" + Date.now().toString();
       const inviteData = {
         fromUserId: user.id,
-        toEmail: inviteEmail.toLowerCase(),
+        toEmail: cleanEmail,
         householdId: user.householdId,
+        householdName: household?.name || 'Family Portfolio',
+        inviteCode: codeToShare,
         status: 'pending'
       };
       await setDoc(doc(db, 'invites', inviteId), inviteData);
-      
-      // We still need the server to send the email
-      fetch('/api/household/invite', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ fromUserId: user.id, toEmail: inviteEmail, householdId: user.householdId, skipDb: true }),
-      });
+
+      if (auth.currentUser) {
+        const idToken = await auth.currentUser.getIdToken();
+        const res = await fetch('/api/household/invite-code', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`
+          },
+          body: JSON.stringify({
+            householdId: user.householdId,
+            householdName: household?.name,
+            inviterName: user.name,
+            refreshToken: auth.currentUser.refreshToken,
+            preferredCode: codeToShare,
+            toEmail: cleanEmail
+          })
+        });
+        if (res.ok) {
+          const info = await res.json();
+          if (info.code) setHouseholdInviteCode(info.code);
+        }
+      }
 
       setInviteSent(true);
+      setInviteEmail('');
+      setNotification({
+        message: `Added pending invite for ${cleanEmail}! Share code ${codeToShare} or the join link for instant access.`,
+        type: 'success'
+      });
       setTimeout(() => {
-        setShowInviteModal(false);
         setInviteSent(false);
-        setInviteEmail('');
-      }, 2000);
+      }, 3000);
     } catch (e: any) {
       handleFirestoreError(e, OperationType.CREATE, 'invites');
     } finally {
@@ -985,6 +1241,7 @@ export default function App() {
     try {
       await updateDoc(doc(db, 'households', user.householdId), { 
         settings: {
+          ...(household?.settings || {}),
           emailAlertsEnabled: settings.enabled,
           accuracyThreshold: settings.threshold
         }
@@ -1004,7 +1261,7 @@ export default function App() {
     // Filter holdings based on the selected view
     const filteredHoldings = dashboardView === 'combined' 
       ? data.holdings 
-      : data.holdings.filter(h => h.userId === dashboardView);
+      : data.holdings.filter(h => getHoldingOwnerId(h) === dashboardView);
 
     const holdingsWithVal = filteredHoldings.map(h => {
       // Re-map arbitrage funds to Debt as per user preference
@@ -1063,7 +1320,7 @@ export default function App() {
     
     // Member Contributions
     const memberContributions = (data.household.membersData || []).map(m => {
-      const memberVal = holdingsWithVal.filter(h => h.userId === m.id).reduce((s, h) => s + h.valINR, 0);
+      const memberVal = holdingsWithVal.filter(h => !(h as any).isPlaceholder && getHoldingOwnerId(h) === m.id).reduce((s, h) => s + h.valINR, 0);
       return {
         id: m.id,
         name: m.name,
@@ -1162,8 +1419,8 @@ export default function App() {
         </div>
       );
     }
-    if (!user) return <LandingPage onLogin={login} onSignup={signup} onForgot={forgotPassword} onReset={resetPassword} onGoogleLogin={handleGoogleAuth} />;
-    if (!user.householdId) return <HouseholdSetup onCreate={createHousehold} onJoin={joinHousehold} invites={invites} />;
+    if (!user) return <LandingPage onLogin={login} onSignup={signup} onForgot={forgotPassword} onReset={resetPassword} onGoogleLogin={handleGoogleAuth} pendingInviteCode={pendingInviteCode} />;
+    if (!user.householdId) return <HouseholdSetup onCreate={createHousehold} onJoin={joinHousehold} onJoinByCode={redeemInviteCode} isJoining={isJoiningFamily} initialCode={pendingInviteCode} invites={invites} />;
     if (!data || !data.household || !stats) {
       return (
         <div className="p-8 text-center bg-slate-50 min-h-screen flex flex-col items-center justify-center">
@@ -1273,24 +1530,24 @@ export default function App() {
                 </button>
               ))}
             </div>
-            {dashboardView !== 'combined' && (
-              <div className="flex items-center gap-2">
-                <button 
-                  onClick={() => triggerUpload(dashboardView)}
-                  disabled={isParsing}
-                  className="flex items-center gap-2 px-3 py-1 bg-white border border-slate-200 text-slate-700 rounded-lg text-xs font-bold hover:bg-slate-50 transition-all shadow-sm active:scale-95 disabled:opacity-50"
-                >
-                  {isParsing ? <RefreshCcw size={14} className="animate-spin text-indigo-500" /> : <FileUp size={14} />}
-                  {isParsing ? "PARSING..." : "IMPORT PDF / CSV"}
-                </button>
+            <div className="flex items-center gap-2">
+              <button 
+                onClick={() => triggerUpload(dashboardView !== 'combined' ? dashboardView : user.id)}
+                disabled={isParsing}
+                className="flex items-center gap-2 px-3 py-1 bg-white border border-slate-200 text-slate-700 rounded-lg text-xs font-bold hover:bg-slate-50 transition-all shadow-sm active:scale-95 disabled:opacity-50"
+              >
+                {isParsing ? <RefreshCcw size={14} className="animate-spin text-indigo-500" /> : <FileUp size={14} />}
+                {isParsing ? "PARSING..." : "IMPORT PDF / CSV"}
+              </button>
+              {dashboardView !== 'combined' && (
                 <button 
                   onClick={() => setShowManualEntryModal(true)}
                   className="flex items-center gap-2 px-3 py-1 bg-indigo-600 text-white rounded-lg text-xs font-bold hover:bg-indigo-700 transition-all shadow-sm active:scale-95"
                 >
                   <Plus size={14} /> MANUAL ENTRY
                 </button>
-              </div>
-            )}
+              )}
+            </div>
           </div>
             <div className="flex items-center space-x-3 md:space-x-6">
             <div className="hidden sm:flex flex-col items-end gap-0.5">
@@ -1582,8 +1839,11 @@ export default function App() {
                   <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8">
                     <div><h3 className="text-lg md:text-xl font-bold mb-1 text-slate-800">Connection Manager</h3><p className="text-slate-500 text-xs md:text-sm">Linked sources for your family portfolio</p></div>
                     <div className="flex flex-wrap gap-2 md:gap-3">
-                      <button onClick={() => setShowInviteModal(true)} className="flex items-center gap-2 border border-indigo-200 text-indigo-600 px-3 md:px-4 py-2 rounded-lg font-bold text-xs md:text-sm hover:bg-indigo-50 transition-all">
-                        <Users size={16} /> Invite
+                      <button onClick={() => setShowInviteModal(true)} className="flex items-center gap-2 bg-indigo-600 text-white px-3 md:px-4 py-2 rounded-lg font-bold text-xs md:text-sm hover:bg-indigo-700 transition-all shadow-sm">
+                        <Users size={16} /> Invite Family
+                      </button>
+                      <button onClick={() => { setJoinCodeInput(pendingInviteCode || ''); setShowJoinByCodeModal(true); }} className="flex items-center gap-2 border border-emerald-200 text-emerald-700 bg-emerald-50/50 px-3 md:px-4 py-2 rounded-lg font-bold text-xs md:text-sm hover:bg-emerald-50 transition-all">
+                        <Share2 size={16} /> Join Family
                       </button>
                       <button onClick={() => setShowSyncModal(true)} className="flex items-center gap-2 border border-slate-200 text-slate-600 px-3 md:px-4 py-2 rounded-lg font-bold text-xs md:text-sm hover:bg-slate-50 transition-all">
                         <Plus size={16} /> Import Data
@@ -1591,10 +1851,39 @@ export default function App() {
                     </div>
                   </div>
 
+                  {(householdInviteCode || data.household.settings?.inviteCode) && (
+                    <div className="mb-8 p-4 md:p-5 rounded-2xl bg-gradient-to-r from-indigo-50/80 via-white to-emerald-50/50 border border-indigo-100 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                      <div>
+                        <div className="text-[10px] font-black text-indigo-600 uppercase tracking-widest mb-1">Family Invite Code • Share to Link Accounts</div>
+                        <p className="text-xs text-slate-600">
+                          Family members can enter code <span className="font-mono font-black text-slate-900 bg-white px-2 py-0.5 rounded border border-slate-200">{householdInviteCode || data.household.settings?.inviteCode}</span> under <strong>Join Family</strong> (no email setup needed).
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => copyInviteValue('code')}
+                          className="flex items-center gap-1.5 px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-bold text-slate-700 hover:bg-slate-50 transition-all"
+                        >
+                          {copiedInviteField === 'code' ? <Check size={14} className="text-emerald-600" /> : <Copy size={14} />}
+                          Copy Code
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => copyInviteValue('link')}
+                          className="flex items-center gap-1.5 px-3 py-2 bg-indigo-600 rounded-xl text-xs font-bold text-white hover:bg-indigo-700 transition-all shadow-sm"
+                        >
+                          {copiedInviteField === 'link' ? <Check size={14} /> : <Share2 size={14} />}
+                          Copy Join Link
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
                   <div className="space-y-6">
                     <section>
                       <div className="flex items-center justify-between mb-4">
-                        <h4 className="text-xs font-bold text-slate-400 uppercase tracking-widest">Household Members</h4>
+                        <h4 className="text-xs font-bold text-slate-400 uppercase tracking-widest">Household Members ({data.household.name})</h4>
                         <button 
                           onClick={() => setShowAddMemberModal(true)}
                           className="text-[10px] font-bold text-indigo-600 hover:bg-indigo-50 px-2 py-1 rounded transition-colors"
@@ -1609,8 +1898,8 @@ export default function App() {
                              id={m.id}
                              name={m.name} 
                              email={m.email} 
-                             role={idx === 0 ? "Admin" : "Member"} 
-                             accounts={data.holdings.filter(h => h.userId === m.id).length}
+                             role={m.isManual ? "Tracked" : (idx === 0 ? "Admin" : "Member")} 
+                             accounts={data.holdings.filter(h => getHoldingOwnerId(h) === m.id).length}
                              isLast={idx === (data.household.membersData?.length || 0) - 1}
                              onRemove={removeMember}
                              currentUserId={user.id}
@@ -1648,7 +1937,7 @@ export default function App() {
                       ].map((src) => {
                         const activeMemberId = dashboardView !== 'combined' ? dashboardView : user.id;
                         const activeMemberName = data.household.membersData?.find((m: any) => m.id === activeMemberId)?.name || 'You';
-                        const count = data.holdings.filter(h => h.userId === activeMemberId && src.match(h)).length;
+                        const count = data.holdings.filter(h => getHoldingOwnerId(h) === activeMemberId && src.match(h)).length;
                         return (
                           <SourceRow
                             key={src.provider}
@@ -1688,7 +1977,7 @@ export default function App() {
                       ].map((src) => {
                         const activeMemberId = dashboardView !== 'combined' ? dashboardView : user.id;
                         const activeMemberName = data.household.membersData?.find((m: any) => m.id === activeMemberId)?.name || 'You';
-                        const count = data.holdings.filter(h => h.userId === activeMemberId && h.provider === src.provider).length;
+                        const count = data.holdings.filter(h => getHoldingOwnerId(h) === activeMemberId && h.provider === src.provider).length;
                         return (
                           <SourceRow
                             key={src.provider}
@@ -1814,29 +2103,102 @@ export default function App() {
             <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm">
               <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }} className="bg-white rounded-2xl w-full max-w-md overflow-hidden shadow-2xl">
                 <div className="p-6 border-b border-slate-100 flex justify-between items-center">
-                  <h3 className="font-bold text-lg">Invite Family Member</h3>
+                  <h3 className="font-bold text-lg text-slate-800">Invite Family Member</h3>
                   <button onClick={() => setShowInviteModal(false)} className="text-slate-400 hover:text-slate-600">✕</button>
+                </div>
+                <div className="p-6 space-y-5">
+                  <div className="p-4 rounded-2xl bg-indigo-50/70 border border-indigo-100 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] font-black text-indigo-600 uppercase tracking-widest">Instant Invite Code (Recommended)</span>
+                      <span className="text-[10px] font-bold text-emerald-600 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-100">Works Immediately</span>
+                    </div>
+                    <div className="flex items-center justify-between bg-white px-4 py-3 rounded-xl border border-indigo-100">
+                      <span className="font-mono text-2xl font-black tracking-[0.25em] text-slate-900">
+                        {householdInviteCode || data?.household?.settings?.inviteCode || '------'}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => copyInviteValue('code')}
+                        className="flex items-center gap-1.5 px-3 py-1.5 bg-slate-900 text-white rounded-lg text-xs font-bold hover:bg-slate-800 transition-all"
+                      >
+                        {copiedInviteField === 'code' ? <Check size={14} /> : <Copy size={14} />}
+                        {copiedInviteField === 'code' ? 'Copied' : 'Copy Code'}
+                      </button>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => copyInviteValue('link')}
+                      className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition-all shadow-sm"
+                    >
+                      {copiedInviteField === 'link' ? <Check size={14} /> : <Share2 size={14} />}
+                      {copiedInviteField === 'link' ? 'Join Link Copied to Clipboard!' : 'Copy Shareable Join Link (WhatsApp / SMS)'}
+                    </button>
+                    <p className="text-[11px] text-slate-500 leading-relaxed">
+                      Your spouse or family member can open the link or enter this code under <strong>Join Family</strong> to link accounts in real time.
+                    </p>
+                  </div>
+
+                  <div className="relative">
+                    <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-slate-100"></div></div>
+                    <div className="relative flex justify-center text-[10px] uppercase"><span className="bg-white px-2 text-slate-400 font-bold tracking-widest">Or Pre-Approve by Email</span></div>
+                  </div>
+
+                  <div className="space-y-3">
+                    <div>
+                      <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Member Email</label>
+                      <input 
+                        value={inviteEmail} 
+                        onChange={e => setInviteEmail(e.target.value)} 
+                        type="email" 
+                        className="w-full px-4 py-3 bg-slate-50 border border-slate-100 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-600/20" 
+                        placeholder="spouse@gmail.com" 
+                      />
+                    </div>
+                    <button 
+                      onClick={sendInvite} 
+                      disabled={isInviting || inviteSent || !inviteEmail.trim()}
+                      className={`w-full text-white rounded-xl py-3.5 text-sm font-bold shadow-sm transition-all flex items-center justify-center gap-2 disabled:opacity-50 ${inviteSent ? 'bg-emerald-600' : 'bg-slate-900 hover:bg-slate-800'}`}
+                    >
+                      {isInviting ? <RefreshCcw className="animate-spin" size={18} /> : inviteSent ? <><Check size={18} /> Added to Pending Invites!</> : 'Pre-Approve Email Invite'}
+                    </button>
+                  </div>
+                </div>
+              </motion.div>
+            </div>
+          )}
+        </AnimatePresence>
+
+        {/* Join Existing Family by Code Modal */}
+        <AnimatePresence>
+          {showJoinByCodeModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm">
+              <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }} className="bg-white rounded-2xl w-full max-w-md overflow-hidden shadow-2xl">
+                <div className="p-6 border-b border-slate-100 flex justify-between items-center">
+                  <h3 className="font-bold text-lg text-slate-800">Join a Family Portfolio</h3>
+                  <button onClick={() => setShowJoinByCodeModal(false)} className="text-slate-400 hover:text-slate-600">✕</button>
                 </div>
                 <div className="p-6 space-y-4">
                   <p className="text-sm text-slate-500 leading-relaxed">
-                    Invite your spouse or family member to sync their accounts. You'll both be able to see the combined household allocation.
+                    Enter the 6-character <strong>Family Invite Code</strong> shared by your family member. Any holdings you already added will move with you automatically.
                   </p>
                   <div>
-                    <label className="block text-xs font-bold text-slate-400 uppercase mb-2">Member Email</label>
-                    <input 
-                      value={inviteEmail} 
-                      onChange={e => setInviteEmail(e.target.value)} 
-                      type="email" 
-                      className="w-full px-4 py-3 bg-slate-50 border border-slate-100 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-600/20" 
-                      placeholder="spouse@gmail.com" 
+                    <label className="block text-xs font-bold text-slate-400 uppercase mb-2">Family Invite Code</label>
+                    <input
+                      value={joinCodeInput}
+                      onChange={e => setJoinCodeInput(e.target.value.toUpperCase())}
+                      type="text"
+                      maxLength={12}
+                      className="w-full px-4 py-3.5 bg-slate-50 border border-slate-200 rounded-xl font-mono text-lg font-black tracking-[0.2em] uppercase text-center focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
+                      placeholder="E.G. K7M4P9"
                     />
                   </div>
-                  <button 
-                    onClick={sendInvite} 
-                    disabled={isInviting || inviteSent}
-                    className={`w-full text-white rounded-xl py-4 font-bold shadow-lg transition-all flex items-center justify-center gap-2 ${inviteSent ? 'bg-emerald-600' : 'bg-indigo-600 hover:bg-indigo-700 shadow-indigo-100'}`}
+                  <button
+                    onClick={() => redeemInviteCode(joinCodeInput)}
+                    disabled={isJoiningFamily || !joinCodeInput.trim()}
+                    className="w-full bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-xl py-4 font-bold shadow-lg shadow-emerald-100 transition-all flex items-center justify-center gap-2"
                   >
-                    {isInviting ? <RefreshCcw className="animate-spin" size={20} /> : inviteSent ? <><Check size={20} /> Invitation Sent!</> : 'Send Invitation'}
+                    {isJoiningFamily ? <RefreshCcw className="animate-spin" size={18} /> : <Users size={18} />}
+                    {isJoiningFamily ? 'Joining Family...' : 'Join Family Portfolio'}
                   </button>
                 </div>
               </motion.div>
@@ -2505,8 +2867,9 @@ function DetailViewModal({
   const groupedByMember = useMemo(() => {
     const groups: Record<string, Holding[]> = {};
     augmentedHoldings.forEach(h => {
-      if (!groups[h.userId]) groups[h.userId] = [];
-      groups[h.userId].push(h);
+      const mId = getHoldingOwnerId(h);
+      if (!groups[mId]) groups[mId] = [];
+      groups[mId].push(h);
     });
     return groups;
   }, [augmentedHoldings]);
@@ -2945,14 +3308,15 @@ function SyncOption({ title, desc, icon, onClick, badge, isLinked }: { title: st
   );
 }
 
-function LandingPage({ onLogin, onSignup, onForgot, onReset, onGoogleLogin }: { 
+function LandingPage({ onLogin, onSignup, onForgot, onReset, onGoogleLogin, pendingInviteCode }: { 
   onLogin: (e: string, p: string) => void, 
   onSignup: (e: string, p: string, n: string) => void,
   onForgot: (e: string) => Promise<boolean>,
   onReset: (e: string, c: string, p: string) => Promise<boolean>,
-  onGoogleLogin: () => void
+  onGoogleLogin: () => void,
+  pendingInviteCode?: string
 }) {
-  const [activeView, setActiveView] = useState<'login' | 'signup' | 'forgot' | 'reset'>('login');
+  const [activeView, setActiveView] = useState<'login' | 'signup' | 'forgot' | 'reset'>(() => pendingInviteCode ? 'signup' : 'login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [name, setName] = useState('');
@@ -3004,6 +3368,15 @@ function LandingPage({ onLogin, onSignup, onForgot, onReset, onGoogleLogin }: {
           <p className="text-indigo-100 font-medium">Global Family Wealth Engine</p>
         </div>
         <div className="p-8">
+          {pendingInviteCode && (
+            <div className="mb-6 p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 flex items-start gap-3">
+              <div className="p-1.5 bg-emerald-600 text-white rounded-lg shrink-0 mt-0.5"><Users size={14} /></div>
+              <div>
+                <p className="text-xs font-black text-emerald-900 uppercase tracking-wide">Family Invite Code: {pendingInviteCode}</p>
+                <p className="text-xs text-emerald-700 mt-0.5 leading-snug">Create an account or log in below to join your shared family portfolio.</p>
+              </div>
+            </div>
+          )}
           <h2 className="text-xl font-bold mb-6 text-slate-800">
             {activeView === 'login' && 'Welcome Back'}
             {activeView === 'signup' && 'Create Account'}
@@ -3159,40 +3532,122 @@ function LandingPage({ onLogin, onSignup, onForgot, onReset, onGoogleLogin }: {
   );
 }
 
-function HouseholdSetup({ onCreate, onJoin, invites }: { onCreate: (n: string) => void, onJoin: (id: string) => void, invites: Invite[] }) {
+function HouseholdSetup({
+  onCreate,
+  onJoin,
+  onJoinByCode,
+  isJoining,
+  initialCode,
+  invites
+}: {
+  onCreate: (n: string) => void,
+  onJoin: (id: string) => void,
+  onJoinByCode: (code: string) => void,
+  isJoining?: boolean,
+  initialCode?: string,
+  invites: Invite[]
+}) {
   const [name, setName] = useState('');
+  const [inviteCode, setInviteCode] = useState(initialCode || '');
+  const [previewInfo, setPreviewInfo] = useState<{ householdName: string; inviterName: string } | null>(null);
+
+  useEffect(() => {
+    if (initialCode && !inviteCode) {
+      setInviteCode(initialCode);
+    }
+  }, [initialCode]);
+
+  useEffect(() => {
+    const clean = inviteCode.trim().toUpperCase().replace(/^UW[\-\s]*/i, '').replace(/[^A-Z0-9]/g, '');
+    if (clean.length < 4) {
+      setPreviewInfo(null);
+      return;
+    }
+    let active = true;
+    const t = setTimeout(async () => {
+      try {
+        const res = await fetch(`/api/household/invite-info/${encodeURIComponent(clean)}`);
+        if (res.ok && active) {
+          const info = await res.json();
+          setPreviewInfo({ householdName: info.householdName, inviterName: info.inviterName });
+        } else if (active) {
+          setPreviewInfo(null);
+        }
+      } catch {
+        if (active) setPreviewInfo(null);
+      }
+    }, 250);
+    return () => {
+      active = false;
+      clearTimeout(t);
+    };
+  }, [inviteCode]);
+
   return (
     <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
-      <div className="w-full max-w-2xl grid grid-cols-1 md:grid-cols-2 gap-8">
-        <div className="bg-white p-8 rounded-3xl shadow-xl shadow-slate-200 border border-slate-100">
-          <div className="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center mb-6"><Users /></div>
-          <h2 className="text-xl font-bold mb-2">Create a Household</h2>
-          <p className="text-sm text-slate-500 mb-8 leading-relaxed">Start a new combined portfolio for your family. You'll be the administrator.</p>
+      <div className="w-full max-w-3xl grid grid-cols-1 md:grid-cols-2 gap-8">
+        <div className="bg-white p-8 rounded-3xl shadow-xl shadow-slate-200 border border-slate-100 flex flex-col justify-between">
+          <div>
+            <div className="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center mb-6"><Users /></div>
+            <h2 className="text-xl font-bold mb-2 text-slate-800">Create a Household</h2>
+            <p className="text-sm text-slate-500 mb-8 leading-relaxed">Start a new combined portfolio for your family. You'll receive a shareable 6-character code to invite family members.</p>
+          </div>
           <div className="space-y-4">
-            <input value={name} onChange={e => setName(e.target.value)} className="w-full px-4 py-3 bg-slate-50 border border-slate-100 rounded-xl" placeholder="The Garg Family" />
-            <button onClick={() => onCreate(name)} className="w-full bg-indigo-600 text-white rounded-xl py-4 font-bold shadow-lg shadow-indigo-100">Initialize Family Plan</button>
+            <input value={name} onChange={e => setName(e.target.value)} className="w-full px-4 py-3 bg-slate-50 border border-slate-100 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-600/20" placeholder="The Garg Family" />
+            <button onClick={() => onCreate(name)} className="w-full bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl py-4 font-bold shadow-lg shadow-indigo-100 transition-all">Initialize Family Plan</button>
           </div>
         </div>
         
-        <div className="bg-white p-8 rounded-3xl shadow-xl shadow-slate-200 border border-slate-100">
-          <div className="w-12 h-12 bg-emerald-50 text-emerald-600 rounded-2xl flex items-center justify-center mb-6"><Check /></div>
-          <h2 className="text-xl font-bold mb-2">Pending Invites</h2>
-          <p className="text-sm text-slate-500 mb-8 leading-relaxed">If someone invited you to their family, you'll see it here.</p>
-          <div className="space-y-4">
-            {invites.length === 0 ? (
-              <div className="text-center py-8 text-slate-400 italic text-sm border-2 border-dashed border-slate-100 rounded-2xl">No pending invites found</div>
-            ) : (
-              invites.map(inv => (
-                <div key={inv.id} className="p-4 bg-slate-50 rounded-xl border border-slate-100 flex items-center justify-between">
-                  <div>
-                    <p className="text-sm font-bold">Invite to {inv.householdName}</p>
-                    <p className="text-xs text-slate-500">From a family member</p>
-                  </div>
-                  <button onClick={() => onJoin(inv.id)} className="bg-emerald-600 text-white px-4 py-2 rounded-lg text-xs font-bold hover:bg-emerald-700 transition shadow-lg shadow-emerald-50">JOIN</button>
+        <div className="bg-white p-8 rounded-3xl shadow-xl shadow-slate-200 border border-emerald-100 flex flex-col justify-between">
+          <div>
+            <div className="w-12 h-12 bg-emerald-50 text-emerald-600 rounded-2xl flex items-center justify-center mb-6"><Share2 /></div>
+            <h2 className="text-xl font-bold mb-2 text-slate-800">Join Existing Family</h2>
+            <p className="text-sm text-slate-500 mb-6 leading-relaxed">Enter the 6-character Family Invite Code from your spouse or family member to merge into a shared dashboard.</p>
+            <div className="space-y-3">
+              <input
+                value={inviteCode}
+                onChange={e => setInviteCode(e.target.value.toUpperCase())}
+                maxLength={12}
+                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-mono text-lg font-black tracking-[0.2em] uppercase text-center focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
+                placeholder="ENTER CODE (E.G. K7M4P9)"
+              />
+              {previewInfo && (
+                <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-100 text-xs text-emerald-800 font-semibold flex items-center gap-2">
+                  <Check size={14} className="text-emerald-600 shrink-0" />
+                  <span>Found <strong>{previewInfo.householdName}</strong> (invited by {previewInfo.inviterName})</span>
                 </div>
-              ))
-            )}
+              )}
+              <button
+                onClick={() => onJoinByCode(inviteCode)}
+                disabled={isJoining || !inviteCode.trim()}
+                className="w-full bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white rounded-xl py-4 font-bold shadow-lg shadow-emerald-100 transition-all flex items-center justify-center gap-2"
+              >
+                {isJoining ? <RefreshCcw size={18} className="animate-spin" /> : <Check size={18} />}
+                {isJoining ? 'Joining Family...' : 'Join Family Portfolio'}
+              </button>
+            </div>
           </div>
+
+          {invites.length > 0 && (
+            <div className="mt-6 pt-5 border-t border-slate-100 space-y-3">
+              <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Pending Email Invites</div>
+              {invites.map(inv => (
+                <div key={inv.id} className="p-3.5 bg-slate-50 rounded-xl border border-slate-100 flex items-center justify-between gap-2">
+                  <div>
+                    <p className="text-xs font-bold text-slate-800">Invite to {inv.householdName || 'Family Portfolio'}</p>
+                    <p className="text-[11px] text-slate-500">{inv.inviteCode ? `Code: ${inv.inviteCode}` : 'Pre-approved for your email'}</p>
+                  </div>
+                  <button
+                    onClick={() => onJoin(inv.id)}
+                    disabled={isJoining}
+                    className="bg-emerald-600 text-white px-4 py-2 rounded-lg text-xs font-bold hover:bg-emerald-700 transition shadow-sm shrink-0"
+                  >
+                    JOIN
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -3954,7 +4409,7 @@ function LiveMarketsView({ holdings, members, householdId }: { holdings: Holding
               <div className="text-right">
                 <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest block mb-1">Owners</span>
                 <div className="flex -space-x-2 justify-end">
-                  {members.filter(m => holdings.some(hold => hold.userId === m.id && (hold.ticker + (hold.originalName || '')) === (h.ticker + (h.originalName || '')))).map(m => (
+                  {members.filter(m => holdings.some(hold => getHoldingOwnerId(hold) === m.id && (hold.ticker + (hold.originalName || '')) === (h.ticker + (h.originalName || '')))).map(m => (
                     <div 
                       key={m.id} 
                       className="w-7 h-7 rounded-full border-2 border-white flex items-center justify-center text-[10px] font-bold text-white shadow-sm ring-1 ring-slate-100"

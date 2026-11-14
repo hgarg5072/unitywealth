@@ -12,7 +12,8 @@ export interface Invite {
   fromUserId: string;
   toEmail: string;
   householdId: string;
-  householdName: string;
+  householdName?: string;
+  inviteCode?: string;
   status: 'pending' | 'accepted' | 'declined';
 }
 
@@ -22,6 +23,7 @@ export type Currency = "USD" | "INR";
 export interface Holding {
   id: string;
   userId: string;
+  ownerId?: string;
   householdId: string;
   ticker: string;
   quantity: number;
@@ -57,17 +59,26 @@ export interface PortfolioTargets {
   foreignBreakdown: TargetCategory[];
 }
 
+export interface ManualMember {
+  id: string;
+  name: string;
+  email: string;
+  isManual?: boolean;
+}
+
 export interface HouseholdSettings {
   emailAlertsEnabled?: boolean;
   accuracyThreshold?: number;
   lastAlertSent?: number;
+  inviteCode?: string;
+  manualMembers?: ManualMember[];
 }
 
 export interface Household {
   id: string;
   name: string;
   members: string[];
-  membersData?: { id: string, name: string, email: string }[];
+  membersData?: { id: string, name: string, email: string, isManual?: boolean }[];
   targets: PortfolioTargets;
   settings?: HouseholdSettings;
 }

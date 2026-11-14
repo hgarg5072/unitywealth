@@ -172,7 +172,8 @@ async function startServer() {
         }
       },
       holdings: [],
-      invites: []
+      invites: [],
+      inviteCodes: {}
     }, null, 2));
   }
 
@@ -180,10 +181,11 @@ async function startServer() {
     try {
       const db = JSON.parse(fs.readFileSync(DB_PATH, "utf-8"));
       if (!db.invites) db.invites = [];
+      if (!db.inviteCodes) db.inviteCodes = {};
       return db;
     } catch (e) {
       console.error("DB Read failed, returning empty state to prevent crash");
-      return { users: {}, households: {}, holdings: [], invites: [] };
+      return { users: {}, households: {}, holdings: [], invites: [], inviteCodes: {} };
     }
   }
 
@@ -801,6 +803,305 @@ async function startServer() {
     }
     saveDB(db);
     res.json(db.households[householdId]);
+  });
+
+  function normalizeInviteCode(raw: string): string {
+    return String(raw || "")
+      .trim()
+      .toUpperCase()
+      .replace(/^UW[\-\s]*/i, "")
+      .replace(/[^A-Z0-9]/g, "");
+  }
+
+  function generateInviteCode(existingCodes: Record<string, any>): string {
+    const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    for (let attempt = 0; attempt < 20; attempt++) {
+      let code = "";
+      const bytes = crypto.randomBytes(6);
+      for (let i = 0; i < 6; i++) {
+        code += alphabet[bytes[i] % alphabet.length];
+      }
+      if (!existingCodes[code]) return code;
+    }
+    return crypto.randomBytes(3).toString("hex").toUpperCase();
+  }
+
+  async function verifyFirebaseIdToken(idToken: string): Promise<{ uid: string; email: string; name: string }> {
+    const resp = await axios.post(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
+      { idToken },
+      { timeout: 10000, httpsAgent: ipv4HttpsAgent }
+    );
+    const u = resp.data?.users?.[0];
+    if (!u?.localId) {
+      throw new Error("Invalid Firebase authentication token");
+    }
+    return {
+      uid: u.localId,
+      email: (u.email || "").toLowerCase(),
+      name: u.displayName || ""
+    };
+  }
+
+  async function refreshFirebaseIdToken(refreshToken: string): Promise<string> {
+    const params = new URLSearchParams();
+    params.set("grant_type", "refresh_token");
+    params.set("refresh_token", refreshToken);
+    const resp = await axios.post(
+      `https://securetoken.googleapis.com/v1/token?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
+      params.toString(),
+      {
+        timeout: 10000,
+        httpsAgent: ipv4HttpsAgent,
+        headers: { "Content-Type": "application/x-www-form-urlencoded" }
+      }
+    );
+    if (!resp.data?.id_token) {
+      throw new Error("Failed to refresh household authorization token");
+    }
+    return resp.data.id_token;
+  }
+
+  async function firestoreRestGet(docPath: string, idToken: string): Promise<any> {
+    const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/${docPath}`;
+    const resp = await axios.get(url, {
+      timeout: 10000,
+      httpsAgent: ipv4HttpsAgent,
+      headers: { Authorization: `Bearer ${idToken}` }
+    });
+    return resp.data;
+  }
+
+  async function firestoreRestPatch(docPath: string, fieldPaths: string[], fields: any, idToken: string): Promise<any> {
+    const maskQuery = fieldPaths.map(f => `updateMask.fieldPaths=${encodeURIComponent(f)}`).join("&");
+    const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/${docPath}?${maskQuery}`;
+    const resp = await axios.patch(
+      url,
+      { fields },
+      {
+        timeout: 10000,
+        httpsAgent: ipv4HttpsAgent,
+        headers: {
+          Authorization: `Bearer ${idToken}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+    return resp.data;
+  }
+
+  // Register or sync a household's shareable Invite Code (backed by member auth)
+  app.post("/api/household/invite-code", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization || "";
+      const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : String(req.body?.idToken || "");
+      const { householdId, householdName, inviterName, refreshToken, preferredCode, toEmail } = req.body || {};
+
+      if (!idToken || !householdId) {
+        return res.status(400).json({ error: "Missing authentication token or householdId" });
+      }
+
+      const caller = await verifyFirebaseIdToken(idToken);
+      const hhDoc = await firestoreRestGet(`households/${householdId}`, idToken);
+      const memberValues: any[] = hhDoc?.fields?.members?.arrayValue?.values || [];
+      const memberIds = memberValues.map((v: any) => v.stringValue).filter(Boolean);
+
+      if (!memberIds.includes(caller.uid)) {
+        return res.status(403).json({ error: "Only an existing household member can generate an invite code." });
+      }
+
+      const resolvedHouseholdName =
+        householdName ||
+        hhDoc?.fields?.name?.stringValue ||
+        "Family Portfolio";
+      const firestoreStoredCode = normalizeInviteCode(
+        hhDoc?.fields?.settings?.mapValue?.fields?.inviteCode?.stringValue || ""
+      );
+
+      const db = getDB();
+      if (!db.inviteCodes) db.inviteCodes = {};
+
+      // Find existing code for this household, or use preferredCode / firestoreStoredCode, or generate a new 6-char code
+      let code = "";
+      const existingEntry = Object.values(db.inviteCodes).find((entry: any) => entry.householdId === householdId) as any;
+      const requestedClean = normalizeInviteCode(preferredCode || firestoreStoredCode);
+
+      if (requestedClean && requestedClean.length >= 4 && (!db.inviteCodes[requestedClean] || db.inviteCodes[requestedClean].householdId === householdId)) {
+        code = requestedClean;
+        if (existingEntry && existingEntry.code !== code) {
+          delete db.inviteCodes[existingEntry.code];
+        }
+      } else if (existingEntry?.code) {
+        code = existingEntry.code;
+      } else {
+        code = generateInviteCode(db.inviteCodes);
+      }
+
+      db.inviteCodes[code] = {
+        code,
+        householdId,
+        householdName: resolvedHouseholdName,
+        inviterUid: caller.uid,
+        inviterName: inviterName || caller.name || caller.email,
+        refreshToken: refreshToken || existingEntry?.refreshToken || "",
+        lastIdToken: idToken,
+        lastTokenAt: Date.now(),
+        updatedAt: Date.now()
+      };
+
+      if (toEmail && typeof toEmail === "string") {
+        const cleanEmail = toEmail.trim().toLowerCase();
+        if (cleanEmail) {
+          const alreadyPending = db.invites.find(
+            (i: any) => i.toEmail === cleanEmail && i.householdId === householdId && i.status === "pending"
+          );
+          if (!alreadyPending) {
+            db.invites.push({
+              id: Date.now().toString(),
+              fromUserId: caller.uid,
+              toEmail: cleanEmail,
+              householdId,
+              householdName: resolvedHouseholdName,
+              inviteCode: code,
+              status: "pending"
+            });
+          }
+          const host = req.get("host");
+          const proto = req.get("x-forwarded-proto") || (host?.includes("localhost") ? "http" : "https");
+          const baseUrl = (process.env.APP_URL || `${proto}://${host}`).replace(/\/$/, "");
+          logEmail(
+            cleanEmail,
+            `Join ${resolvedHouseholdName} on UnityWealth (Invite Code: ${code})`,
+            `${inviterName || caller.name || "A family member"} invited you to join '${resolvedHouseholdName}' on UnityWealth.\n\nInvite Code: ${code}\nDirect Join Link: ${baseUrl}/?invite=${code}`
+          ).catch(() => {});
+        }
+      }
+
+      saveDB(db);
+
+      const host = req.get("host");
+      const proto = req.get("x-forwarded-proto") || (host?.includes("localhost") ? "http" : "https");
+      const baseUrl = (process.env.APP_URL || `${proto}://${host}`).replace(/\/$/, "");
+
+      res.json({
+        success: true,
+        code,
+        householdId,
+        householdName: resolvedHouseholdName,
+        joinUrl: `${baseUrl}/?invite=${code}`
+      });
+    } catch (e: any) {
+      const status = e?.response?.status === 403 ? 403 : 500;
+      console.error("[InviteCode] Error:", e?.response?.data || e.message);
+      res.status(status).json({ error: e?.response?.data?.error?.message || e.message || "Failed to generate invite code" });
+    }
+  });
+
+  // Public preview of an invite code (returns household name & inviter display name only)
+  app.get("/api/household/invite-info/:code", (req, res) => {
+    const code = normalizeInviteCode(req.params.code);
+    if (!code) return res.status(400).json({ error: "Invite code is required" });
+    const db = getDB();
+    const entry = db.inviteCodes?.[code];
+    if (!entry) {
+      return res.status(404).json({ error: "Invalid or expired invite code. Ask your family admin to open Invite and copy the latest code." });
+    }
+    res.json({
+      valid: true,
+      code: entry.code,
+      householdId: entry.householdId,
+      householdName: entry.householdName || "Family Portfolio",
+      inviterName: entry.inviterName || "Family Member"
+    });
+  });
+
+  // Redeem an Invite Code (or pending email invite) and add the authenticated user to the household
+  app.post("/api/household/redeem-invite", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization || "";
+      const joinerIdToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : String(req.body?.idToken || "");
+      const { code: rawCode, householdId: requestedHouseholdId } = req.body || {};
+
+      if (!joinerIdToken) {
+        return res.status(401).json({ error: "Please sign in first to join a family portfolio." });
+      }
+
+      const joiner = await verifyFirebaseIdToken(joinerIdToken);
+      const db = getDB();
+      const cleanCode = normalizeInviteCode(rawCode || "");
+
+      let entry: any = null;
+      if (cleanCode && db.inviteCodes?.[cleanCode]) {
+        entry = db.inviteCodes[cleanCode];
+      } else if (requestedHouseholdId) {
+        entry = Object.values(db.inviteCodes || {}).find((e: any) => e.householdId === requestedHouseholdId);
+      }
+
+      if (!entry) {
+        return res.status(404).json({
+          error: cleanCode
+            ? `Invite code "${cleanCode}" was not found. Please verify the 6-character code from your family admin's Invite dialog.`
+            : "This invitation requires an active household invite token. Ask your family admin to copy their Family Invite Code and enter it here."
+        });
+      }
+
+      let memberAuthToken = "";
+      if (entry.refreshToken) {
+        memberAuthToken = await refreshFirebaseIdToken(entry.refreshToken);
+        entry.lastIdToken = memberAuthToken;
+        entry.lastTokenAt = Date.now();
+      } else if (entry.lastIdToken && Date.now() - (entry.lastTokenAt || 0) < 50 * 60 * 1000) {
+        memberAuthToken = entry.lastIdToken;
+      } else {
+        return res.status(400).json({
+          error: "Invite session expired. Ask your family admin to open UnityWealth once to refresh the invite link."
+        });
+      }
+
+      const hhDoc = await firestoreRestGet(`households/${entry.householdId}`, memberAuthToken);
+      const currentValues: any[] = hhDoc?.fields?.members?.arrayValue?.values || [];
+      const currentMembers = currentValues.map((v: any) => v.stringValue).filter(Boolean);
+
+      if (!currentMembers.includes(joiner.uid)) {
+        const nextMembers = [...currentMembers, joiner.uid];
+        await firestoreRestPatch(
+          `households/${entry.householdId}`,
+          ["members"],
+          {
+            members: {
+              arrayValue: {
+                values: nextMembers.map((m) => ({ stringValue: m }))
+              }
+            }
+          },
+          memberAuthToken
+        );
+      }
+
+      // Mark any matching local email invite accepted
+      let dbChanged = false;
+      (db.invites || []).forEach((inv: any) => {
+        if (inv.householdId === entry.householdId && inv.toEmail === joiner.email && inv.status === "pending") {
+          inv.status = "accepted";
+          dbChanged = true;
+        }
+      });
+      if (dbChanged || entry.lastTokenAt) {
+        saveDB(db);
+      }
+
+      const resolvedHouseholdName = hhDoc?.fields?.name?.stringValue || entry.householdName || "Family Portfolio";
+      res.json({
+        success: true,
+        householdId: entry.householdId,
+        householdName: resolvedHouseholdName
+      });
+    } catch (e: any) {
+      console.error("[RedeemInvite] Error:", e?.response?.data || e.message);
+      res.status(500).json({
+        error: e?.response?.data?.error?.message || e.message || "Failed to join household"
+      });
+    }
   });
 
   app.post("/api/household/invite", (req, res) => {
