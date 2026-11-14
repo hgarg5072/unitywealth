@@ -86,42 +86,68 @@ import { DashboardData, Holding, AssetClass, Currency, PortfolioTargets, User, I
 
 function shortenAssetName(name: string): string {
   if (!name) return '';
-  let clean = name;
-  
-  // 1. Remove ticker-like prefixes at the start (e.g., "PP001ZG - ")
-  // We look for a code that is at least 3 chars AND ends with a dash.
-  // Using dynamic lookahead or just splitting by dash might be safer.
-  if (clean.includes(' - ') || clean.includes(' – ') || clean.includes(' — ')) {
-    const parts = clean.split(/ [\-–—] /);
-    // If the first part looks like a code (short, alphanumeric, or includes numbers)
-    if (parts[0].length <= 10 && (/[0-9]/.test(parts[0]) || /^[A-Z0-9]+$/.test(parts[0]))) {
-      parts.shift();
-      clean = parts.join(' - ');
-    }
-  }
-  
-  // 2. Remove standard suffixes and everything after them
+  let clean = name.trim();
+
+  // 1. Strip ISIN metadata and parenthetical rename/category suffixes
+  clean = clean
+    .replace(/,?\s*ISIN\s*:\s*[A-Z0-9]+.*$/i, '')
+    .replace(/\s*\((formerly|erstwhile|non-demat|equity|debt|hybrid)[^)]*\).*$/i, '')
+    .replace(/\s*\([GD]\)\s*$/i, '');
+
+  // 2. Remove folio/scheme code prefixes at the start (e.g., "PP001ZG - ", "102T801 - ", "G202-")
+  clean = clean.replace(/^[A-Z0-9]{3,10}\s*[\-–—]\s*(?=[A-Za-z])/i, '');
+
+  // 3. Remove plan/option noise (handles both " - Direct Plan" and tight "-Growth-Regular Plan")
   const stopMarkers = [
-    / [\-–—] Direct Plan.*/gi,
-    / [\-–—] Direct .*Growth.*/gi,
-    / [\-–—] Direct Growth.*/gi,
-    / [\-–—] Growth.*/gi,
-    / [\-–—] Regular Plan.*/gi,
-    / [\-–—] Regular.*/gi,
-    / [\-–—] Dividend.*/gi,
-    / \(formerly .*/gi,
-    / \(Erstwhile .*/gi,
-    / \(Non-Demat\).*/gi,
-    / [\-–—] IDCW.*/gi,
-    / [\-–—] Payout.*/gi,
-    / [\-–—] Reinvestment.*/gi
+    /\s*[\-–—]\s*Direct\s*(Plan)?.*$/i,
+    /\s*[\-–—]\s*Regular\s*(Plan)?.*$/i,
+    /\s*[\-–—]\s*Institutional\s*(Plan)?.*$/i,
+    /\s*[\-–—]\s*Retail\s*(Plan)?.*$/i,
+    /\s*[\-–—]\s*Plan\s*[A-Z0-9]+\b.*$/i,
+    /\s*[\-–—]\s*(Growth|IDCW|Dividend|Payout|Reinvestment|Bonus)\b.*$/i,
+    /\b(Direct|Regular)\s+Plan\b.*$/i,
+    /\b(Growth|IDCW)\s+Option\b.*$/i,
   ];
-  
-  stopMarkers.forEach(s => {
+  stopMarkers.forEach((s) => {
     clean = clean.replace(s, '');
   });
-  
-  return clean.trim();
+
+  // 4. Abbreviate verbose Indian AMC prefixes & common long words
+  const replacements: [RegExp, string][] = [
+    [/^Aditya Birla Sun Life\b/i, 'ABSL'],
+    [/^Birla Sun Life\b/i, 'ABSL'],
+    [/^ICICI Prudential\b/i, 'ICICI Pru'],
+    [/^Parag Parikh\b/i, 'PPFAS'],
+    [/^Franklin India\b/i, 'Franklin'],
+    [/^Templeton India\b/i, 'Templeton'],
+    [/^Nippon India\b/i, 'Nippon'],
+    [/^Motilal Oswal\b/i, 'Motilal'],
+    [/^Kotak Mahindra\b/i, 'Kotak'],
+    [/^Mirae Asset\b/i, 'Mirae'],
+    [/^Mahindra Manulife\b/i, 'Mahindra'],
+    [/^Canara Robeco\b/i, 'Canara'],
+    [/^DSP BlackRock\b/i, 'DSP'],
+    [/^WhiteOak Capital\b/i, 'WhiteOak'],
+    [/^Bandhan\b/i, 'Bandhan'],
+    [/\bInternational\b/gi, 'Intl'],
+    [/\bOpportunities\b/gi, 'Opp'],
+    [/\bInfrastructure\b/gi, 'Infra'],
+    [/\bTechnology\b/gi, 'Tech'],
+    [/\bHealthcare\b/gi, 'Health'],
+    [/\bManufacturing\b/gi, 'Mfg'],
+    [/\s+and\s+/gi, ' & '],
+  ];
+  replacements.forEach(([pattern, short]) => {
+    clean = clean.replace(pattern, short);
+  });
+
+  // 5. Strip trailing "Mutual Fund" / "Fund" / "Scheme" if at least 2 words remain
+  const strippedTrailing = clean.replace(/\s+(Mutual\s+Fund|Fund|Scheme|Plan|Option)\s*$/i, '').trim();
+  if (strippedTrailing.split(/\s+/).length >= 2) {
+    clean = strippedTrailing;
+  }
+
+  return clean.replace(/\s*[\-–—,]+\s*$/, '').replace(/\s{2,}/g, ' ').trim();
 }
 
 export default function App() {
@@ -141,7 +167,8 @@ export default function App() {
 
   useEffect(() => {
     if (notification) {
-      const timer = setTimeout(() => setNotification(null), 5000);
+      const duration = notification.type === 'error' ? 9000 : 5000;
+      const timer = setTimeout(() => setNotification(null), duration);
       return () => clearTimeout(timer);
     }
   }, [notification]);
@@ -319,6 +346,7 @@ export default function App() {
 
   const [isParsing, setIsParsing] = useState(false);
   const [targetUserId, setTargetUserId] = useState<string | null>(null);
+  const [selectedImportProvider, setSelectedImportProvider] = useState<string | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
 
   const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -326,6 +354,8 @@ export default function App() {
     if (!file || !user || !targetUserId) return;
 
     setIsParsing(true);
+    setShowSyncModal(false);
+    const providerHintUsed = selectedImportProvider;
     const reader = new FileReader();
     const isPDF = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
     
@@ -343,7 +373,12 @@ export default function App() {
         const res = await fetch("/api/gemini/extract", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ content: isPDF ? base64 : textContent, isPDF })
+          body: JSON.stringify({
+            content: isPDF ? base64 : textContent,
+            isPDF,
+            fileName: file.name,
+            providerHint: providerHintUsed
+          })
         });
         
         if (!res.ok) {
@@ -351,8 +386,26 @@ export default function App() {
           throw new Error(err.error || "Failed to extract holdings");
         }
         
-        const holdings = await res.json();
-        console.log("Extracted holdings:", holdings);
+        const extractedPayload = await res.json();
+        const holdings: any[] = Array.isArray(extractedPayload)
+          ? extractedPayload
+          : (extractedPayload?.holdings || []);
+        const detectedProvider: string = providerHintUsed || (!Array.isArray(extractedPayload) && extractedPayload?.provider) || 'CAMS';
+        const warningMsg: string | undefined = !Array.isArray(extractedPayload) ? extractedPayload?.warning : undefined;
+
+        console.log("Extracted holdings:", extractedPayload);
+
+        if (holdings.length === 0) {
+          setNotification({
+            message: warningMsg || "No active open holdings (> 0 units) were found in this statement.",
+            type: 'error'
+          });
+          return;
+        }
+
+        const incomingProviders = new Set<string>(
+          holdings.map((h: any) => String(h.provider || detectedProvider || 'CAMS'))
+        );
         
         if (targetUserId === user.id && user.householdId) {
           const existingQuery = query(
@@ -364,7 +417,8 @@ export default function App() {
           const batch = writeBatch(db);
           existingSnap.docs.forEach((docSnap) => {
             const d = docSnap.data();
-            if (d.source === 'PDF' || d.provider === 'CAMS') {
+            const docProvider = String(d.provider || 'CAMS');
+            if (d.source === 'PDF' && incomingProviders.has(docProvider)) {
               batch.delete(docSnap.ref);
             }
           });
@@ -373,11 +427,11 @@ export default function App() {
             batch.set(doc(db, 'holdings', id), {
               userId: targetUserId,
               householdId: user.householdId,
-              ticker: String(h.schemeName || 'MF').slice(0, 50),
+              ticker: String(h.ticker || h.schemeName || 'MF').slice(0, 50),
               quantity: Number(h.units) || 0,
               assetClass: h.assetClass || 'Mutual Fund',
               currency: h.currency === 'USD' ? 'USD' : 'INR',
-              provider: 'CAMS',
+              provider: String(h.provider || detectedProvider || 'CAMS'),
               source: 'PDF',
               currentPrice: Number(h.nav) || 0,
               originalName: h.originalName || h.schemeName || '',
@@ -385,7 +439,10 @@ export default function App() {
             });
           });
           await batch.commit();
-          setNotification({ message: 'Portfolio refreshed successfully!', type: 'refreshed' });
+          setNotification({
+            message: `Imported ${holdings.length} ${holdings.length === 1 ? 'holding' : 'holdings'} from ${detectedProvider} with live prices!`,
+            type: 'refreshed'
+          });
         } else {
           const saveRes = await fetch('/api/portfolio/bulk-add', {
             method: 'POST',
@@ -393,6 +450,7 @@ export default function App() {
             body: JSON.stringify({
               userId: targetUserId,
               householdId: user.householdId,
+              provider: detectedProvider,
               holdings
             }),
           });
@@ -407,17 +465,21 @@ export default function App() {
           }
 
           if (saveRes.ok) {
-            setNotification({ message: 'Portfolio refreshed successfully!', type: 'refreshed' });
+            setNotification({
+              message: `Imported ${holdings.length} holdings from ${detectedProvider}!`,
+              type: 'refreshed'
+            });
           } else {
             setNotification({ message: saveResult.error || 'Failed to save imported holdings.', type: 'error' });
           }
         }
       } catch (parseError: any) {
         console.error("Upload process error:", parseError);
-        setNotification({ message: parseError.message || "Error parsing PDF", type: 'error' });
+        setNotification({ message: parseError.message || "Error parsing statement", type: 'error' });
       } finally {
         setIsParsing(false);
         setTargetUserId(null);
+        setSelectedImportProvider(null);
         if (fileInputRef.current) fileInputRef.current.value = '';
       }
     };
@@ -432,12 +494,14 @@ export default function App() {
     }
   };
 
-  const triggerUpload = (memberId: string) => {
-    if (!memberId || memberId === 'combined') {
-      alert("Please select an individual member first.");
+  const triggerUpload = (memberId: string, providerHint?: string) => {
+    const resolvedMember = (!memberId || memberId === 'combined') ? user?.id : memberId;
+    if (!resolvedMember) {
+      alert("Please sign in first.");
       return;
     }
-    setTargetUserId(memberId);
+    setTargetUserId(resolvedMember);
+    setSelectedImportProvider(providerHint || null);
     setTimeout(() => {
       fileInputRef.current?.click();
     }, 100);
@@ -1158,9 +1222,9 @@ export default function App() {
             <button onClick={() => setActiveTab('accounts')} className="text-[10px] font-bold text-indigo-600 hover:underline">MANAGE</button>
           </div>
           <div className="space-y-4">
-            <AccountStatusItem label="Schwab (US)" isActive={data?.holdings?.some(h => h.currency === 'USD' && h.source === 'PDF')} />
-            <AccountStatusItem label="Alpha Vantage (Live)" isActive={!!data?.holdings?.some(h => h.currency === 'INR')} />
-            <AccountStatusItem label="Finvu / CAS" isActive={data?.holdings?.some(h => h.currency === 'INR' && h.source === 'PDF')} />
+            <AccountStatusItem label="US Brokers (USD)" isActive={!!data?.holdings?.some(h => h.currency === 'USD')} />
+            <AccountStatusItem label="NSE & Finnhub" isActive={true} />
+            <AccountStatusItem label="CAMS / Zerodha" isActive={!!data?.holdings?.some(h => h.currency === 'INR')} />
           </div>
         </div>
 
@@ -1217,7 +1281,7 @@ export default function App() {
                   className="flex items-center gap-2 px-3 py-1 bg-white border border-slate-200 text-slate-700 rounded-lg text-xs font-bold hover:bg-slate-50 transition-all shadow-sm active:scale-95 disabled:opacity-50"
                 >
                   {isParsing ? <RefreshCcw size={14} className="animate-spin text-indigo-500" /> : <FileUp size={14} />}
-                  {isParsing ? "PARSING..." : "PDF IMPORT"}
+                  {isParsing ? "PARSING..." : "IMPORT PDF / CSV"}
                 </button>
                 <button 
                   onClick={() => setShowManualEntryModal(true)}
@@ -1421,7 +1485,7 @@ export default function App() {
                             <tr key={h.id} className="hover:bg-slate-50/50 transition-colors">
                               <td className="py-4">
                                 <div className="flex items-center gap-2">
-                                  <div className="font-bold text-slate-800 text-sm">{shortenAssetName(h.originalName || h.ticker)}</div>
+                                  <div className="font-bold text-slate-800 text-sm" title={h.originalName || h.ticker}>{shortenAssetName(h.originalName || h.ticker)}</div>
                                   <a 
                                     href={`https://www.google.com/search?q=${encodeURIComponent((h.originalName || h.ticker) + ' price')}`} 
                                     target="_blank" 
@@ -1432,15 +1496,20 @@ export default function App() {
                                     <Globe size={12} />
                                   </a>
                                 </div>
-                                <div className="text-[10px] text-slate-400 font-bold uppercase tracking-wider flex items-center gap-2">
+                                <div className="text-[10px] text-slate-400 font-bold uppercase tracking-wider flex items-center gap-2 flex-wrap mt-0.5">
                                   <span className="font-mono">{h.ticker}</span>
                                   <span>•</span>
                                   <span>{h.assetClass}</span>
-                                  <span>•</span>
-                                  {(h.source === 'PDF' || h.source === 'PDF Import') && <span className="bg-amber-50 text-amber-600 px-1.5 py-0.5 rounded-md border border-amber-200/50 text-[9px] font-black uppercase">PDF IMPORT</span>}
+                                  {h.provider && h.provider !== 'Manual' && (
+                                    <>
+                                      <span>•</span>
+                                      <span className="bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded-md text-[9px] font-black uppercase">{h.provider}</span>
+                                    </>
+                                  )}
+                                  {(h.source === 'PDF' || h.source === 'PDF Import') && <span className="bg-amber-50 text-amber-600 px-1.5 py-0.5 rounded-md border border-amber-200/50 text-[9px] font-black uppercase">STATEMENT</span>}
                                   {h.source === 'Sync' && <span className="bg-violet-50 text-violet-600 px-1.5 py-0.5 rounded-md border border-violet-200/50 text-[9px] font-black uppercase">SYNC</span>}
                                   {(h.source === 'Manual' || !h.source) && <span className="bg-blue-50 text-blue-600 px-1.5 py-0.5 rounded-md border border-blue-200/50 text-[9px] font-black uppercase">Manual</span>}
-                                  {(h.provider === 'AMFI' || h.provider === 'Finnhub') && <span className="bg-emerald-50 text-emerald-600 px-1.5 py-0.5 rounded-md border border-emerald-200/50 flex items-center gap-1 text-[9px] font-black uppercase"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>LIVE</span>}
+                                  {h.ticker && h.ticker !== 'MANUAL' && h.currentPrice > 0 && <span className="bg-emerald-50 text-emerald-600 px-1.5 py-0.5 rounded-md border border-emerald-200/50 flex items-center gap-1 text-[9px] font-black uppercase"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>LIVE</span>}
                                 </div>
                               </td>
                               <td className="py-4 text-sm text-slate-600 tabular-nums">
@@ -1553,26 +1622,86 @@ export default function App() {
 
 
                     <section>
-                      <h4 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4">India Mutual Funds (Manual/Auto)</h4>
-                      {data.holdings.some(h => h.userId === user.id && h.source === 'PDF') ? (
-                        <SourceRow 
-                          icon={<FileText className="text-amber-500" />} 
-                          name="CAMS CAS PDF" 
-                          user="You" 
-                          status="Connected" 
-                          lastSync="Manual Refresh" 
-                          onClick={() => triggerUpload(user.id)}
-                        />
-                      ) : (
-                         <SourceRow 
-                          icon={<FileText className="text-slate-300" />} 
-                          name="CAMS CAS PDF" 
-                          user="You" 
-                          status="Not Linked" 
-                          onClick={() => triggerUpload(user.id)}
-                        />
-                      )}
-                      <SourceRow icon={<Globe className="text-emerald-500" />} name="MFCentral Sync" user="Family Member" status="Syncing" lastSync="2 mins ago" />
+                      <div className="flex items-center justify-between mb-3">
+                        <h4 className="text-xs font-bold text-slate-400 uppercase tracking-widest">India Accounts (Mutual Funds & Equities)</h4>
+                        <span className="text-[10px] text-slate-400 font-semibold">Click any broker to upload PDF or CSV</span>
+                      </div>
+                      {[
+                        {
+                          provider: 'CAMS',
+                          name: 'CAMS / KFintech / MFCentral CAS',
+                          hint: 'Upload unlocked CAS Holdings Valuation PDF (not Capital Gains) — auto-links ISINs to live AMFI NAVs',
+                          match: (h: Holding) => h.provider === 'CAMS' || h.provider === 'KFintech' || (h.source === 'PDF' && h.currency === 'INR' && h.assetClass !== 'Equity')
+                        },
+                        {
+                          provider: 'Zerodha',
+                          name: 'Zerodha (Kite / Console / Coin)',
+                          hint: 'Console → Portfolio → Holdings → Download CSV or PDF — auto-links NSE/BSE stocks & Coin MFs',
+                          match: (h: Holding) => h.provider === 'Zerodha'
+                        },
+                        {
+                          provider: 'INDmoney',
+                          name: 'INDmoney (US Stocks & India Portfolio)',
+                          hint: 'Upload INDmoney US Stocks (DriveWealth/Alpaca) or Indian Portfolio PDF / CSV',
+                          match: (h: Holding) => h.provider === 'INDmoney'
+                        }
+                      ].map((src) => {
+                        const activeMemberId = dashboardView !== 'combined' ? dashboardView : user.id;
+                        const activeMemberName = data.household.membersData?.find((m: any) => m.id === activeMemberId)?.name || 'You';
+                        const count = data.holdings.filter(h => h.userId === activeMemberId && src.match(h)).length;
+                        return (
+                          <SourceRow
+                            key={src.provider}
+                            icon={<FileText className={count > 0 ? "text-emerald-500" : "text-indigo-500"} />}
+                            name={src.name}
+                            user={activeMemberName}
+                            hint={src.hint}
+                            status={count > 0 ? "Connected" : "Upload PDF/CSV"}
+                            lastSync={count > 0 ? `${count} active ${count === 1 ? 'holding' : 'holdings'}` : undefined}
+                            onClick={() => triggerUpload(activeMemberId, src.provider)}
+                          />
+                        );
+                      })}
+                    </section>
+
+                    <section className="pt-4 border-t border-slate-100">
+                      <div className="flex items-center justify-between mb-3">
+                        <h4 className="text-xs font-bold text-slate-400 uppercase tracking-widest">US Stock Brokerages (Live USD via Finnhub)</h4>
+                        <span className="text-[10px] text-slate-400 font-semibold">Each broker syncs independently</span>
+                      </div>
+                      {[
+                        {
+                          provider: 'Charles Schwab',
+                          name: 'Charles Schwab',
+                          hint: 'Accounts → Positions → Export CSV, or upload Monthly Brokerage Statement PDF'
+                        },
+                        {
+                          provider: 'IBKR',
+                          name: 'Interactive Brokers (IBKR)',
+                          hint: 'Performance & Reports → Statements → Activity / Open Positions CSV or PDF'
+                        },
+                        {
+                          provider: 'E*TRADE',
+                          name: 'E*TRADE (Morgan Stanley)',
+                          hint: 'Accounts → Portfolios → Download CSV, or upload Brokerage / Vested RSU PDF'
+                        }
+                      ].map((src) => {
+                        const activeMemberId = dashboardView !== 'combined' ? dashboardView : user.id;
+                        const activeMemberName = data.household.membersData?.find((m: any) => m.id === activeMemberId)?.name || 'You';
+                        const count = data.holdings.filter(h => h.userId === activeMemberId && h.provider === src.provider).length;
+                        return (
+                          <SourceRow
+                            key={src.provider}
+                            icon={<Globe className={count > 0 ? "text-emerald-500" : "text-blue-500"} />}
+                            name={src.name}
+                            user={activeMemberName}
+                            hint={src.hint}
+                            status={count > 0 ? "Connected" : "Upload CSV/PDF"}
+                            lastSync={count > 0 ? `${count} active ${count === 1 ? 'position' : 'positions'}` : undefined}
+                            onClick={() => triggerUpload(activeMemberId, src.provider)}
+                          />
+                        );
+                      })}
                     </section>
 
                     <section className="pt-6 border-t border-slate-100">
@@ -1622,7 +1751,7 @@ export default function App() {
           ref={fileInputRef} 
           onChange={handleFileUpload} 
           className="hidden" 
-          accept="application/pdf,text/csv,.csv,.txt" 
+          accept="application/pdf,text/csv,text/tab-separated-values,.pdf,.csv,.tsv,.txt" 
         />
 
         <AnimatePresence>
@@ -1662,7 +1791,7 @@ export default function App() {
                 </div>
                 <h3 className="text-xl font-bold text-slate-800 mb-2">Analyzing Wealth Data</h3>
                 <p className="text-slate-500 text-center text-sm leading-relaxed">
-                  Our AI is currently extracting holdings from your CAMS CAS statement. This usually takes 10-15 seconds.
+                  Extracting active holdings from your {selectedImportProvider || "brokerage"} statement and linking live market prices (10-15s).
                 </p>
                 <div className="mt-8 w-full bg-slate-100 h-1.5 rounded-full overflow-hidden">
                   <motion.div 
@@ -1873,11 +2002,11 @@ export default function App() {
                 </div>
                 <div className="p-6 space-y-3">
                   <SyncOption 
-                    title="Import Statement (PDF/CSV)" 
-                    desc="Supports CAMS, Schwab, and Bulk CSVs" 
+                    title="Import Statement (PDF / CSV)" 
+                    desc="Supports CAMS CAS, Zerodha, INDmoney, Schwab, IBKR & E*TRADE" 
                     icon={<FileText className="text-violet-600" />} 
-                    onClick={() => { setTargetUserId(data.household.membersData?.[0]?.id || user.id); fileInputRef.current?.click(); }}
-                    badge="Free & Fast"
+                    onClick={() => triggerUpload(dashboardView !== 'combined' ? dashboardView : (data.household.membersData?.[0]?.id || user.id))}
+                    badge="Multi-Broker"
                   />
                   <div className="h-px bg-slate-50 my-2"></div>
                   <SyncOption 
@@ -2049,8 +2178,9 @@ function RebalanceView({ stats, fxRates }: { stats: any, fxRates: Record<string,
             const catGoalVal = stats.foreignEquityValINR * (cat.percentage / 100);
             const tickerIdealVal = catGoalVal * tickerTargetPctOfCat;
             
-            const tickerHolding = catHoldings.find((h: any) => h.ticker.toUpperCase() === tw.ticker.toUpperCase());
-            const tickerActualVal = tickerHolding ? tickerHolding.valINR : 0;
+            const tickerActualVal = catHoldings
+              .filter((h: any) => h.ticker.toUpperCase() === tw.ticker.toUpperCase())
+              .reduce((sum: number, h: any) => sum + h.valINR, 0);
             const tickerDrift = tickerActualVal - tickerIdealVal;
 
             if (Math.abs(tickerDrift) > 1000) {
@@ -2386,11 +2516,13 @@ function DetailViewModal({
       'Indian Equity': userHoldings.filter(h => (h.assetClass === 'Equity' || h.assetClass === 'Mutual Fund') && h.currency === 'INR'),
       'Indian Debt': userHoldings.filter(h => h.assetClass === 'Debt' && h.currency === 'INR'),
       'Foreign Equity': userHoldings.filter(h => (h.assetClass === 'Equity' || h.assetClass === 'Mutual Fund') && h.currency === 'USD'),
+      'Foreign Debt & Cash': userHoldings.filter(h => h.assetClass === 'Debt' && h.currency === 'USD'),
       'Other': userHoldings.filter(h => {
         const isIE = (h.assetClass === 'Equity' || h.assetClass === 'Mutual Fund') && h.currency === 'INR';
         const isID = h.assetClass === 'Debt' && h.currency === 'INR';
         const isFE = (h.assetClass === 'Equity' || h.assetClass === 'Mutual Fund') && h.currency === 'USD';
-        return !isIE && !isID && !isFE;
+        const isFD = h.assetClass === 'Debt' && h.currency === 'USD';
+        return !isIE && !isID && !isFE && !isFD;
       })
     };
   };
@@ -2512,7 +2644,7 @@ function DetailViewModal({
                         <td className="px-4 sm:px-8 py-4 md:py-5">
                           <div className="flex flex-col min-w-[120px] md:min-w-0">
                             <div className="flex items-center gap-2 flex-wrap">
-                              <span className="font-bold text-slate-800 text-xs md:text-sm leading-snug">{displayTitle}</span>
+                              <span className="font-bold text-slate-800 text-xs md:text-sm leading-snug" title={h.originalName || h.ticker}>{displayTitle}</span>
                               {(h as any).isPlaceholder && (
                                 <div className="flex items-center gap-2">
                                   <span className="text-[8px] bg-indigo-50 text-indigo-400 px-1.5 py-0.5 rounded-md border border-indigo-100 font-black uppercase tracking-tighter">TARGET</span>
@@ -2532,7 +2664,10 @@ function DetailViewModal({
                                   </button>
                                 </div>
                               )}
-                              {(h.source === 'PDF' || h.source === 'PDF Import') && <span className="text-[8px] bg-amber-50 text-amber-600 px-1.5 py-0.5 rounded-md border border-amber-100/50 font-black uppercase tracking-tighter shrink-0">PDF</span>}
+                              {h.provider && h.provider !== 'Manual' && !(h as any).isPlaceholder && (
+                                <span className="text-[8px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded-md font-black uppercase tracking-tighter shrink-0">{h.provider}</span>
+                              )}
+                              {(h.source === 'PDF' || h.source === 'PDF Import') && <span className="text-[8px] bg-amber-50 text-amber-600 px-1.5 py-0.5 rounded-md border border-amber-100/50 font-black uppercase tracking-tighter shrink-0">STATEMENT</span>}
                               {h.source === 'Sync' && <span className="text-[8px] bg-violet-50 text-violet-600 px-1.5 py-0.5 rounded-md border border-violet-100/50 font-black uppercase tracking-tighter shrink-0">SYNC</span>}
                             </div>
                             <div className="flex items-center gap-1.5 mt-1">
@@ -2693,25 +2828,26 @@ function TickerCapCard({ ticker, actual, target, driftVal, isINR }: { ticker: st
   );
 }
 
-function SourceRow({ icon, name, user, status, lastSync, onClick }: { icon: React.ReactNode, name: string, user: string, status: string, lastSync?: string, onClick?: () => void }) {
+function SourceRow({ icon, name, user, hint, status, lastSync, onClick }: { icon: React.ReactNode, name: string, user: string, hint?: string, status: string, lastSync?: string, onClick?: () => void, key?: any }) {
   return (
     <div 
       onClick={onClick}
-      className={`flex items-center justify-between p-4 bg-white border border-slate-100 rounded-xl mb-3 hover:border-indigo-200 transition-colors ${onClick ? 'cursor-pointer hover:bg-slate-50' : ''}`}
+      className={`flex items-center justify-between gap-4 p-4 bg-white border border-slate-100 rounded-xl mb-3 hover:border-indigo-200 transition-colors ${onClick ? 'cursor-pointer hover:bg-slate-50' : ''}`}
     >
-      <div className="flex items-center gap-4">
-        <div className="p-2 bg-slate-50 rounded-lg">{icon}</div>
-        <div>
-          <h5 className="text-sm font-bold">{name}</h5>
+      <div className="flex items-start sm:items-center gap-4 min-w-0">
+        <div className="p-2 bg-slate-50 rounded-lg shrink-0">{icon}</div>
+        <div className="min-w-0">
+          <h5 className="text-sm font-bold text-slate-800">{name}</h5>
           <p className="text-xs text-slate-500">Member: {user}</p>
+          {hint && <p className="text-[11px] text-slate-400 mt-0.5 leading-snug">{hint}</p>}
         </div>
       </div>
-      <div className="text-right">
-        <div className="flex items-center gap-2 justify-end mb-1">
-          {status === 'Connected' ? <Check size={14} className="text-emerald-500" /> : <RefreshCcw size={14} className="text-indigo-500 animate-spin-slow" />}
-          <span className={`text-[10px] font-bold uppercase transition-all ${status === 'Connected' ? 'text-emerald-600' : 'text-indigo-500'}`}>{status}</span>
+      <div className="text-right shrink-0">
+        <div className="flex items-center gap-1.5 justify-end mb-1">
+          {status === 'Connected' ? <Check size={14} className="text-emerald-500" /> : <FileUp size={14} className="text-indigo-500" />}
+          <span className={`text-[10px] font-bold uppercase transition-all ${status === 'Connected' ? 'text-emerald-600' : 'text-indigo-600'}`}>{status}</span>
         </div>
-        {lastSync && <p className="text-[10px] text-slate-400 italic">Last sync: {lastSync}</p>}
+        {lastSync && <p className="text-[10px] text-slate-400 italic">{lastSync}</p>}
       </div>
     </div>
   );
@@ -3778,7 +3914,7 @@ function LiveMarketsView({ holdings, members, householdId }: { holdings: Holding
          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {uniqueHoldings.sort((a,b) => (a.assetClass || '').localeCompare(b.assetClass || '')).map(h => (
           <div key={h.id} className="bg-white p-6 rounded-3xl shadow-sm border border-slate-100 hover:border-emerald-200 transition-all group relative overflow-hidden">
-            {(h.provider === 'AMFI' || h.provider === 'Finnhub' || h.provider === 'Plaid') && (
+            {h.ticker && h.ticker !== 'MANUAL' && h.currentPrice > 0 && (
               <div className="absolute top-0 right-0 p-3">
                 <span className="flex items-center gap-1 text-[7px] font-black text-emerald-500 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-100">
                   <span className="w-1 h-1 rounded-full bg-emerald-500 animate-pulse"></span>

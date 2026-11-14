@@ -881,6 +881,10 @@ async function startServer() {
           if (navIdx !== -1) {
             // AMFI formats include 6-part (Code;ISIN1;ISIN2;Name;NAV;Date) and
             // 8-part (Code;ISIN1;ISIN2;SchemeName;Plan;Option;NAV;Date)
+            const isins = parts
+              .slice(1, navIdx)
+              .map(s => s.trim().toUpperCase())
+              .filter(s => /^INF[A-Z0-9]{9}$/.test(s));
             const nameParts = parts
               .slice(1, navIdx)
               .map(s => s.trim())
@@ -892,6 +896,7 @@ async function startServer() {
               results.push({
                 symbol: parts[0].trim(),
                 shortname: fullName,
+                isins,
                 currentPrice: price,
                 typeDisp: 'MUTUAL_FUND',
                 exchDisp: 'AMFI',
@@ -1300,15 +1305,52 @@ async function startServer() {
   function findAmfiMatch(mfData: any[], holding: any) {
     const ticker = String(holding.ticker || '').trim();
     const orig = String(holding.originalName || '').trim();
+    const explicitIsin = String(holding.isin || '').trim().toUpperCase();
+    const embeddedIsinMatch = `${explicitIsin} ${orig} ${ticker}`.match(/\b(INF[A-Z0-9]{9})\b/i);
+    if (embeddedIsinMatch) {
+      const targetIsin = embeddedIsinMatch[1].toUpperCase();
+      const byIsin = mfData.find(m => Array.isArray(m.isins) && m.isins.includes(targetIsin));
+      if (byIsin) return byIsin;
+    }
+
     const exact = mfData.find(m => m.symbol === ticker || (orig && m.shortname === orig) || (ticker && m.shortname === ticker));
     if (exact) return exact;
 
-    const target = (orig || ticker).toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
-    if (!target || target.length < 6) return null;
-    return mfData.find(m => {
-      const mName = String(m.shortname || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
-      return mName === target;
-    }) || null;
+    const rawName = orig || ticker;
+    const cleanedTarget = rawName
+      .replace(/,?\s*ISIN\s*:.*$/i, '')
+      .replace(/\(formerly[^)]*\)/gi, '')
+      .replace(/\(erstwhile[^)]*\)/gi, '')
+      .replace(/^[A-Z0-9]{3,10}\s*[-–—]\s*/i, '')
+      .toLowerCase();
+    const wantsDirect = /\bdirect\b/.test(cleanedTarget);
+    const wantsIdcw = /\b(idcw|dividend|payout|reinvestment)\b/.test(cleanedTarget);
+    const stopWords = new Set(['fund', 'scheme', 'plan', 'option', 'direct', 'regular', 'growth', 'idcw', 'dividend', 'payout', 'reinvestment', 'india', 'mutual', 'open', 'ended', 'equity', 'g', 'd']);
+    const coreTokens = cleanedTarget
+      .replace(/[^a-z0-9 ]/g, ' ')
+      .split(/\s+/)
+      .filter(t => t.length >= 2 && !stopWords.has(t));
+
+    if (coreTokens.length < 2) return null;
+
+    const candidates = mfData.filter(m => {
+      const mLower = String(m.shortname || '').toLowerCase();
+      return coreTokens.every(tok => mLower.includes(tok));
+    });
+    if (candidates.length === 0) return null;
+
+    candidates.sort((a, b) => {
+      const aL = String(a.shortname || '').toLowerCase();
+      const bL = String(b.shortname || '').toLowerCase();
+      const aPlanScore = (wantsDirect ? aL.includes('direct') : !aL.includes('direct')) ? 0 : 1;
+      const bPlanScore = (wantsDirect ? bL.includes('direct') : !bL.includes('direct')) ? 0 : 1;
+      if (aPlanScore !== bPlanScore) return aPlanScore - bPlanScore;
+      const aOptScore = (wantsIdcw ? (aL.includes('idcw') || aL.includes('dividend')) : aL.includes('growth')) ? 0 : 1;
+      const bOptScore = (wantsIdcw ? (bL.includes('idcw') || bL.includes('dividend')) : bL.includes('growth')) ? 0 : 1;
+      if (aOptScore !== bOptScore) return aOptScore - bOptScore;
+      return aL.length - bL.length;
+    });
+    return candidates[0];
   }
 
   app.post("/api/portfolio/refresh", async (req, res) => {
@@ -1613,46 +1655,72 @@ UnityWealth Team`;
   });
 
   app.post("/api/portfolio/bulk-add", async (req, res) => {
-    const { userId, householdId, holdings } = req.body;
+    const { userId, householdId, holdings, provider: batchProvider } = req.body;
     
     try {
-      // Clean existing PDF or CAMS holdings for this user
-      const holdingsRef = firestore.collection('holdings');
-      const q = holdingsRef
-        .where('userId', '==', userId)
-        .where('householdId', '==', householdId);
-      const snap = await q.get();
-      
-      const batch = firestore.batch();
-      snap.docs.forEach(doc => {
-        const data = doc.data();
-        if (data.source === "PDF" || data.provider === "CAMS") {
-          batch.delete(doc.ref);
-        }
-      });
+      const incomingProviders = new Set<string>(
+        (holdings || []).map((h: any) => String(h.provider || batchProvider || "CAMS"))
+      );
+      if (incomingProviders.size === 0 && batchProvider) {
+        incomingProviders.add(String(batchProvider));
+      }
 
-      const newHoldings = holdings.map((h: any) => {
+      const newHoldings = (holdings || []).map((h: any) => {
         const id = "h_" + Math.random().toString(36).substr(2, 9);
-        const data = {
+        const resolvedProvider = String(h.provider || batchProvider || "CAMS");
+        const resolvedCurrency = h.currency === "USD" ? "USD" : "INR";
+        return {
+          id,
           userId,
           householdId,
-          ticker: h.schemeName,
-          quantity: parseFloat(h.units),
+          ticker: String(h.ticker || h.schemeName || "MF").slice(0, 50),
+          quantity: parseFloat(h.units) || 0,
           assetClass: h.assetClass || "Mutual Fund",
-          currency: "INR",
-          provider: "CAMS",
+          currency: resolvedCurrency,
+          provider: resolvedProvider,
           source: "PDF",
-          currentPrice: parseFloat(h.nav),
-          originalName: h.originalName,
+          currentPrice: parseFloat(h.nav) || 0,
+          originalName: h.originalName || h.schemeName || "",
           syncedAt: Date.now()
         };
-        batch.set(holdingsRef.doc(id), data);
-        return { id, ...data };
       });
 
-      await batch.commit();
+      // Persist to Firestore if server has ADC, while client handles direct Firestore writes when logged in
+      try {
+        const holdingsRef = firestore.collection('holdings');
+        const snap = await holdingsRef
+          .where('userId', '==', userId)
+          .where('householdId', '==', householdId)
+          .get();
+        
+        const batch = firestore.batch();
+        snap.docs.forEach(doc => {
+          const data = doc.data();
+          const docProvider = String(data.provider || "CAMS");
+          if (data.source === "PDF" && incomingProviders.has(docProvider)) {
+            batch.delete(doc.ref);
+          }
+        });
+        newHoldings.forEach((item: any) => {
+          const { id, ...rest } = item;
+          batch.set(holdingsRef.doc(id), rest);
+        });
+        await batch.commit();
+      } catch {
+        // Fallback to local db.json when server runs without Firestore service account
+      }
+
+      const db = getDB();
+      db.holdings = db.holdings.filter((h: any) => {
+        if (h.userId !== userId || h.householdId !== householdId) return true;
+        const docProvider = String(h.provider || "CAMS");
+        return !(h.source === "PDF" && incomingProviders.has(docProvider));
+      });
+      db.holdings.push(...newHoldings);
+      saveDB(db);
+
       checkAndSendRebalanceAlert(householdId); 
-      res.json({ success: true, count: newHoldings.length });
+      res.json({ success: true, count: newHoldings.length, holdings: newHoldings });
     } catch (e: any) {
       console.error("Bulk-add error", e);
       res.status(500).json({ error: e.message });
@@ -1684,7 +1752,14 @@ UnityWealth Team`;
         syncedAt: Date.now()
       };
 
-      await firestore.collection('holdings').doc(id).set(newHolding);
+      try {
+        await firestore.collection('holdings').doc(id).set(newHolding);
+      } catch {
+        // Client handles Firestore directly when authenticated
+      }
+      const db = getDB();
+      db.holdings.push({ id, ...newHolding });
+      saveDB(db);
       checkAndSendRebalanceAlert(householdId);
       res.json({ id, ...newHolding });
     } catch (e: any) {
@@ -1708,40 +1783,99 @@ UnityWealth Team`;
   app.get("/api/market/price/:ticker", async (req, res) => {
     const ticker = req.params.ticker.toUpperCase();
     try {
-      // Mocking real-time market data fetch. 
-      const prices: Record<string, number> = {
-        "GOOGL": 175.24,
-        "MSFT": 415.10,
-        "AAPL": 190.12,
-        "AMZN": 185.30,
-        "TSLA": 170.50
-      };
-      
-      const price = prices[ticker] || (100 + Math.random() * 50);
-      res.json({ ticker, price });
+      const priceMap = await fetchLiveStockPrices([ticker]);
+      if (priceMap[ticker]) {
+        return res.json({ ticker, price: priceMap[ticker] });
+      }
+      res.status(404).json({ error: "Price not found" });
     } catch (e) {
       res.status(500).json({ error: "Failed to fetch price" });
     }
   });
 
   app.post("/api/gemini/extract", async (req, res) => {
-    const { content, isPDF } = req.body;
+    const { content, isPDF, fileName, providerHint } = req.body;
+    if (!content) {
+      return res.status(400).json({ error: "No file content received." });
+    }
+
+    // Pre-check if PDF is password-encrypted
+    let looksEncryptedPdf = false;
+    if (isPDF && typeof content === "string") {
+      try {
+        const head = Buffer.from(content.slice(0, 65536), "base64").toString("latin1");
+        const tail = content.length > 65536 ? Buffer.from(content.slice(-65536), "base64").toString("latin1") : "";
+        if ((head + tail).includes("/Encrypt")) {
+          looksEncryptedPdf = true;
+        }
+      } catch {
+        // ignore buffer check failure
+      }
+    }
+
     try {
-      let promptParts: any[] = [
-        { text: `Extract all investment holdings (Stocks, Mutual Funds, ETFs) from this ${isPDF ? 'PDF' : 'file content'}. \n\n` +
-                "Return as a JSON array of objects with keys: schemeName, originalName, units, nav, assetClass (one of 'Equity', 'Debt', 'Mutual Fund').\n\n" +
-                "STRICT CLEANING RULES for 'schemeName':\n" +
-                "1. IDENTIFY the core name or ticker. \n" +
-                "2. STRIP all plan/option/platform noise.\n" +
-                "3. originalName: MUST be the verbatim name for accurate linking.\n\n" +
-                "CURRENCY & ASSET CLASS RULES:\n" +
-                "- If the fund name contains the word 'Arbitrage' anywhere, set assetClass to 'Debt'. This is MANDATORY.\n" +
-                "- If it's a US Stock (e.g. Qualcomm, Apple, Google, Microsoft) or has a ticker like 'QCOM', set currency to 'USD' and assetClass to 'Equity'.\n" +
-                "- Default currency is 'INR'.\n\n" +
-                "- units and nav: Must be numbers.\n" +
-                "- Ignore zero balances.\n" +
-                "Only return raw JSON array." }
-      ];
+      const hintLine = providerHint ? `\nUser selected account/broker hint: "${providerHint}".` : "";
+      const fileLine = fileName ? `\nUploaded filename: "${fileName}".` : "";
+
+      const extractionInstructions = `You are a precision financial statement parser supporting Indian and US brokerages:
+- CAMS / KFintech / MFCentral Consolidated Account Statement (CAS) PDFs
+- Zerodha Console / Kite / Coin Holdings CSVs & PDFs
+- INDmoney US Stocks (DriveWealth/Alpaca) & Indian Portfolio PDFs/CSVs
+- Charles Schwab Positions CSVs & Brokerage Statement PDFs
+- Interactive Brokers (IBKR) Activity Statement / Open Positions CSVs & PDFs
+- E*TRADE (Morgan Stanley) Portfolio Download CSVs & RSU/ESPP/Brokerage PDFs${hintLine}${fileLine}
+
+Return ONLY a valid JSON object matching this exact structure:
+{
+  "statementType": "holdings" | "capital_gains_only" | "transactions_only",
+  "provider": "CAMS" | "KFintech" | "Zerodha" | "INDmoney" | "Charles Schwab" | "IBKR" | "E*TRADE" | "Statement",
+  "summaryNote": "1-sentence description of what was detected",
+  "holdings": [
+    {
+      "ticker": "Stock ticker (e.g. NVDA, AAPL, QCOM, RELIANCE.NS) or short clean MF name",
+      "schemeName": "Short clean display name (strip Direct/Regular/Growth/ISIN noise)",
+      "originalName": "Full verbatim security/scheme name from statement (include ISIN if printed)",
+      "isin": "12-char ISIN (e.g. INF179K01BE2) if present, else empty string",
+      "units": 123.456,
+      "nav": 94.25,
+      "assetClass": "Equity" | "Debt" | "Mutual Fund",
+      "currency": "INR" | "USD"
+    }
+  ]
+}
+
+CRITICAL STATEMENT TYPE RULES (DO NOT VIOLATE):
+1. Check the document title and table columns FIRST.
+2. If the file is a "Capital Gain / Loss Statement", "Tax P&L", "Realized Gain/Loss", or "Redemption Statement" that ONLY lists sold/redeemed/switched-out tax lots WITHOUT current open/closing unit balances (for example, CAMS Capital Gain / Loss Statement with Redemption rows, Purchase Date, Indexed Cost, Short Term / Long Term gain), you MUST set:
+   "statementType": "capital_gains_only",
+   "holdings": []
+   NEVER treat redeemed/sold units as active portfolio holdings!
+3. If the file has BOTH historical transactions AND a "Closing Unit Balance" / "Open Positions" / "Ending Balance" column or summary (e.g. Detailed CAMS CAS or IBKR Activity Statement), set "statementType": "holdings" and extract ONLY the current open/closing balance for each asset where units > 0. Ignore zero-balance folios and closed positions.
+
+BROKER, TICKER & CURRENCY RULES:
+- CAMS / KFintech / MFCentral CAS:
+  - provider: "CAMS" (or "KFintech" if exclusively KFintech).
+  - currency: "INR".
+  - Extract the 12-char "INF..." ISIN into "isin" whenever shown!
+  - assetClass: MUST be "Debt" if scheme name contains "Arbitrage", "Liquid", "Money Market", "Overnight", "Ultra Short", "Low Duration", "Short Term", "Short Duration", "Corporate Bond", "Gilt", "Banking and PSU", "Banking & PSU", "Dynamic Bond", "Floater", or "Debt"; otherwise "Mutual Fund".
+- Zerodha:
+  - provider: "Zerodha", currency: "INR".
+  - For Indian NSE/BSE stocks & ETFs (e.g. RELIANCE, INFY, TCS, HDFCBANK, NIFTYBEES, GOLDBEES), append ".NS" to ticker (e.g. "RELIANCE.NS") and set assetClass to "Equity" (except LIQUIDBEES / LIQUIDCASE / GILT / BHARATBOND -> "Debt"). For Coin Mutual Funds, set assetClass to "Mutual Fund" (or "Debt" if Arbitrage/Debt).
+- INDmoney:
+  - provider: "INDmoney".
+  - For US Stocks/ETFs (DriveWealth/Alpaca statements or US stock holdings like AAPL, NVDA, MSFT, GOOGL, META, AMZN, TSLA, QCOM, VOO, QQQ, including fractional shares like 0.4521), set currency to "USD", assetClass to "Equity", and ticker to the clean US symbol (e.g. "NVDA"). For Indian MFs/stocks in INDmoney, use "INR".
+- Charles Schwab:
+  - provider: "Charles Schwab", currency: "USD".
+  - Ignore "Account Total", "Positions Total", and "Cash & Cash Investments" rows. Convert "BRK/B" -> "BRK.B". Money market / treasury funds (SWVXX, SNVXX, SGOV, BIL, USFR, BND, TLT) -> assetClass "Debt"; stocks/equity ETFs -> "Equity".
+- Interactive Brokers (IBKR):
+  - provider: "IBKR".
+  - From "Open Positions" (Summary rows for Stocks/ETFs/Bonds), extract symbol, open quantity, and close/mark price. Ignore "Total" and "Forex" rows. Default currency "USD" (or "INR" if NSE).
+- E*TRADE:
+  - provider: "E*TRADE", currency: "USD", assetClass: "Equity".
+  - Extract portfolio positions and VESTED/sellable RSU or ESPP shares (ignore unvested future grant schedules, "CASH", and "TOTAL" rows).
+- MANDATORY GLOBAL RULE: Any fund or ETF containing the word "Arbitrage" MUST have assetClass = "Debt".`;
+
+      const promptParts: any[] = [{ text: extractionInstructions }];
 
       if (isPDF) {
         promptParts.push({
@@ -1751,7 +1885,7 @@ UnityWealth Team`;
           }
         });
       } else {
-        promptParts[0].text += `\n\nContent:\n${content}`;
+        promptParts[0].text += `\n\nFile Content:\n${String(content).slice(0, 350000)}`;
       }
 
       const result = await getAIClient().models.generateContent({
@@ -1762,13 +1896,138 @@ UnityWealth Team`;
         }
       });
       const text = result.text;
-      
-      // Clean up markdown code blocks if present
       const cleaned = (text || "").replace(/```json/g, "").replace(/```/g, "").trim();
-      const json = JSON.parse(cleaned);
-      res.json(json);
+      const parsed = JSON.parse(cleaned);
+
+      const rawList: any[] = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.holdings) ? parsed.holdings : []);
+      const statementType: string = Array.isArray(parsed) ? "holdings" : (parsed?.statementType || "holdings");
+      const detectedProvider: string = providerHint || (!Array.isArray(parsed) && parsed?.provider) || "CAMS";
+      const summaryNote: string = (!Array.isArray(parsed) && parsed?.summaryNote) || "";
+
+      if (statementType === "capital_gains_only" && rawList.length === 0) {
+        return res.json({
+          statementType: "capital_gains_only",
+          provider: detectedProvider,
+          summaryNote,
+          warning: "This file is a Capital Gain / Loss (Redemption) tax statement showing sold units rather than active holdings. Please upload a CAMS / MFCentral Consolidated Account Statement (CAS) or Portfolio Holdings statement with current balances.",
+          holdings: []
+        });
+      }
+
+      // Normalize, enforce mandatory domain rules, and consolidate duplicate lots within the same statement
+      const debtKeywords = /\b(arbitrage|liquid|liquidbees|liquidcase|overnight|money market|ultra short|low duration|short term debt|short duration|corporate bond|gilt|banking and psu|banking & psu|dynamic bond|floater|swvxx|snvxx|vmfxx|spaxx|sgov|usfr)\b/i;
+      const skipTickers = new Set(["CASH", "TOTAL", "ACCOUNT TOTAL", "POSITIONS TOTAL", "CASH & CASH INVESTMENTS", "USD"]);
+
+      const consolidatedMap = new Map<string, any>();
+      for (const item of rawList) {
+        const units = Number(String(item.units ?? item.quantity ?? 0).replace(/,/g, ""));
+        const nav = Number(String(item.nav ?? item.currentPrice ?? item.price ?? 0).replace(/[$,₹,\s]/g, ""));
+        if (!units || isNaN(units) || units <= 0) continue;
+
+        const origName = String(item.originalName || item.schemeName || item.ticker || "").trim();
+        const schemeName = String(item.schemeName || item.ticker || origName).trim();
+        let rawTicker = String(item.ticker || item.schemeName || origName).trim();
+        if (skipTickers.has(rawTicker.toUpperCase()) || skipTickers.has(origName.toUpperCase())) continue;
+
+        const rowProvider = String(item.provider || detectedProvider || "CAMS").trim();
+        let currency: "USD" | "INR" = item.currency === "USD" ? "USD" : "INR";
+        if (["Charles Schwab", "IBKR", "E*TRADE"].includes(rowProvider) && !item.currency) {
+          currency = "USD";
+        }
+
+        let assetClass: "Equity" | "Debt" | "Mutual Fund" =
+          item.assetClass === "Debt" ? "Debt" :
+          item.assetClass === "Equity" ? "Equity" : "Mutual Fund";
+
+        if (debtKeywords.test(origName) || debtKeywords.test(schemeName) || debtKeywords.test(rawTicker)) {
+          assetClass = "Debt";
+        } else if (currency === "USD" && assetClass === "Mutual Fund") {
+          assetClass = "Equity";
+        }
+
+        // Clean stock tickers
+        if (assetClass === "Equity" || (currency === "USD" && /^[A-Z./-]{1,10}$/i.test(rawTicker))) {
+          rawTicker = rawTicker.toUpperCase().replace(/\//g, ".");
+          if (currency === "INR" && rowProvider === "Zerodha" && /^[A-Z0-9&-]{1,15}$/.test(rawTicker) && !rawTicker.endsWith(".NS") && !rawTicker.endsWith(".BO")) {
+            rawTicker = `${rawTicker}.NS`;
+          }
+          if (currency === "USD") {
+            rawTicker = rawTicker.replace(/\.US$/, "");
+          }
+        }
+
+        const isinMatch = `${item.isin || ""} ${origName}`.match(/\b([A-Z]{2}[A-Z0-9]{10})\b/i);
+        const isin = isinMatch ? isinMatch[1].toUpperCase() : "";
+        const dedupKey = `${rowProvider}|${currency}|${isin || rawTicker.toUpperCase()}|${assetClass}`;
+
+        if (consolidatedMap.has(dedupKey)) {
+          const prev = consolidatedMap.get(dedupKey)!;
+          prev.units = Number((prev.units + units).toFixed(6));
+          if (!prev.nav && nav > 0) prev.nav = nav;
+        } else {
+          consolidatedMap.set(dedupKey, {
+            ticker: rawTicker.slice(0, 50),
+            schemeName: schemeName.slice(0, 50),
+            originalName: origName,
+            isin,
+            units,
+            nav: isNaN(nav) ? 0 : nav,
+            assetClass,
+            currency,
+            provider: rowProvider
+          });
+        }
+      }
+
+      const enrichedHoldings = Array.from(consolidatedMap.values());
+
+      // Enrich Indian MFs with exact AMFI scheme code & latest live NAV, and stocks with live quotes
+      const mfData = await getAmfiData();
+      const stockSymbolsToFetch = new Set<string>();
+
+      for (const h of enrichedHoldings) {
+        if (h.currency === "INR" && (h.assetClass === "Mutual Fund" || h.assetClass === "Debt" || /^INF[A-Z0-9]{9}$/.test(h.isin))) {
+          const mf = findAmfiMatch(mfData, h);
+          if (mf) {
+            h.ticker = mf.symbol;
+            if (mf.currentPrice > 0) h.nav = mf.currentPrice;
+            if (!h.originalName || h.originalName.length < mf.shortname.length) {
+              h.originalName = mf.shortname;
+            }
+            continue;
+          }
+        }
+        if (h.assetClass === "Equity" || h.currency === "USD" || h.ticker.endsWith(".NS") || h.ticker.endsWith(".BO")) {
+          stockSymbolsToFetch.add(h.ticker);
+        }
+      }
+
+      if (stockSymbolsToFetch.size > 0) {
+        try {
+          const livePrices = await fetchLiveStockPrices(Array.from(stockSymbolsToFetch));
+          for (const h of enrichedHoldings) {
+            if (livePrices[h.ticker] && livePrices[h.ticker] > 0) {
+              h.nav = livePrices[h.ticker];
+            }
+          }
+        } catch (err) {
+          console.warn("[extract] Live stock price enrichment warning:", err);
+        }
+      }
+
+      res.json({
+        statementType,
+        provider: detectedProvider,
+        summaryNote,
+        holdings: enrichedHoldings
+      });
     } catch (e: any) {
       console.error("Gemini Extraction Error:", e);
+      if (looksEncryptedPdf) {
+        return res.status(400).json({
+          error: "This PDF is password-protected (encrypted). Please unlock or 'Print to PDF' first (CAMS/CAS password is usually PAN or DDMMYYYY) and upload again."
+        });
+      }
       res.status(500).json({ error: "Failed to extract data: " + e.message });
     }
   });
