@@ -879,20 +879,19 @@ async function startServer() {
           }
 
           if (navIdx !== -1) {
-            // Scheme name is usually the field before ISIN or right before NAV if ISIN is missing
-            // Standard format is Code;ISIN;ISIN;Name;NAV;Date (6 parts)
-            // or Code|ISIN|Name|NAV|Date (5 parts)
-            let nameIdx = navIdx - 1;
-            // Catch cases where there's an ISIN between Name and NAV (rare)
-            if (parts[nameIdx].length > 4 && /^[A-Z0-9]{12}$/.test(parts[nameIdx])) {
-              nameIdx = nameIdx - 1;
-            }
+            // AMFI formats include 6-part (Code;ISIN1;ISIN2;Name;NAV;Date) and
+            // 8-part (Code;ISIN1;ISIN2;SchemeName;Plan;Option;NAV;Date)
+            const nameParts = parts
+              .slice(1, navIdx)
+              .map(s => s.trim())
+              .filter(s => s && s !== '-' && !/^INF[A-Z0-9]{9}$/i.test(s) && !/^[A-Z0-9]{12}$/.test(s));
+            const fullName = nameParts.join(' - ');
 
             const price = parseFloat(parts[navIdx]);
-            if (!isNaN(price) && parts[nameIdx]) {
+            if (!isNaN(price) && fullName) {
               results.push({
                 symbol: parts[0].trim(),
-                shortname: parts[nameIdx].trim(),
+                shortname: fullName,
                 currentPrice: price,
                 typeDisp: 'MUTUAL_FUND',
                 exchDisp: 'AMFI',
@@ -965,6 +964,82 @@ async function startServer() {
     return price;
   }
 
+  function toTradingViewIndiaTicker(raw: string): { primary: string; fallback?: string } {
+    let sym = raw.trim().toUpperCase();
+    if (sym.includes(':')) {
+      const [exch, ticker] = sym.split(':');
+      if (exch === 'BSE') return { primary: `BSE:${ticker}`, fallback: `NSE:${ticker}` };
+      return { primary: `NSE:${ticker}`, fallback: `BSE:${ticker}` };
+    }
+    if (sym.endsWith('.BO') || sym.endsWith('.BSE')) {
+      const base = sym.replace(/\.(BO|BSE)$/, '');
+      return { primary: `BSE:${base}`, fallback: `NSE:${base}` };
+    }
+    const base = sym.replace(/\.(NS|NSE)$/, '');
+    return { primary: `NSE:${base}`, fallback: `BSE:${base}` };
+  }
+
+  async function fetchTradingViewIndiaPrices(symbols: string[]): Promise<Record<string, number>> {
+    const out: Record<string, number> = {};
+    if (symbols.length === 0) return out;
+
+    const tickerSet = new Set<string>();
+    const mapBySymbol = new Map<string, { primary: string; fallback?: string }>();
+    for (const sym of symbols) {
+      const mapped = toTradingViewIndiaTicker(sym);
+      mapBySymbol.set(sym, mapped);
+      tickerSet.add(mapped.primary);
+      if (mapped.fallback) tickerSet.add(mapped.fallback);
+    }
+
+    try {
+      const res = await axios.post(
+        'https://scanner.tradingview.com/india/scan',
+        {
+          symbols: { tickers: Array.from(tickerSet) },
+          columns: ['close']
+        },
+        { timeout: 6000, headers: { 'Content-Type': 'application/json', 'User-Agent': YAHOO_HEADERS['User-Agent'] } }
+      );
+      const tvPrices = new Map<string, number>();
+      for (const item of res.data?.data || []) {
+        const price = item?.d?.[0];
+        if (item?.s && typeof price === 'number' && price > 0) {
+          tvPrices.set(String(item.s).toUpperCase(), price);
+        }
+      }
+      for (const sym of symbols) {
+        const mapped = mapBySymbol.get(sym)!;
+        const p = tvPrices.get(mapped.primary) ?? (mapped.fallback ? tvPrices.get(mapped.fallback) : undefined);
+        if (p) out[sym] = p;
+      }
+    } catch (e: any) {
+      console.warn('[TradingView India] Quote batch failed:', e.message);
+    }
+    return out;
+  }
+
+  async function fetchTradingViewUSPrice(symbol: string): Promise<number | null> {
+    const clean = symbol.trim().toUpperCase().replace(/\.US$/, '');
+    try {
+      const res = await axios.post(
+        'https://scanner.tradingview.com/america/scan',
+        {
+          symbols: { tickers: [`NASDAQ:${clean}`, `NYSE:${clean}`, `AMEX:${clean}`] },
+          columns: ['close']
+        },
+        { timeout: 5000, headers: { 'Content-Type': 'application/json', 'User-Agent': YAHOO_HEADERS['User-Agent'] } }
+      );
+      for (const item of res.data?.data || []) {
+        const price = item?.d?.[0];
+        if (typeof price === 'number' && price > 0) return price;
+      }
+    } catch {
+      // ignore
+    }
+    return null;
+  }
+
   async function fetchLiveStockPrices(symbols: string[]) {
     if (symbols.length === 0) return {};
 
@@ -988,17 +1063,25 @@ async function startServer() {
 
     const isIndiaSymbol = (s: string) => {
       const u = s.toUpperCase();
-      return u.endsWith('.NS') || u.endsWith('.BO') || u.endsWith('.NSE') || u.endsWith('.BSE') || u.includes(':NSE') || u.includes(':BSE');
+      return u.endsWith('.NS') || u.endsWith('.BO') || u.endsWith('.NSE') || u.endsWith('.BSE') || u.includes(':NSE') || u.includes(':BSE') || u.startsWith('NSE:') || u.startsWith('BSE:');
     };
 
     const indiaStocks = uncached.filter(isIndiaSymbol);
     const potentialUS = uncached.filter(s => !isIndiaSymbol(s));
 
-    console.log(`[fetchLiveStockPrices] Symbols: ${uncached.join(', ')}. Finnhub: ${FINNHUB_KEY ? 'Present' : 'MISSING'}. Yahoo: Active.`);
+    console.log(`[fetchLiveStockPrices] Symbols: ${uncached.join(', ')}. Finnhub: ${FINNHUB_KEY ? 'Present' : 'MISSING'}. TV-India: Active.`);
 
-    // --- Task A: Yahoo Finance for Indian Stocks (.NS / .BO), with optional AlphaVantage fallback ---
+    // --- Task A: TradingView India batch quote for NSE/BSE (.NS / .BO), with Yahoo/AV fallback ---
     const indiaTask = (async () => {
-      await Promise.all(indiaStocks.map(async (symbol) => {
+      if (indiaStocks.length === 0) return;
+      const tvResults = await fetchTradingViewIndiaPrices(indiaStocks);
+      for (const [sym, price] of Object.entries(tvResults)) {
+        priceMap[sym] = price;
+        stockQuoteCache.set(sym.toUpperCase(), { price, ts: Date.now() });
+      }
+
+      const missingIndia = indiaStocks.filter(s => !priceMap[s]);
+      await Promise.all(missingIndia.map(async (symbol) => {
         const yPrice = await fetchYahooPriceForSymbol(symbol);
         if (yPrice) {
           priceMap[symbol] = yPrice;
@@ -1007,7 +1090,7 @@ async function startServer() {
         }
         if (AV_KEY) {
           try {
-            let avSym = toYahooSymbol(symbol).replace(/\.NS$/, '.BSE').replace(/\.BO$/, '.BSE');
+            const avSym = toYahooSymbol(symbol).replace(/\.NS$/, '.BSE').replace(/\.BO$/, '.BSE');
             const res = await axios.get(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(avSym)}&apikey=${AV_KEY}`, { timeout: 6000 });
             const priceStr = res.data?.["Global Quote"]?.["05. price"];
             if (priceStr && parseFloat(priceStr) > 0) {
@@ -1022,7 +1105,7 @@ async function startServer() {
       }));
     })();
 
-    // --- Task B: Finnhub primary for US Stocks & Crypto, with Yahoo Finance automatic fallback ---
+    // --- Task B: Finnhub primary for US Stocks & Crypto, with TradingView US + India fallback ---
     const usTask = (async () => {
       await Promise.all(potentialUS.map(async (symbol) => {
         if (FINNHUB_KEY) {
@@ -1044,11 +1127,16 @@ async function startServer() {
             console.warn(`[Finnhub] Failed for ${symbol}: ${e.message}`);
           }
         }
-        // Fallback to Yahoo Finance (also handles cases where an Indian ticker was entered without suffix or US ETF missed)
-        const yPrice = await fetchYahooPriceForSymbol(symbol);
-        if (yPrice) {
-          priceMap[symbol] = yPrice;
-          stockQuoteCache.set(symbol.toUpperCase(), { price: yPrice, ts: Date.now() });
+        const tvUsPrice = await fetchTradingViewUSPrice(symbol);
+        if (tvUsPrice) {
+          priceMap[symbol] = tvUsPrice;
+          stockQuoteCache.set(symbol.toUpperCase(), { price: tvUsPrice, ts: Date.now() });
+          return;
+        }
+        const tvIn = await fetchTradingViewIndiaPrices([`${symbol}.NS`]);
+        if (tvIn[`${symbol}.NS`]) {
+          priceMap[symbol] = tvIn[`${symbol}.NS`];
+          stockQuoteCache.set(symbol.toUpperCase(), { price: tvIn[`${symbol}.NS`], ts: Date.now() });
         }
       }));
     })();
@@ -1062,14 +1150,22 @@ async function startServer() {
   app.get("/api/mf/search", async (req, res) => {
     const { q } = req.query;
     if (!q) return res.json([]);
-    const query = (q as string).toLowerCase();
+    const query = (q as string).toLowerCase().trim();
+    const tokens = query.split(/\s+/).filter(Boolean);
 
     const data = await getAmfiData();
     const filtered = data
-      .filter(item => 
-        (item.shortname && item.shortname.toLowerCase().includes(query)) || 
-        (item.symbol && item.symbol.includes(query))
-      )
+      .filter(item => {
+        if (item.symbol && item.symbol.toLowerCase().includes(query)) return true;
+        if (!item.shortname) return false;
+        const nameLower = item.shortname.toLowerCase();
+        return tokens.every(tok => nameLower.includes(tok));
+      })
+      .sort((a, b) => {
+        const aDirectGrowth = a.shortname.includes('Direct') && a.shortname.includes('Growth') ? 0 : 1;
+        const bDirectGrowth = b.shortname.includes('Direct') && b.shortname.includes('Growth') ? 0 : 1;
+        return aDirectGrowth - bDirectGrowth;
+      })
       .slice(0, 15);
 
     console.log(`MF Search for "${query}" found ${filtered.length} results.`);
@@ -1083,31 +1179,44 @@ async function startServer() {
     try {
       const results: any[] = [];
       const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
+      const cleanIndiaQuery = String(q).trim().replace(/^(NSE|BSE):/i, '').replace(/\.(NS|BO|NSE|BSE)$/i, '').trim();
 
-      // Run Yahoo Finance Search (best for NSE/BSE .NS/.BO + global ETFs) and Finnhub Search in parallel
-      const [yahooQuotes, finnhubQuotes] = await Promise.all([
+      // Run TradingView India Search (NSE/BSE with live price included!) + Finnhub US Search in parallel
+      const [indiaQuotes, finnhubQuotes] = await Promise.all([
         (async () => {
+          if (!cleanIndiaQuery) return [];
           try {
-            const yRes = await axios.get(
-              `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(q as string)}&quotesCount=12&newsCount=0`,
-              { timeout: 6000, headers: YAHOO_HEADERS }
+            const tvRes = await axios.post(
+              'https://scanner.tradingview.com/india/scan',
+              {
+                filter: [{ left: 'name,description', operation: 'match', right: cleanIndiaQuery }],
+                options: { lang: 'en' },
+                markets: ['india'],
+                columns: ['name', 'description', 'close', 'currency', 'exchange', 'type'],
+                sort: { sortBy: 'market_cap_basic', sortOrder: 'desc' },
+                range: [0, 8]
+              },
+              { timeout: 6000, headers: { 'Content-Type': 'application/json', 'User-Agent': YAHOO_HEADERS['User-Agent'] } }
             );
-            return (yRes.data?.quotes || [])
-              .filter((qt: any) => qt.symbol && ['EQUITY', 'ETF', 'INDEX', 'CRYPTOCURRENCY'].includes(qt.quoteType))
-              .map((qt: any) => {
-                const sym = String(qt.symbol);
-                const isIndia = sym.endsWith('.NS') || sym.endsWith('.BO') || qt.exchange === 'NSI' || qt.exchange === 'BSE';
-                return {
-                  symbol: sym,
-                  shortname: qt.shortname || qt.longname || sym,
-                  exchDisp: qt.exchDisp || (sym.endsWith('.NS') ? 'NSE' : sym.endsWith('.BO') ? 'BSE' : (qt.exchange || 'US')),
-                  typeDisp: qt.quoteType,
-                  currentPrice: 0,
-                  isIndia
-                };
-              });
+            return (tvRes.data?.data || []).map((item: any) => {
+              const [ticker, desc, close, , exch, assetType] = item.d || [];
+              const suffix = exch === 'BSE' ? '.BO' : '.NS';
+              const sym = `${ticker}${suffix}`;
+              const price = typeof close === 'number' && close > 0 ? close : 0;
+              if (price > 0) {
+                stockQuoteCache.set(sym.toUpperCase(), { price, ts: Date.now() });
+              }
+              return {
+                symbol: sym,
+                shortname: desc || ticker,
+                exchDisp: exch || 'NSE',
+                typeDisp: assetType === 'fund' ? 'ETF' : 'EQUITY',
+                currentPrice: price,
+                isIndia: true
+              };
+            });
           } catch (e: any) {
-            console.warn("Yahoo search failed:", e.message);
+            console.warn("TradingView India search failed:", e.message);
             return [];
           }
         })(),
@@ -1119,15 +1228,15 @@ async function startServer() {
               { timeout: 5000 }
             );
             return (fRes.data?.result || [])
-              .filter((quote: any) => ['Common Stock', 'ETF', 'REIT', 'ADR'].includes(quote.type))
+              .filter((quote: any) => ['Common Stock', 'ETF', 'REIT', 'ADR'].includes(quote.type) && !quote.symbol.includes('.'))
               .slice(0, 8)
               .map((quote: any) => ({
                 symbol: toYahooSymbol(quote.symbol),
                 shortname: quote.description,
-                exchDisp: quote.displaySymbol?.includes('.') ? quote.displaySymbol.split('.')[1] : 'US',
+                exchDisp: 'US',
                 typeDisp: quote.type,
                 currentPrice: 0,
-                isIndia: quote.symbol.endsWith('.NS') || quote.symbol.endsWith('.BO')
+                isIndia: false
               }));
           } catch {
             console.warn("Finnhub search failed");
@@ -1136,7 +1245,7 @@ async function startServer() {
         })()
       ]);
 
-      results.push(...yahooQuotes, ...finnhubQuotes);
+      results.push(...indiaQuotes, ...finnhubQuotes);
 
       // De-duplicate by symbol
       const seen = new Set<string>();
@@ -1147,14 +1256,13 @@ async function startServer() {
         return true;
       }).slice(0, 10);
 
-      // Fetch prices for search results
-      if (uniqueResults.length > 0) {
+      // Fetch prices for any search results that didn't already include a price (e.g. Finnhub US hits)
+      const missingPriceSymbols = uniqueResults.filter((r: any) => !r.currentPrice).map((r: any) => r.symbol);
+      if (missingPriceSymbols.length > 0) {
         try {
-          const priceMap = await fetchLiveStockPrices(
-            uniqueResults.map((r: any) => r.symbol)
-          );
+          const priceMap = await fetchLiveStockPrices(missingPriceSymbols);
           uniqueResults.forEach((r: any) => {
-            if (priceMap[r.symbol]) r.currentPrice = priceMap[r.symbol];
+            if (!r.currentPrice && priceMap[r.symbol]) r.currentPrice = priceMap[r.symbol];
           });
         } catch (e) {
           console.warn("Failed to fetch prices for search results", e);
