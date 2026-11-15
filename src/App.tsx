@@ -2577,7 +2577,7 @@ export default function App() {
       `}>
         <div className="flex items-center justify-between mb-10">
           <div className="flex items-center gap-2.5">
-            <BrandLogo size={38} className="shadow-xs rounded-xl" />
+            <BrandLogo size={36} />
             <div className="leading-none">
               <div className="text-xl tracking-tight">
                 <span className="font-extrabold text-slate-900">unity</span>
@@ -2663,7 +2663,7 @@ export default function App() {
               >
                 <Menu size={20} />
               </button>
-              <BrandLogo size={28} className="lg:hidden rounded-lg shadow-2xs" />
+              <BrandLogo size={28} className="lg:hidden" />
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="font-black text-sm sm:text-base text-slate-900 truncate">
@@ -5090,8 +5090,17 @@ function LandingPage({ onLogin, onSignup, onForgot, onReset, onGoogleLogin, pend
   return (
     <div className="min-h-dvh bg-slate-50 flex items-center justify-center p-4 sm:p-6">
       <div className="w-full max-w-md bg-white rounded-3xl shadow-xl shadow-slate-200 overflow-hidden">
-        <div className="bg-[#0a1626] px-6 py-7 sm:px-8 sm:py-8 text-white flex items-center justify-center border-b border-slate-800/60">
-          <BrandLogo lockup size={64} className="max-w-full" />
+        <div className="bg-gradient-to-b from-slate-50 to-white px-6 pt-7 pb-5 sm:px-8 sm:pt-8 sm:pb-6 border-b border-slate-100 flex items-center gap-3.5">
+          <BrandLogo size={46} />
+          <div className="leading-none">
+            <div className="text-2xl tracking-tight">
+              <span className="font-extrabold text-slate-900">unity</span>
+              <span className="font-semibold text-emerald-600">wealth</span>
+            </div>
+            <div className="text-[10px] font-bold tracking-[0.18em] text-slate-400 uppercase mt-1.5">
+              Portfolio &amp; Rebalancing
+            </div>
+          </div>
         </div>
         <div className="p-6 sm:p-8">
           {pendingInviteCode && (
@@ -5310,7 +5319,7 @@ function HouseholdSetup({
   return (
     <div className="min-h-dvh bg-slate-50 flex flex-col items-center justify-center p-4 sm:p-6 gap-6 sm:gap-8">
       <div className="flex items-center gap-3 pt-2 sm:pt-0">
-        <BrandLogo size={42} className="shadow-sm rounded-xl" />
+        <BrandLogo size={42} />
         <div className="leading-none">
           <div className="text-2xl tracking-tight">
             <span className="font-extrabold text-slate-900">unity</span>

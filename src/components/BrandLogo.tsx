@@ -4,34 +4,23 @@ interface BrandLogoProps {
   size?: number;
   className?: string;
   variant?: 'default' | 'onDark';
-  lockup?: boolean;
 }
 
 export const BrandLogo: React.FC<BrandLogoProps> = ({
   size = 36,
   className = '',
-  lockup = false,
+  variant = 'default',
 }) => {
-  if (lockup) {
-    return (
-      <img
-        src="/logo-lockup.png?v=4"
-        alt="UnityWealth — Portfolio & Rebalancing"
-        style={{ height: size, width: 'auto' }}
-        className={`shrink-0 select-none object-contain ${className}`}
-        draggable={false}
-      />
-    );
-  }
-
   return (
     <img
-      src="/logo-mark.png?v=4"
+      src="/logo-mark.png?v=5"
       width={size}
       height={size}
       alt="UnityWealth"
       style={{ width: size, height: size }}
-      className={`shrink-0 select-none object-contain ${className}`}
+      className={`shrink-0 select-none object-contain ${
+        variant === 'onDark' ? 'bg-white rounded-xl p-1' : ''
+      } ${className}`}
       draggable={false}
     />
   );
