@@ -219,7 +219,7 @@ export function computePropertySummary(prop: RealEstateProperty): RealEstateComp
     ? Math.max(0, Number(prop.manualSelfPaidINR) || 0)
     : ledgerSelfBuilderINR;
 
-  const ledgerDisbursedBest = runningDisbursed > 0 ? runningDisbursed : ledgerLoanBuilderINR;
+  const ledgerDisbursedBest = Math.max(runningDisbursed, ledgerLoanBuilderINR);
   const loanDisbursedINR = hasManual
     ? Math.max(0, Number(prop.manualLoanDisbursedINR) || 0)
     : ledgerDisbursedBest;
