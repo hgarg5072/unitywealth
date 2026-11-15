@@ -201,13 +201,74 @@ export interface NotificationRecord {
   id: string;
   householdId: string;
   userId?: string;
-  category: 'import' | 'family' | 'milestone' | 'drift' | 'system';
+  category: 'import' | 'family' | 'milestone' | 'drift' | 'tax' | 'rsu' | 'system';
   severity: 'info' | 'success' | 'warning';
   title: string;
   message: string;
   actionTab?: string;
   isRead: boolean;
   createdAt: number;
+}
+
+export type TaxAcquisitionType = 'RSU Vest' | 'ESPP' | 'Market Buy' | 'SIP' | 'Bonus/Split';
+
+export interface TaxLot {
+  id: string;
+  householdId: string;
+  holdingId?: string;
+  ownerId: string;
+  ticker: string;
+  provider?: string;
+  acquiredDate: string; // YYYY-MM-DD (purchase date or RSU vest release date)
+  quantity: number;     // Open units in this tranche
+  costPerUnit: number;  // Cost basis per unit in native currency (USD or INR)
+  currency: Currency;
+  fxRateAtBuy?: number; // USD/INR rate at vest/purchase (optional)
+  acquisitionType: TaxAcquisitionType;
+  notes?: string;
+  updatedAt: number;
+}
+
+export interface RsuVestTranche {
+  id: string;
+  vestDate: string;     // YYYY-MM-DD
+  grossUnits: number;   // Gross shares scheduled to vest
+  netUnits?: number;    // Optional override; else grossUnits * (1 - withholdingTaxPct / 100)
+  vested?: boolean;     // True once confirmed & converted into Holding + TaxLot
+  vestPriceUSD?: number;
+}
+
+export interface RsuGrant {
+  id: string;
+  householdId: string;
+  ownerId: string;
+  ticker: string;            // e.g. QCOM, GOOGL, MSFT, NVDA
+  companyName?: string;
+  grantName: string;         // e.g. '2025 Annual Refresher'
+  grantDate?: string;        // YYYY-MM-DD
+  currency: Currency;        // typically 'USD'
+  provider: string;          // e.g. 'E*TRADE', 'Charles Schwab'
+  withholdingTaxPct: number; // default 35.88 (sell-to-cover tax %)
+  vestSchedule: RsuVestTranche[];
+  notes?: string;
+  updatedAt: number;
+}
+
+export type IncomeBracketKey = 'above_5cr' | '2cr_to_5cr' | '1cr_to_2cr' | '50l_to_1cr' | 'below_50l';
+
+export interface TaxProfileSettings {
+  incomeBracket: IncomeBracketKey;
+  taxRegime: 'new' | 'old';
+  realizedSec112aGainByMemberINR?: Record<string, number>; // FY realized Indian Eq LTCG per member PAN
+  realizedLossOffsetPoolINR?: number;                      // Current/carry-forward capital losses available
+  nomineeVerifiedByAccount?: Record<string, string>;       // Account key -> Nominee name / verified note (for ICE sheet)
+}
+
+export interface HouseholdTaxPlanningBundle {
+  taxLots: TaxLot[];
+  rsuGrants: RsuGrant[];
+  taxProfile: TaxProfileSettings;
+  updatedAt?: number;
 }
 
 export interface EmailStatusPublic {
@@ -231,6 +292,7 @@ export interface HouseholdSettings {
   manualMembers?: ManualMember[];
   memberProfiles?: Record<string, { id: string; name: string; email: string }>;
   realEstateProperties?: RealEstateProperty[];
+  taxProfile?: TaxProfileSettings;
 }
 
 export interface Household {

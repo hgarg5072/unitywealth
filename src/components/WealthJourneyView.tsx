@@ -42,8 +42,15 @@ import type {
   MemberSnapshotBreakdown,
   HoldingSnapshotBreakdown,
   RebalanceSnapshotMeta,
-  WealthSnapshotRecord
+  WealthSnapshotRecord,
+  TaxLot,
+  RsuGrant
 } from '../types';
+import {
+  computePortfolioTaxIntelligence,
+  computeXirrFromEvaluatedLots,
+  simulateRsuForwardPlan
+} from '../shared/taxAndRsuMath';
 
 export { formatCompactINR, formatCompactUSD };
 export type MemberSnapshotEntry = MemberSnapshotBreakdown;
@@ -235,6 +242,9 @@ interface Props {
   realEstateEquityINR?: number;
   realEstateByMember?: Record<string, number>;
   includeRealEstate?: boolean;
+  taxLots?: TaxLot[];
+  rsuGrants?: RsuGrant[];
+  onOpenRsuForecast?: () => void;
 }
 
 export function WealthJourneyView({
@@ -252,7 +262,10 @@ export function WealthJourneyView({
   onDeleteMonth,
   realEstateEquityINR = 0,
   realEstateByMember = {},
-  includeRealEstate = true
+  includeRealEstate = true,
+  taxLots = [],
+  rsuGrants = [],
+  onOpenRsuForecast
 }: Props) {
   // Scope: 'family' (combined) or a specific member.id — synced with global header member pills
   const [internalScope, setInternalScope] = useState<'family' | string>('family');
@@ -744,6 +757,42 @@ export function WealthJourneyView({
       ? 'Family Combined'
       : memberNameMap.get(scope) || 'Member';
 
+  // Compute True Cash-Flow XIRR & Unvested RSU Pipeline summary when dated lots / RSU grants exist
+  const xirrAndRsuMeta = useMemo(() => {
+    let xirrPct: number | null = null;
+    let unvestedNetINR = 0;
+    if (stats && taxLots.length > 0) {
+      const filteredLots =
+        scope === 'family' ? taxLots : taxLots.filter((l) => l.ownerId === scope);
+      if (filteredLots.length > 0) {
+        const intel = computePortfolioTaxIntelligence({
+          stats,
+          taxLots: filteredLots,
+          members,
+          fxRate: safeFx
+        });
+        const xr = computeXirrFromEvaluatedLots(intel.evaluatedLots);
+        xirrPct = xr.xirrPct;
+      }
+    }
+    if (stats && rsuGrants.length > 0) {
+      const filteredGrants =
+        scope === 'family' ? rsuGrants : rsuGrants.filter((g) => g.ownerId === scope);
+      if (filteredGrants.length > 0) {
+        const sim = simulateRsuForwardPlan({
+          stats,
+          rsuGrants: filteredGrants,
+          targets: targets || { assetSplit: { Equity: 70, Debt: 30 }, equitySplit: { Indian: 60, Foreign: 40 }, foreignBreakdown: [] },
+          members,
+          fxRate: safeFx,
+          horizonMonths: 24
+        });
+        unvestedNetINR = sim.totalNetVestValueINR;
+      }
+    }
+    return { xirrPct, unvestedNetINR };
+  }, [stats, taxLots, rsuGrants, scope, members, safeFx, targets]);
+
   const filteredDropdownAssets = useMemo(() => {
     const q = assetSearch.trim().toLowerCase();
     if (!q) return scopedAssets;
@@ -796,6 +845,25 @@ export function WealthJourneyView({
             <span className="px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center gap-1">
               <ShieldCheck size={12} /> PostgreSQL Vault
             </span>
+            {xirrAndRsuMeta.xirrPct !== null && (
+              <span
+                className="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-indigo-50 text-indigo-700 border border-indigo-200 flex items-center gap-1"
+                title="True annualized cash-flow XIRR across dated holdings"
+              >
+                <TrendingUp size={11} /> True XIRR: {xirrAndRsuMeta.xirrPct >= 0 ? '+' : ''}
+                {xirrAndRsuMeta.xirrPct}% p.a.
+              </span>
+            )}
+            {xirrAndRsuMeta.unvestedNetINR > 0 && (
+              <button
+                type="button"
+                onClick={onOpenRsuForecast}
+                className="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-amber-50 text-amber-800 border border-amber-200 flex items-center gap-1 hover:bg-amber-100 transition-colors"
+                title="Projected net RSU vests over next 24 months (excluded from current liquid balance)"
+              >
+                <Sparkles size={11} /> +{formatCompactINR(xirrAndRsuMeta.unvestedNetINR)} Unvested RSU →
+              </button>
+            )}
             {scope !== 'family' && (
               <button
                 type="button"

@@ -7,9 +7,10 @@ import {
   RefreshCcw,
   X,
   Plus,
-  FileUp
+  FileUp,
+  Calendar
 } from 'lucide-react';
-import { AssetClass, Currency } from '../types';
+import { AssetClass, Currency, TaxAcquisitionType } from '../types';
 import { shortenAssetName } from '../lib/formatAssetName';
 import { DEBT_KEYWORDS_REGEX } from '../shared/portfolioMath';
 
@@ -37,6 +38,11 @@ interface QuickAddProps {
     assetClass: AssetClass;
     provider: string;
     source: 'Manual' | 'Live';
+    initialLot?: {
+      acquiredDate: string;
+      costPerUnit: number;
+      acquisitionType: TaxAcquisitionType;
+    };
   }) => Promise<void>;
   onUploadFiles: (files: FileList | File[], ownerId: string, providerHint?: string) => Promise<void>;
 }
@@ -85,6 +91,10 @@ export function QuickAddModal({
   const [currency, setCurrency] = useState<Currency>('INR');
   const [assetClass, setAssetClass] = useState<AssetClass>('Equity');
   const [provider, setProvider] = useState('Manual');
+  const [showLotFields, setShowLotFields] = useState(false);
+  const [acquiredDateInput, setAcquiredDateInput] = useState('');
+  const [costBasisInput, setCostBasisInput] = useState('');
+  const [acqTypeInput, setAcqTypeInput] = useState<TaxAcquisitionType>('Market Buy');
 
   // Preset Mode State
   const [selectedPresetId, setSelectedPresetId] = useState('epf');
@@ -187,6 +197,8 @@ export function QuickAddModal({
     setUnitsInput('');
     setAmountInput('');
     setPriceInput('');
+    setAcquiredDateInput('');
+    setCostBasisInput('');
   };
 
   const submitSearchEntry = async (keepOpen: boolean) => {
@@ -204,6 +216,16 @@ export function QuickAddModal({
     const finalName = assetName.trim() || selectedSymbol.trim();
     if (!finalName || !(qty > 0) || !(finalPrice > 0)) return;
 
+    const parsedCost = parseFloat(costBasisInput);
+    const initialLot =
+      showLotFields && acquiredDateInput
+        ? {
+            acquiredDate: acquiredDateInput,
+            costPerUnit: !isNaN(parsedCost) && parsedCost >= 0 ? parsedCost : finalPrice,
+            acquisitionType: acqTypeInput
+          }
+        : undefined;
+
     setIsSubmitting(true);
     try {
       await onSaveHolding({
@@ -215,7 +237,8 @@ export function QuickAddModal({
         currency,
         assetClass,
         provider: provider || 'Manual',
-        source: selectedSymbol ? 'Live' : 'Manual'
+        source: selectedSymbol ? 'Live' : 'Manual',
+        initialLot
       });
       if (keepOpen) {
         setAddedToast(`Saved ${finalName}! Ready for next entry.`);
@@ -500,6 +523,63 @@ export function QuickAddModal({
                     className="w-full px-2.5 py-2 bg-slate-50 border border-slate-200 rounded-xl text-xs font-bold"
                   />
                 </div>
+              </div>
+
+              {/* Optional Progressive Disclosure: Purchase / RSU Vest Date for Tax AI */}
+              <div>
+                <button
+                  type="button"
+                  onClick={() => setShowLotFields((v) => !v)}
+                  className="inline-flex items-center gap-1.5 text-xs font-bold text-indigo-600 hover:underline"
+                >
+                  <Calendar size={13} />
+                  {showLotFields
+                    ? 'Hide Purchase / Vest Date'
+                    : '+ Optional: Add Purchase / RSU Vest Date & Cost (for Tax AI)'}
+                </button>
+                {showLotFields && (
+                  <div className="mt-2 p-3 rounded-xl bg-indigo-50/60 border border-indigo-100 grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <div>
+                      <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">
+                        Buy / Vest Date
+                      </label>
+                      <input
+                        type="date"
+                        value={acquiredDateInput}
+                        onChange={(e) => setAcquiredDateInput(e.target.value)}
+                        className="w-full px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-semibold"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">
+                        Buy Cost ({currency})
+                      </label>
+                      <input
+                        type="number"
+                        step="any"
+                        placeholder={priceInput || 'Cost / unit'}
+                        value={costBasisInput}
+                        onChange={(e) => setCostBasisInput(e.target.value)}
+                        className="w-full px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-semibold"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] font-bold text-slate-500 uppercase mb-1">
+                        Tranche Type
+                      </label>
+                      <select
+                        value={acqTypeInput}
+                        onChange={(e) => setAcqTypeInput(e.target.value as TaxAcquisitionType)}
+                        className="w-full px-2.5 py-1.5 bg-white border border-slate-200 rounded-lg text-xs font-semibold"
+                      >
+                        <option value="Market Buy">Market Buy</option>
+                        <option value="RSU Vest">RSU Vest</option>
+                        <option value="ESPP">ESPP</option>
+                        <option value="SIP">SIP</option>
+                      </select>
+                    </div>
+                  </div>
+                )}
               </div>
 
               <div className="flex flex-col sm:flex-row gap-2 pt-1">

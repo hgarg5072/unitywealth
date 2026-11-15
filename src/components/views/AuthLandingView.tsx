@@ -10,13 +10,15 @@ export function LandingPage({
   onSignup,
   onForgot,
   onGoogleLogin,
-  pendingInviteCode
+  pendingInviteCode,
+  themeNode
 }: {
   onLogin: (email: string, password: string) => Promise<void> | void;
   onSignup: (email: string, password: string, name: string) => Promise<void> | void;
   onForgot: (email: string) => Promise<boolean>;
   onGoogleLogin: () => void;
   pendingInviteCode?: string;
+  themeNode?: React.ReactNode;
 }) {
   const [activeView, setActiveView] = useState<'login' | 'signup' | 'forgot'>(() =>
     pendingInviteCode ? 'signup' : 'login'
@@ -59,17 +61,20 @@ export function LandingPage({
   return (
     <div className="min-h-dvh bg-slate-50 flex items-center justify-center p-4 sm:p-6">
       <div className="w-full max-w-md bg-white rounded-3xl shadow-xl shadow-slate-200 overflow-hidden">
-        <div className="bg-gradient-to-b from-slate-50 to-white px-6 pt-7 pb-5 sm:px-8 sm:pt-8 sm:pb-6 border-b border-slate-100 flex items-center gap-3.5">
-          <BrandLogo size={46} />
-          <div className="leading-none">
-            <div className="text-2xl tracking-tight">
-              <span className="font-extrabold text-slate-900">unity</span>
-              <span className="font-semibold text-emerald-600">wealth</span>
-            </div>
-            <div className="text-[10px] font-bold tracking-[0.18em] text-slate-400 uppercase mt-1.5">
-              Portfolio &amp; Rebalancing
+        <div className="bg-gradient-to-b from-slate-50 to-white px-6 pt-7 pb-5 sm:px-8 sm:pt-8 sm:pb-6 border-b border-slate-100 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3.5">
+            <BrandLogo size={46} />
+            <div className="leading-none">
+              <div className="text-2xl tracking-tight">
+                <span className="font-extrabold text-slate-900">unity</span>
+                <span className="font-semibold text-emerald-600">wealth</span>
+              </div>
+              <div className="text-[10px] font-bold tracking-[0.18em] text-slate-400 uppercase mt-1.5">
+                Portfolio &amp; Rebalancing
+              </div>
             </div>
           </div>
+          {themeNode && <div className="shrink-0">{themeNode}</div>}
         </div>
         <div className="p-6 sm:p-8">
           {pendingInviteCode && (
@@ -287,7 +292,8 @@ export function HouseholdSetup({
   onJoinByCode,
   isJoining,
   initialCode,
-  invites
+  invites,
+  themeNode
 }: {
   onCreate: (name: string) => void;
   onJoin: (id: string) => void;
@@ -295,6 +301,7 @@ export function HouseholdSetup({
   isJoining?: boolean;
   initialCode?: string;
   invites: Invite[];
+  themeNode?: React.ReactNode;
 }) {
   const [name, setName] = useState('');
   const [inviteCode, setInviteCode] = useState(initialCode || '');
@@ -338,7 +345,8 @@ export function HouseholdSetup({
   }, [inviteCode]);
 
   return (
-    <div className="min-h-dvh bg-slate-50 flex flex-col items-center justify-center p-4 sm:p-6 gap-6 sm:gap-8">
+    <div className="min-h-dvh bg-slate-50 flex flex-col items-center justify-center p-4 sm:p-6 gap-6 sm:gap-8 relative">
+      {themeNode && <div className="absolute top-4 right-4 sm:top-6 sm:right-6">{themeNode}</div>}
       <div className="flex items-center gap-3 pt-2 sm:pt-0">
         <BrandLogo size={42} />
         <div className="leading-none">

@@ -25,6 +25,8 @@ import {
   deleteWealthSnapshotPg,
   getRealEstatePg,
   saveRealEstatePg,
+  getTaxPlanningPg,
+  saveTaxPlanningPg,
   addNotificationPg,
   getNotificationsPg,
   markNotificationsReadPg,
@@ -1298,6 +1300,118 @@ async function startServer() {
     } catch (e: any) {
       const code = e.statusCode || 400;
       res.status(code).json({ error: e.message || "Failed to import spreadsheet" });
+    }
+  });
+
+  // --- Dedicated PostgreSQL Tax Lots, RSU Vesting & Tax Profile Persistence + AI CIO Copilot ---
+  app.get("/api/tax-planning/:householdId", async (req, res) => {
+    try {
+      const { householdId } = req.params;
+      await verifyCallerHouseholdAccess(req, householdId);
+      const bundle = await getTaxPlanningPg(householdId);
+      res.json(bundle);
+    } catch (e: any) {
+      const code = e.statusCode || 500;
+      res.status(code).json({ error: e.message || "Failed to load tax & RSU planning records" });
+    }
+  });
+
+  app.post("/api/tax-planning/:householdId", async (req, res) => {
+    try {
+      const { householdId } = req.params;
+      await verifyCallerHouseholdAccess(req, householdId);
+      const { taxLots, rsuGrants, taxProfile } = req.body || {};
+      const saved = await saveTaxPlanningPg(householdId, {
+        ...(Array.isArray(taxLots) ? { taxLots } : {}),
+        ...(Array.isArray(rsuGrants) ? { rsuGrants } : {}),
+        ...(taxProfile && typeof taxProfile === "object" ? { taxProfile } : {})
+      });
+      res.json({ success: true, ...saved });
+    } catch (e: any) {
+      const code = e.statusCode || 500;
+      res.status(code).json({ error: e.message || "Failed to save tax & RSU planning records" });
+    }
+  });
+
+  app.post("/api/ai/wealth-copilot", async (req, res) => {
+    try {
+      const { householdId, question, contextSummary } = req.body || {};
+      if (!householdId) {
+        return res.status(400).json({ error: "householdId is required" });
+      }
+      await verifyCallerHouseholdAccess(req, householdId);
+
+      const userQuestion = String(
+        question || "Give me a prioritized tax-smart rebalancing, RSU vesting, and cash-flow action plan."
+      )
+        .trim()
+        .slice(0, 800);
+
+      const prompt = `You are an elite Indian Cross-Border Family Office Chief Investment Officer & Chartered Tax Strategist advising a high-income Indian resident household (> Rs. 1 Crore annual income, top tax bracket).
+
+EXACT INDIAN CAPITAL GAINS RULES YOU MUST APPLY (Post-Finance Act 2024/2025):
+1. Surcharge on Sec 111A, Sec 112A, and Sec 112 Capital Gains is statutory-capped at 15% even when total income exceeds Rs. 2 Cr or Rs. 5 Cr!
+2. Indian Equity / Equity MFs / Arbitrage Funds (STT paid):
+   - Held > 12 months: LTCG @ 12.5% -> 14.95% effective (12.5% * 1.15 * 1.04), with Rs. 1.25 Lakh LTCG tax-free per PAN per FY (Sec 112A).
+   - Held <= 12 months: STCG @ 20% -> 23.92% effective (20% * 1.15 * 1.04).
+   - Note: Arbitrage Funds give liquid/debt-like low volatility while enjoying Equity taxation (14.95% LTCG >12m) instead of 35.88%-39% Debt slab tax!
+3. Foreign Stocks / US Employer RSUs (QCOM, GOOGL, MSFT, NVDA, VTI, etc.):
+   - Held > 24 months (>730 days): LTCG @ 12.5% -> 14.95% effective (Sec 112).
+   - Held <= 24 months: STCG taxed at Marginal Slab Rate (35.88% for Rs. 1-2 Cr; 39.00% for > Rs. 2 Cr New Regime).
+   - CRITICAL RSU RULE: Freshly vested RSUs already suffered perquisite income tax withholding at vest. Selling newly vested RSU shares near vest FMV yields Gain ~ Rs. 0 -> ~0% extra capital gains tax, making vest-day liquidation far more tax-efficient than selling appreciated STCG lots or even deep-gain LTCG lots!
+   - Schedule FA Compliance: Foreign assets must be disclosed annually (Jan 1 - Dec 31 calendar year peak & closing values) in ITR Schedule FA.
+4. Non-Arbitrage Debt MFs (bought on/after 1 Apr 2023, Sec 50AA) & Fixed Deposits: taxed at Marginal Slab Rate (35.88% - 39.00%).
+
+LIVE HOUSEHOLD PORTFOLIO, TAX LOTS, UNVESTED RSU & REAL ESTATE SNAPSHOT:
+${JSON.stringify(contextSummary || {}, null, 2).slice(0, 28000)}
+
+INVESTOR QUESTION:
+"${userQuestion}"
+
+Return ONLY a valid JSON object matching this exact schema:
+{
+  "headline": "Crisp 1-line executive takeaway with concrete Rs. numbers",
+  "directAnswer": "2-4 sentences directly answering the question with exact tax rates, rupee impact, and trade-offs.",
+  "actionSteps": [
+    "Concrete step 1 naming exact ticker/account/member/lot or RSU tranche and Rs. amount",
+    "Concrete step 2...",
+    "Concrete step 3..."
+  ],
+  "taxAlphaNote": "1-sentence highlight of estimated Rs. tax saved or compliance reminder (e.g. LTCG cliff, Sec 112A multi-PAN harvest, or vest-day 0-gain sale)"
+}`;
+
+      try {
+        const rawJson = await callGeminiJSON([{ text: prompt }]);
+        const cleaned = (rawJson || "").replace(/```json/g, "").replace(/```/g, "").trim();
+        const parsed = JSON.parse(cleaned);
+        return res.json({
+          source: "gemini",
+          headline: String(parsed?.headline || "Tax-Smart Portfolio Strategy Ready"),
+          directAnswer: String(parsed?.directAnswer || ""),
+          actionSteps: Array.isArray(parsed?.actionSteps)
+            ? parsed.actionSteps.map((s: any) => String(s)).slice(0, 5)
+            : [],
+          taxAlphaNote: String(parsed?.taxAlphaNote || "")
+        });
+      } catch (aiErr: any) {
+        console.warn("[Wealth Copilot] Falling back to deterministic tax engine:", aiErr?.message);
+        const cs = contextSummary || {};
+        return res.json({
+          source: "deterministic",
+          headline: `Tax-Smart Strategy for ${cs.bracketLabel || "> ₹1 Cr Top Bracket"} (${cs.alignmentPct || 95}% Aligned)`,
+          directAnswer: `In your ${cs.marginalRatePct || 35.88}% slab, prioritize (1) booking tax-loss lots or freshly vested RSUs near vest FMV (~0% tax drag), (2) utilizing ₹1.25L Sec 112A tax-free LTCG per family PAN, and (3) selling >24M US / >12M India LTCG lots at 14.95% effective rate while strictly avoiding <=24M appreciated US STCG lots (${cs.marginalRatePct || 35.88}%).`,
+          actionSteps: [
+            cs.topSellSummary || "Use the Lot Optimizer on each SELL order to liquidate lowest tax-drag tranches first.",
+            cs.rsuSummary || "Sell excess newly vesting RSUs within 48 hours of vest (~₹0 cap-gains tax) and route proceeds into underweight Indian Equity / Arbitrage Debt.",
+            cs.harvestSummary || "Harvest up to ₹1.25L LTCG tax-free per family member PAN in Indian Equity / Arbitrage MFs before March 31."
+          ],
+          taxAlphaNote:
+            "Statutory 15% surcharge cap keeps all qualifying LTCG at 14.95% vs 35.88%–39.00% marginal STCG."
+        });
+      }
+    } catch (e: any) {
+      const code = e.statusCode || 500;
+      res.status(code).json({ error: e.message || "Failed to generate AI strategy" });
     }
   });
 
@@ -2724,7 +2838,7 @@ async function startServer() {
 
 Return ONLY a valid JSON object matching this exact structure:
 {
-  "statementType": "holdings" | "capital_gains_only" | "transactions_only",
+  "statementType": "holdings" | "capital_gains_only" | "transactions_only" | "unvested_rsu_only",
   "provider": "CAMS" | "KFintech" | "Zerodha" | "INDmoney" | "Charles Schwab" | "IBKR" | "E*TRADE" | "Statement",
   "statementMonth": "YYYY-MM valuation month printed on the statement (e.g. 2026-11) or empty string",
   "summaryNote": "1-sentence description of what was detected",
@@ -2737,7 +2851,28 @@ Return ONLY a valid JSON object matching this exact structure:
       "units": 123.456,
       "nav": 94.25,
       "assetClass": "Equity" | "Debt" | "Mutual Fund",
-      "currency": "INR" | "USD"
+      "currency": "INR" | "USD",
+      "lots": [
+        {
+          "acquiredDate": "YYYY-MM-DD purchase or RSU vest release date if shown for open units",
+          "units": 45.0,
+          "costPerUnit": 168.50,
+          "acquisitionType": "RSU Vest" | "ESPP" | "Market Buy" | "SIP"
+        }
+      ]
+    }
+  ],
+  "unvestedGrants": [
+    {
+      "ticker": "Stock ticker (e.g. QCOM, GOOGL, MSFT, NVDA)",
+      "grantName": "Grant ID or Grant Name if shown",
+      "provider": "E*TRADE" | "Charles Schwab" | "Statement",
+      "vestSchedule": [
+        {
+          "vestDate": "YYYY-MM-DD future vest date",
+          "grossUnits": 50
+        }
+      ]
     }
   ]
 }
@@ -2774,7 +2909,9 @@ BROKER, TICKER & CURRENCY RULES:
   - From "Open Positions" (Summary rows for Stocks/ETFs/Bonds), extract symbol, open quantity, and close/mark price. Ignore "Total" and "Forex" rows. Default currency "USD" (or "INR" if NSE).
 - E*TRADE:
   - provider: "E*TRADE", currency: "USD", assetClass: "Equity".
-  - Extract portfolio positions and VESTED/sellable RSU or ESPP shares (ignore unvested future grant schedules, "CASH", and "TOTAL" rows).
+  - Extract portfolio positions and VESTED/sellable RSU or ESPP shares into "holdings" (NEVER include unvested future shares in "holdings"!).
+  - If open tax lots / RSU release dates & vest FMVs or purchase dates/costs are shown for open shares (in E*TRADE, Schwab Lot Details, IBKR, Zerodha, or CAMS transaction folios), populate the holding's "lots" array with YYYY-MM-DD "acquiredDate", open "units", and native "costPerUnit".
+  - If unvested future RSU vest dates and unvested quantities are shown on the statement, extract them ONLY into top-level "unvestedGrants" (and if the file has ONLY unvested future grants and 0 vested shares, set "statementType": "unvested_rsu_only").
 - MANDATORY GLOBAL RULE: Any fund or ETF containing the word "Arbitrage" MUST have assetClass = "Debt".`;
 
       const promptParts: any[] = [{ text: extractionInstructions }];
@@ -2861,10 +2998,36 @@ BROKER, TICKER & CURRENCY RULES:
         const isin = isinMatch ? isinMatch[1].toUpperCase() : "";
         const dedupKey = `${rowProvider}|${currency}|${isin || rawTicker.toUpperCase()}|${assetClass}`;
 
+        const parsedLots = Array.isArray(item.lots)
+          ? item.lots
+              .map((l: any) => ({
+                acquiredDate: String(l?.acquiredDate || "").trim(),
+                units: Number(String(l?.units ?? l?.quantity ?? 0).replace(/,/g, "")),
+                costPerUnit: Number(String(l?.costPerUnit ?? l?.cost ?? 0).replace(/[$,₹,\s]/g, "")),
+                acquisitionType: ["RSU Vest", "ESPP", "Market Buy", "SIP"].includes(String(l?.acquisitionType))
+                  ? String(l.acquisitionType)
+                  : rowProvider === "E*TRADE"
+                  ? "RSU Vest"
+                  : assetClass === "Mutual Fund"
+                  ? "SIP"
+                  : "Market Buy"
+              }))
+              .filter(
+                (l: any) =>
+                  /^\d{4}-\d{2}-\d{2}$/.test(l.acquiredDate) &&
+                  l.units > 0 &&
+                  !isNaN(l.costPerUnit) &&
+                  l.costPerUnit >= 0
+              )
+          : [];
+
         if (consolidatedMap.has(dedupKey)) {
           const prev = consolidatedMap.get(dedupKey)!;
           prev.units = Number((prev.units + units).toFixed(6));
           if (!prev.nav && nav > 0) prev.nav = nav;
+          if (parsedLots.length > 0) {
+            prev.lots = [...(prev.lots || []), ...parsedLots];
+          }
         } else {
           consolidatedMap.set(dedupKey, {
             ticker: rawTicker.slice(0, 50),
@@ -2875,7 +3038,8 @@ BROKER, TICKER & CURRENCY RULES:
             nav: isNaN(nav) ? 0 : nav,
             assetClass,
             currency,
-            provider: rowProvider
+            provider: rowProvider,
+            lots: parsedLots
           });
         }
       }
@@ -2922,12 +3086,35 @@ BROKER, TICKER & CURRENCY RULES:
           ? String(parsed.statementMonth)
           : "";
 
+      const rawUnvestedGrants: any[] =
+        !Array.isArray(parsed) && Array.isArray(parsed?.unvestedGrants) ? parsed.unvestedGrants : [];
+      const cleanedUnvestedGrants = rawUnvestedGrants
+        .map((g: any) => {
+          const ticker = String(g?.ticker || "").trim().toUpperCase().replace(/\.US$/, "");
+          const vestSchedule = Array.isArray(g?.vestSchedule)
+            ? g.vestSchedule
+                .map((v: any) => ({
+                  vestDate: String(v?.vestDate || "").trim(),
+                  grossUnits: Number(String(v?.grossUnits ?? v?.units ?? 0).replace(/,/g, ""))
+                }))
+                .filter((v: any) => /^\d{4}-\d{2}-\d{2}$/.test(v.vestDate) && v.grossUnits > 0)
+            : [];
+          return {
+            ticker,
+            grantName: String(g?.grantName || `${ticker} RSU Grant`).trim(),
+            provider: String(g?.provider || detectedProvider || "E*TRADE").trim(),
+            vestSchedule
+          };
+        })
+        .filter((g: any) => g.ticker && g.vestSchedule.length > 0);
+
       res.json({
         statementType,
         provider: detectedProvider,
         statementMonth,
         summaryNote,
-        holdings: enrichedHoldings
+        holdings: enrichedHoldings,
+        unvestedGrants: cleanedUnvestedGrants
       });
     } catch (e: any) {
       console.error("Gemini Extraction Error:", e);

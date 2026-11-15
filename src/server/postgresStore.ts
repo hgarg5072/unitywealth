@@ -5,10 +5,15 @@ import {
   RebalanceSnapshotMeta,
   WealthSnapshotRecord,
   NotificationRecord,
-  RealEstateProperty
+  RealEstateProperty,
+  HouseholdTaxPlanningBundle,
+  TaxLot,
+  RsuGrant,
+  TaxProfileSettings
 } from "../types";
 import { LRUCache } from "../shared/lruCache";
 import { FX_FALLBACK_RATE } from "../shared/formatters";
+import { DEFAULT_TAX_PROFILE } from "../shared/taxAndRsuMath";
 
 export type {
   MemberSnapshotBreakdown,
@@ -38,6 +43,7 @@ const fallbackSnapshots = new Map<string, Map<string, WealthSnapshotRecord>>();
 const fallbackNotifications = new Map<string, NotificationRecord[]>();
 const fallbackStateKeys = new Map<string, any>();
 const fallbackRealEstate = new Map<string, RealEstateProperty[]>();
+const fallbackTaxPlanning = new Map<string, HouseholdTaxPlanningBundle>();
 
 // 60-second read cache for uw_app_state (avoids repeated SELECTs on /api/health & /api/email/status)
 const appStateReadCache = new LRUCache<string, any>(256, 60_000);
@@ -164,6 +170,14 @@ export async function initPostgresStore(): Promise<{
       CREATE TABLE IF NOT EXISTS uw_real_estate (
         household_id TEXT PRIMARY KEY,
         properties JSONB NOT NULL DEFAULT '[]'::jsonb,
+        updated_at BIGINT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS uw_tax_planning (
+        household_id TEXT PRIMARY KEY,
+        tax_lots JSONB NOT NULL DEFAULT '[]'::jsonb,
+        rsu_grants JSONB NOT NULL DEFAULT '[]'::jsonb,
+        tax_profile JSONB NOT NULL DEFAULT '{}'::jsonb,
         updated_at BIGINT NOT NULL
       );
 
@@ -492,6 +506,86 @@ export async function saveRealEstatePg(
      DO UPDATE SET properties = EXCLUDED.properties, updated_at = EXCLUDED.updated_at`,
     [householdId, JSON.stringify(clean), Date.now()]
   );
+}
+
+export async function getTaxPlanningPg(householdId: string): Promise<HouseholdTaxPlanningBundle> {
+  if (!householdId) {
+    return { taxLots: [], rsuGrants: [], taxProfile: { ...DEFAULT_TAX_PROFILE } };
+  }
+  if (!pgReady || !pool) {
+    return (
+      fallbackTaxPlanning.get(householdId) || {
+        taxLots: [],
+        rsuGrants: [],
+        taxProfile: { ...DEFAULT_TAX_PROFILE }
+      }
+    );
+  }
+  try {
+    const res = await pool.query(
+      "SELECT tax_lots, rsu_grants, tax_profile, updated_at FROM uw_tax_planning WHERE household_id = $1 LIMIT 1",
+      [householdId]
+    );
+    if (res.rows.length > 0) {
+      const row = res.rows[0];
+      return {
+        taxLots: Array.isArray(row.tax_lots) ? (row.tax_lots as TaxLot[]) : [],
+        rsuGrants: Array.isArray(row.rsu_grants) ? (row.rsu_grants as RsuGrant[]) : [],
+        taxProfile: {
+          ...DEFAULT_TAX_PROFILE,
+          ...(row.tax_profile && typeof row.tax_profile === "object"
+            ? (row.tax_profile as Partial<TaxProfileSettings>)
+            : {})
+        },
+        updatedAt: Number(row.updated_at) || Date.now()
+      };
+    }
+  } catch (err: any) {
+    console.warn("[Postgres] getTaxPlanningPg warning:", err.message);
+  }
+  return { taxLots: [], rsuGrants: [], taxProfile: { ...DEFAULT_TAX_PROFILE } };
+}
+
+export async function saveTaxPlanningPg(
+  householdId: string,
+  patch: Partial<HouseholdTaxPlanningBundle>
+): Promise<HouseholdTaxPlanningBundle> {
+  const existing = await getTaxPlanningPg(householdId);
+  const merged: HouseholdTaxPlanningBundle = {
+    taxLots: Array.isArray(patch.taxLots) ? patch.taxLots : existing.taxLots,
+    rsuGrants: Array.isArray(patch.rsuGrants) ? patch.rsuGrants : existing.rsuGrants,
+    taxProfile: patch.taxProfile
+      ? { ...DEFAULT_TAX_PROFILE, ...existing.taxProfile, ...patch.taxProfile }
+      : existing.taxProfile,
+    updatedAt: Date.now()
+  };
+
+  if (!householdId) return merged;
+
+  if (!pgReady || !pool) {
+    fallbackTaxPlanning.set(householdId, merged);
+    return merged;
+  }
+
+  await pool.query(
+    `INSERT INTO uw_tax_planning (household_id, tax_lots, rsu_grants, tax_profile, updated_at)
+     VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, $5)
+     ON CONFLICT (household_id)
+     DO UPDATE SET
+       tax_lots = EXCLUDED.tax_lots,
+       rsu_grants = EXCLUDED.rsu_grants,
+       tax_profile = EXCLUDED.tax_profile,
+       updated_at = EXCLUDED.updated_at`,
+    [
+      householdId,
+      JSON.stringify(merged.taxLots),
+      JSON.stringify(merged.rsuGrants),
+      JSON.stringify(merged.taxProfile),
+      merged.updatedAt
+    ]
+  );
+
+  return merged;
 }
 
 export async function addNotificationPg(

@@ -8,7 +8,8 @@ import {
   Pencil,
   Trash,
   Check,
-  X
+  X,
+  Calendar
 } from 'lucide-react';
 import {
   formatCompactINR,
@@ -17,6 +18,12 @@ import {
   getHoldingOwnerId
 } from '../shared/formatters';
 import { normalizeHoldingClassification } from '../shared/portfolioMath';
+import { TaxLot, TaxProfileSettings } from '../types';
+import {
+  classifyHoldingTaxTreatment,
+  getLotsForHolding
+} from '../shared/taxAndRsuMath';
+import { HoldingTaxLotsDrawer } from './HoldingTaxLotsDrawer';
 
 export type AssetRegionFilter =
   | 'all'
@@ -98,6 +105,10 @@ interface Props {
   formatName: (raw: string, ticker?: string) => string;
   title?: string;
   compactHeader?: boolean;
+  householdId?: string;
+  taxLots?: TaxLot[];
+  taxProfile?: Partial<TaxProfileSettings>;
+  onSaveTaxLots?: (nextLots: TaxLot[]) => Promise<void>;
   onAddClick?: () => void;
   onUpdateHolding?: (id: string, quantity: number, currentPrice?: number) => Promise<void>;
   onDeleteHolding?: (id: string) => Promise<void>;
@@ -111,6 +122,10 @@ export function HoldingsExplorer({
   formatName,
   title = 'Holdings Details',
   compactHeader = false,
+  householdId = '',
+  taxLots = [],
+  taxProfile,
+  onSaveTaxLots,
   onAddClick,
   onUpdateHolding,
   onDeleteHolding
@@ -121,11 +136,12 @@ export function HoldingsExplorer({
   const [memberFilter, setMemberFilter] = useState<string>('all');
   const [sortBy, setSortBy] = useState<HoldingSortKey>('valDesc');
 
-  // Inline edit / delete state
+  // Inline edit / delete / tax-lot drawer state
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editQty, setEditQty] = useState<string>('');
   const [editPrice, setEditPrice] = useState<string>('');
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [expandedLotHoldingId, setExpandedLotHoldingId] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
 
   const safeFx = fxRate || FX_FALLBACK_RATE;
@@ -176,11 +192,44 @@ export function HoldingsExplorer({
       return { ...h, valINR, ownerName };
     });
 
-    return withVal.map((h) => ({
-      ...h,
-      weightPct: totalAllINR > 0 ? (h.valINR / totalAllINR) * 100 : 0
-    }));
-  }, [staticNormalized, safeFx, memberNameMap]);
+    return withVal.map((h) => {
+      const matchedLots = taxLots.length > 0 ? getLotsForHolding(h, taxLots) : [];
+      let ltcgQty = 0;
+      let stcgQty = 0;
+      let minCliffDays = 0;
+      if (matchedLots.length > 0) {
+        const rule = classifyHoldingTaxTreatment(h);
+        const nowMs = Date.now();
+        for (const l of matchedLots) {
+          const acqMs = Date.parse(l.acquiredDate || '');
+          const days = !isNaN(acqMs) ? Math.max(0, Math.floor((nowMs - acqMs) / 86_400_000)) : 0;
+          const isPre23Debt = rule.treatment === 'debt_sec50aa_or_cash' && l.acquiredDate < '2023-04-01';
+          const isLtcg =
+            (rule.treatment !== 'debt_sec50aa_or_cash' || isPre23Debt) &&
+            days > rule.ltcgThresholdDays;
+          if (isLtcg) {
+            ltcgQty += l.quantity;
+          } else {
+            stcgQty += l.quantity;
+            if (rule.treatment !== 'debt_sec50aa_or_cash') {
+              const rem = Math.max(1, rule.ltcgThresholdDays + 1 - days);
+              if (rem <= 60 && (minCliffDays === 0 || rem < minCliffDays)) {
+                minCliffDays = rem;
+              }
+            }
+          }
+        }
+      }
+      return {
+        ...h,
+        matchedLots,
+        ltcgQty,
+        stcgQty,
+        minCliffDays,
+        weightPct: totalAllINR > 0 ? (h.valINR / totalAllINR) * 100 : 0
+      };
+    });
+  }, [staticNormalized, safeFx, memberNameMap, taxLots]);
 
   const totalPortfolioINR = useMemo(
     () => enriched.reduce((s, h) => s + h.valINR, 0),
@@ -566,11 +615,37 @@ export function HoldingsExplorer({
                   </div>
                 </div>
 
-                {(onUpdateHolding || onDeleteHolding) && (
+                {(onUpdateHolding || onDeleteHolding || onSaveTaxLots) && (
                   <div className="pt-2 border-t border-slate-200/60 flex items-center justify-between gap-2">
-                    <span className="text-[10px] font-bold text-slate-400">
-                      {h.weightPct.toFixed(1)}% of portfolio
-                    </span>
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <span className="text-[10px] font-bold text-slate-400">
+                        {h.weightPct.toFixed(1)}%
+                      </span>
+                      {onSaveTaxLots && (
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setExpandedLotHoldingId(expandedLotHoldingId === h.id ? null : h.id)
+                          }
+                          className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-[9px] font-black transition-colors ${
+                            h.minCliffDays > 0
+                              ? 'bg-amber-50 text-amber-800 border border-amber-200'
+                              : h.matchedLots.length > 0
+                              ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                              : 'bg-white border border-slate-200 text-slate-600 hover:border-indigo-300'
+                          }`}
+                        >
+                          <Calendar size={10} />
+                          {h.minCliffDays > 0
+                            ? `LTCG in ${h.minCliffDays}d`
+                            : h.matchedLots.length > 0
+                            ? h.ltcgQty > 0 && h.stcgQty <= 0
+                              ? `LTCG (${h.matchedLots.length})`
+                              : `Lots (${h.matchedLots.length})`
+                            : '+ Buy/Vest Date'}
+                        </button>
+                      )}
+                    </div>
                     {editingId === h.id ? (
                       <div className="flex items-center gap-1.5">
                         <input
@@ -642,6 +717,20 @@ export function HoldingsExplorer({
                     )}
                   </div>
                 )}
+                {onSaveTaxLots && expandedLotHoldingId === h.id && (
+                  <div className="pt-2">
+                    <HoldingTaxLotsDrawer
+                      holding={h}
+                      householdId={householdId}
+                      lots={h.matchedLots}
+                      allTaxLots={taxLots}
+                      taxProfile={taxProfile}
+                      fxRate={safeFx}
+                      onSaveTaxLots={onSaveTaxLots}
+                      onClose={() => setExpandedLotHoldingId(null)}
+                    />
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -662,7 +751,8 @@ export function HoldingsExplorer({
               </thead>
               <tbody className="divide-y divide-slate-50">
                 {filteredAndSorted.map((h) => (
-                  <tr key={h.id} className="hover:bg-slate-50/60 transition-colors">
+                  <React.Fragment key={h.id}>
+                  <tr className="hover:bg-slate-50/60 transition-colors">
                     <td className="py-3.5 pr-3">
                       <div className="flex items-center gap-1.5">
                         <span className="font-bold text-slate-800 text-sm" title={h.originalName || h.ticker}>
@@ -700,6 +790,35 @@ export function HoldingsExplorer({
                             <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
                             LIVE
                           </span>
+                        )}
+                        {onSaveTaxLots && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setExpandedLotHoldingId(expandedLotHoldingId === h.id ? null : h.id)
+                            }
+                            className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9px] font-black transition-colors cursor-pointer ${
+                              h.minCliffDays > 0
+                                ? 'bg-amber-50 text-amber-800 border border-amber-200'
+                                : h.matchedLots.length > 0
+                                ? h.ltcgQty > 0 && h.stcgQty <= 0
+                                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                  : 'bg-indigo-50 text-indigo-700 border border-indigo-200'
+                                : 'bg-slate-100 text-slate-500 hover:text-indigo-600'
+                            }`}
+                            title="View or add purchase / RSU vest dates for tax-smart rebalancing"
+                          >
+                            <Calendar size={10} />
+                            {h.minCliffDays > 0
+                              ? `LTCG IN ${h.minCliffDays}D`
+                              : h.matchedLots.length > 0
+                              ? h.ltcgQty > 0 && h.stcgQty <= 0
+                                ? `LTCG • ${h.matchedLots.length} LOT${h.matchedLots.length > 1 ? 'S' : ''}`
+                                : h.stcgQty > 0 && h.ltcgQty <= 0
+                                ? `STCG • ${h.matchedLots.length} LOT${h.matchedLots.length > 1 ? 'S' : ''}`
+                                : `LTCG/STCG • ${h.matchedLots.length}`
+                              : '+ VEST / BUY DATE'}
+                          </button>
                         )}
                       </div>
                     </td>
@@ -834,6 +953,23 @@ export function HoldingsExplorer({
                       </td>
                     )}
                   </tr>
+                  {onSaveTaxLots && expandedLotHoldingId === h.id && (
+                    <tr>
+                      <td colSpan={7} className="pb-4 pt-1">
+                        <HoldingTaxLotsDrawer
+                          holding={h}
+                          householdId={householdId}
+                          lots={h.matchedLots}
+                          allTaxLots={taxLots}
+                          taxProfile={taxProfile}
+                          fxRate={safeFx}
+                          onSaveTaxLots={onSaveTaxLots}
+                          onClose={() => setExpandedLotHoldingId(null)}
+                        />
+                      </td>
+                    </tr>
+                  )}
+                  </React.Fragment>
                 ))}
               </tbody>
             </table>

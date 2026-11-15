@@ -71,16 +71,31 @@ import {
   NotificationRecord,
   PortfolioTargets,
   RealEstateProperty,
+  RsuGrant,
+  TaxAcquisitionType,
+  TaxLot,
+  TaxProfileSettings,
   User,
   WealthSnapshotRecord
 } from './types';
 import { BrandLogo } from './components/BrandLogo';
+import { ThemeToggle } from './components/ThemeToggle';
 import { HoldingsExplorer } from './components/HoldingsExplorer';
 import { MarketPulseRibbon } from './components/MarketPulseRibbon';
 import type { SmartInsightAlert } from './components/NotificationDrawer';
 import { LandingPage, HouseholdSetup } from './components/views/AuthLandingView';
 import { shortenAssetName } from './lib/formatAssetName';
 import { computeHouseholdRealEstateTotals } from './lib/realEstateMath';
+import { useTheme } from './lib/useTheme';
+import {
+  DEFAULT_TAX_PROFILE,
+  UpcomingVestEvent,
+  buildScheduleFaCsv,
+  computePortfolioTaxIntelligence,
+  normalizeProviderMatchKey,
+  normalizeTickerMatchKey,
+  openPrintableFamilyIceSheet
+} from './shared/taxAndRsuMath';
 import {
   FX_FALLBACK_RATE,
   formatCompactINR,
@@ -127,6 +142,7 @@ function ViewLoadingFallback() {
 }
 
 export default function App() {
+  const { theme, setTheme, isDark } = useTheme();
   const [user, setUser] = useState<User | null>(null);
   const [household, setHousehold] = useState<any>(null);
   const [holdingsList, setHoldingsList] = useState<Holding[] | null>(null);
@@ -136,6 +152,10 @@ export default function App() {
   >('dashboard');
   const [dashboardView, setDashboardView] = useState<'combined' | string>('combined');
   const [realEstateProperties, setRealEstateProperties] = useState<RealEstateProperty[] | null>(null);
+  const [taxLots, setTaxLots] = useState<TaxLot[]>([]);
+  const [rsuGrants, setRsuGrants] = useState<RsuGrant[]>([]);
+  const [taxProfile, setTaxProfile] = useState<TaxProfileSettings>(DEFAULT_TAX_PROFILE);
+  const holdingsSectionRef = useRef<HTMLDivElement | null>(null);
   const [showPropertyInDashboard, setShowPropertyInDashboard] = useState<boolean>(true);
   const [isSaving, setIsSaving] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -797,13 +817,16 @@ export default function App() {
         const holdings: any[] = Array.isArray(extractedPayload)
           ? extractedPayload
           : extractedPayload?.holdings || [];
+        const extractedUnvestedGrants: any[] = !Array.isArray(extractedPayload) && Array.isArray(extractedPayload?.unvestedGrants)
+          ? extractedPayload.unvestedGrants
+          : [];
         const detectedProvider: string =
           providerHint || (!Array.isArray(extractedPayload) && extractedPayload?.provider) || 'CAMS';
         const warningMsg: string | undefined = !Array.isArray(extractedPayload)
           ? extractedPayload?.warning
           : undefined;
 
-        if (holdings.length === 0) {
+        if (holdings.length === 0 && extractedUnvestedGrants.length === 0) {
           lastError = warningMsg || `No active open holdings (> 0 units) were found in ${file.name}.`;
           continue;
         }
@@ -819,6 +842,7 @@ export default function App() {
             const existingOwner = getHoldingOwnerId(existingH);
             const docProvider = String(existingH.provider || 'CAMS');
             if (
+              holdings.length > 0 &&
               existingOwner === resolvedOwner &&
               existingH.source === 'PDF' &&
               incomingProviders.has(docProvider) &&
@@ -832,17 +856,22 @@ export default function App() {
           });
 
           const createdDocs: Holding[] = [];
+          const autoExtractedLots: TaxLot[] = [];
+
           holdings.forEach((h: any) => {
             const id = 'h_' + Math.random().toString(36).slice(2, 11);
+            const cleanTicker = String(h.ticker || h.schemeName || 'MF').slice(0, 50);
+            const cleanProvider = String(h.provider || detectedProvider || 'CAMS');
+            const cleanCurrency: Currency = h.currency === 'USD' ? 'USD' : 'INR';
             const docObj: any = {
               userId: user.id,
               ownerId: resolvedOwner,
               householdId: user.householdId,
-              ticker: String(h.ticker || h.schemeName || 'MF').slice(0, 50),
+              ticker: cleanTicker,
               quantity: Number(h.units) || 0,
               assetClass: h.assetClass || 'Mutual Fund',
-              currency: h.currency === 'USD' ? 'USD' : 'INR',
-              provider: String(h.provider || detectedProvider || 'CAMS'),
+              currency: cleanCurrency,
+              provider: cleanProvider,
               source: 'PDF',
               currentPrice: Number(h.nav) || 0,
               originalName: h.originalName || h.schemeName || '',
@@ -850,12 +879,94 @@ export default function App() {
             };
             ops.push({ type: 'set', ref: doc(db, 'holdings', id), data: docObj });
             createdDocs.push({ id, ...docObj });
+
+            if (Array.isArray(h.lots) && h.lots.length > 0) {
+              h.lots.forEach((rawLot: any) => {
+                if (rawLot?.acquiredDate && Number(rawLot.units) > 0) {
+                  autoExtractedLots.push({
+                    id: 'lot_' + Math.random().toString(36).slice(2, 10),
+                    householdId: user.householdId!,
+                    holdingId: id,
+                    ownerId: resolvedOwner,
+                    ticker: cleanTicker,
+                    provider: cleanProvider,
+                    acquiredDate: String(rawLot.acquiredDate),
+                    quantity: Number(rawLot.units),
+                    costPerUnit: Number(rawLot.costPerUnit) || Number(h.nav) || 0,
+                    currency: cleanCurrency,
+                    acquisitionType: rawLot.acquisitionType || (cleanProvider === 'E*TRADE' ? 'RSU Vest' : 'Market Buy'),
+                    updatedAt: Date.now()
+                  });
+                }
+              });
+            }
           });
 
-          await commitChunkedBatch(db, ops);
-          workingExisting = [...remainingExisting, ...createdDocs];
-          totalImported += holdings.length;
-          if (!importedProviders.includes(detectedProvider)) {
+          if (ops.length > 0) {
+            await commitChunkedBatch(db, ops);
+            workingExisting = [...remainingExisting, ...createdDocs];
+            totalImported += holdings.length;
+          }
+
+          // Persist any extracted Tax Lots or Unvested RSU Schedules automatically
+          if (autoExtractedLots.length > 0 || extractedUnvestedGrants.length > 0) {
+            const incomingTickerProviderKeys = new Set(
+              autoExtractedLots.map(
+                (l) => `${l.ownerId}|${normalizeTickerMatchKey(l.ticker)}|${normalizeProviderMatchKey(l.provider)}`
+              )
+            );
+            const keptLots = taxLots.filter(
+              (l) =>
+                !incomingTickerProviderKeys.has(
+                  `${l.ownerId}|${normalizeTickerMatchKey(l.ticker)}|${normalizeProviderMatchKey(l.provider)}`
+                )
+            );
+            const nextLots = [...keptLots, ...autoExtractedLots];
+
+            const mappedGrants: RsuGrant[] = extractedUnvestedGrants.map((g: any) => ({
+              id: 'rsu_' + Math.random().toString(36).slice(2, 10),
+              householdId: user.householdId!,
+              ownerId: resolvedOwner,
+              ticker: String(g.ticker || 'QCOM').toUpperCase(),
+              grantName: String(g.grantName || `${g.ticker} RSU Grant`),
+              currency: 'USD',
+              provider: String(g.provider || detectedProvider || 'E*TRADE'),
+              withholdingTaxPct: 35.88,
+              vestSchedule: (g.vestSchedule || []).map((v: any) => ({
+                id: 'vst_' + Math.random().toString(36).slice(2, 9),
+                vestDate: String(v.vestDate),
+                grossUnits: Number(v.grossUnits) || 0,
+                vested: false
+              })),
+              updatedAt: Date.now()
+            }));
+            const nextGrants = [...rsuGrants, ...mappedGrants];
+
+            setTaxLots(nextLots);
+            if (mappedGrants.length > 0) setRsuGrants(nextGrants);
+
+            const idToken = await auth.currentUser.getIdToken();
+            await fetch(`/api/tax-planning/${user.householdId}`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${idToken}`
+              },
+              body: JSON.stringify({
+                taxLots: nextLots,
+                ...(mappedGrants.length > 0 ? { rsuGrants: nextGrants } : {})
+              })
+            }).catch(() => {});
+
+            if (holdings.length === 0 && mappedGrants.length > 0) {
+              setNotification({
+                message: `Imported ${mappedGrants.length} unvested RSU grant schedule(s) into Future RSU Forecast!`,
+                type: 'success'
+              });
+            }
+          }
+
+          if (holdings.length > 0 && !importedProviders.includes(detectedProvider)) {
             importedProviders.push(detectedProvider);
           }
         }
@@ -920,6 +1031,11 @@ export default function App() {
     assetClass: AssetClass;
     provider: string;
     source: 'Manual' | 'Live';
+    initialLot?: {
+      acquiredDate: string;
+      costPerUnit: number;
+      acquisitionType: TaxAcquisitionType;
+    };
   }) => {
     if (!user?.householdId) return;
     const resolvedOwner =
@@ -944,6 +1060,32 @@ export default function App() {
       currentPrice: Number(payload.currentPrice) || 0,
       syncedAt: Date.now()
     });
+
+    if (payload.initialLot?.acquiredDate && auth.currentUser) {
+      const createdLot: TaxLot = {
+        id: 'lot_' + Math.random().toString(36).slice(2, 10),
+        householdId: user.householdId,
+        holdingId: id,
+        ownerId: resolvedOwner,
+        ticker: upperTicker,
+        provider: payload.provider || 'Manual',
+        acquiredDate: payload.initialLot.acquiredDate,
+        quantity: Number(payload.quantity) || 0,
+        costPerUnit: Number(payload.initialLot.costPerUnit) || Number(payload.currentPrice) || 0,
+        currency: resolvedCurrency,
+        fxRateAtBuy: resolvedCurrency === 'USD' ? fxRates.INR : undefined,
+        acquisitionType: payload.initialLot.acquisitionType || 'Market Buy',
+        updatedAt: Date.now()
+      };
+      const nextLots = [...taxLots, createdLot];
+      setTaxLots(nextLots);
+      const idToken = await auth.currentUser.getIdToken();
+      fetch(`/api/tax-planning/${user.householdId}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+        body: JSON.stringify({ taxLots: nextLots })
+      }).catch(() => {});
+    }
     autoSnapDoneRef.current = '';
     const memberName = data?.household?.membersData?.find(
       (m: any) => m.id === resolvedOwner
@@ -1953,6 +2095,9 @@ export default function App() {
       setWealthSnapshots([]);
       setAppNotifications([]);
       setRealEstateProperties(null);
+      setTaxLots([]);
+      setRsuGrants([]);
+      setTaxProfile(DEFAULT_TAX_PROFILE);
       return;
     }
     let active = true;
@@ -1960,10 +2105,11 @@ export default function App() {
       try {
         const idToken = await auth.currentUser!.getIdToken();
         const headers = { Authorization: `Bearer ${idToken}` };
-        const [histRes, notifRes, reRes] = await Promise.all([
+        const [histRes, notifRes, reRes, taxRes] = await Promise.all([
           fetch(`/api/wealth-history/${user.householdId}`, { headers }),
           fetch(`/api/notifications/${user.householdId}`, { headers }),
-          fetch(`/api/real-estate/${user.householdId}`, { headers })
+          fetch(`/api/real-estate/${user.householdId}`, { headers }),
+          fetch(`/api/tax-planning/${user.householdId}`, { headers })
         ]);
         if (histRes.ok && active) {
           const hj = await histRes.json();
@@ -1977,6 +2123,14 @@ export default function App() {
           const rj = await reRes.json();
           if (Array.isArray(rj.properties) && rj.properties.length > 0) {
             setRealEstateProperties(rj.properties);
+          }
+        }
+        if (taxRes.ok && active) {
+          const tj = await taxRes.json();
+          if (Array.isArray(tj.taxLots)) setTaxLots(tj.taxLots);
+          if (Array.isArray(tj.rsuGrants)) setRsuGrants(tj.rsuGrants);
+          if (tj.taxProfile && typeof tj.taxProfile === 'object') {
+            setTaxProfile({ ...DEFAULT_TAX_PROFILE, ...tj.taxProfile });
           }
         }
       } catch (err) {
@@ -2044,6 +2198,159 @@ export default function App() {
     autoSnapDoneRef.current = '';
   };
 
+  const handleSaveTaxLots = async (nextLots: TaxLot[]) => {
+    if (!user?.householdId || !auth.currentUser) return;
+    setTaxLots(nextLots);
+    const idToken = await auth.currentUser.getIdToken();
+    await fetch(`/api/tax-planning/${user.householdId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`
+      },
+      body: JSON.stringify({ taxLots: nextLots })
+    });
+  };
+
+  const handleSaveRsuGrants = async (nextGrants: RsuGrant[]) => {
+    if (!user?.householdId || !auth.currentUser) return;
+    setRsuGrants(nextGrants);
+    const idToken = await auth.currentUser.getIdToken();
+    await fetch(`/api/tax-planning/${user.householdId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`
+      },
+      body: JSON.stringify({ rsuGrants: nextGrants })
+    });
+  };
+
+  const handleSaveTaxProfile = async (nextProfile: TaxProfileSettings) => {
+    if (!user?.householdId || !auth.currentUser) return;
+    setTaxProfile(nextProfile);
+    const idToken = await auth.currentUser.getIdToken();
+    await fetch(`/api/tax-planning/${user.householdId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`
+      },
+      body: JSON.stringify({ taxProfile: nextProfile })
+    });
+  };
+
+  const handleConfirmTrancheVested = async (ev: UpcomingVestEvent) => {
+    if (!user?.householdId || !auth.currentUser || !data) return;
+    // 1. Mark tranche vested in RSU Grants
+    const updatedGrants = rsuGrants.map((g) =>
+      g.id !== ev.grantId
+        ? g
+        : {
+            ...g,
+            vestSchedule: (g.vestSchedule || []).map((v) =>
+              v.id === ev.trancheId
+                ? { ...v, vested: true, vestPriceUSD: ev.projectedSharePriceUSD }
+                : v
+            ),
+            updatedAt: Date.now()
+          }
+    );
+
+    // 2. Add net vested shares to existing matching Holding or create a new Holding
+    const existingHolding = data.holdings.find(
+      (h) =>
+        !String(h.id || '').startsWith('placeholder-') &&
+        getHoldingOwnerId(h) === ev.ownerId &&
+        normalizeTickerMatchKey(h.ticker) === normalizeTickerMatchKey(ev.ticker) &&
+        normalizeProviderMatchKey(h.provider) === normalizeProviderMatchKey(ev.provider)
+    );
+
+    let targetHoldingId = existingHolding?.id || '';
+    if (existingHolding && existingHolding.id) {
+      await updateDoc(doc(db, 'holdings', existingHolding.id), {
+        quantity: Number(((Number(existingHolding.quantity) || 0) + ev.netUnits).toFixed(4)),
+        currentPrice: ev.projectedSharePriceUSD,
+        priceUpdatedAt: Date.now()
+      });
+    } else {
+      targetHoldingId = 'h_' + Math.random().toString(36).slice(2, 11);
+      await setDoc(doc(db, 'holdings', targetHoldingId), {
+        userId: user.id,
+        ownerId: ev.ownerId || user.id,
+        householdId: user.householdId,
+        ticker: ev.ticker.toUpperCase(),
+        originalName: `${ev.ticker.toUpperCase()} (${ev.grantName})`,
+        quantity: ev.netUnits,
+        assetClass: 'Equity',
+        currency: 'USD',
+        provider: ev.provider || 'E*TRADE',
+        source: 'Manual',
+        currentPrice: ev.projectedSharePriceUSD,
+        syncedAt: Date.now()
+      });
+    }
+
+    // 3. Record exact RSU Vest Tax Lot
+    const newLot: TaxLot = {
+      id: 'lot_' + Math.random().toString(36).slice(2, 10),
+      householdId: user.householdId,
+      holdingId: targetHoldingId,
+      ownerId: ev.ownerId || user.id,
+      ticker: ev.ticker.toUpperCase(),
+      provider: ev.provider || 'E*TRADE',
+      acquiredDate: ev.vestDate,
+      quantity: ev.netUnits,
+      costPerUnit: ev.projectedSharePriceUSD,
+      currency: 'USD',
+      fxRateAtBuy: fxRates.INR,
+      acquisitionType: 'RSU Vest',
+      updatedAt: Date.now()
+    };
+    const nextLots = [...taxLots, newLot];
+    setRsuGrants(updatedGrants);
+    setTaxLots(nextLots);
+
+    const idToken = await auth.currentUser.getIdToken();
+    await fetch(`/api/tax-planning/${user.householdId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`
+      },
+      body: JSON.stringify({ rsuGrants: updatedGrants, taxLots: nextLots })
+    });
+
+    setNotification({
+      message: `Added ${ev.netUnits} vested ${ev.ticker} shares + RSU Tax Lot (${ev.vestDate})!`,
+      type: 'success'
+    });
+  };
+
+  const handleAskAiCopilot = async (question: string, contextSummary: any) => {
+    if (!user?.householdId || !auth.currentUser) {
+      throw new Error('Sign in required');
+    }
+    const idToken = await auth.currentUser.getIdToken();
+    const res = await fetch('/api/ai/wealth-copilot', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`
+      },
+      body: JSON.stringify({
+        householdId: user.householdId,
+        question,
+        contextSummary
+      })
+    });
+    const json = await res.json();
+    if (!res.ok) {
+      throw new Error(json.error || 'Failed to generate AI strategy');
+    }
+    return json;
+  };
+
   const handleImportRealEstateSheet = async (opts: {
     sheetUrl?: string;
     fileBase64?: string;
@@ -2087,6 +2394,9 @@ export default function App() {
       },
       holdings: data.holdings.filter((h) => !String(h.id || '').startsWith('placeholder-')),
       realEstateProperties: effectiveRealEstateList,
+      taxLots,
+      rsuGrants,
+      taxProfile,
       wealthSnapshots
     };
     const blob = new Blob([JSON.stringify(exportPayload, null, 2)], {
@@ -2148,6 +2458,15 @@ export default function App() {
 
       if (Array.isArray(backup?.realEstateProperties)) {
         await handleSaveRealEstateProperties(backup.realEstateProperties);
+      }
+      if (Array.isArray(backup?.taxLots)) {
+        await handleSaveTaxLots(backup.taxLots);
+      }
+      if (Array.isArray(backup?.rsuGrants)) {
+        await handleSaveRsuGrants(backup.rsuGrants);
+      }
+      if (backup?.taxProfile && typeof backup.taxProfile === 'object') {
+        await handleSaveTaxProfile({ ...DEFAULT_TAX_PROFILE, ...backup.taxProfile });
       }
 
       setNotification({
@@ -2496,8 +2815,36 @@ export default function App() {
       });
     }
 
+    if (taxLots.length > 0) {
+      const intel = computePortfolioTaxIntelligence({
+        stats: householdStats,
+        taxLots,
+        taxProfile,
+        members: memberOptions,
+        fxRate: fxRates.INR
+      });
+      intel.cliffAlerts.slice(0, 2).forEach((cl) => {
+        alerts.unshift({
+          id: `ltcg_cliff_${cl.lotId}`,
+          severity: 'warning',
+          title: `LTCG Cliff in ${cl.daysToLtcg}d: ${cl.ticker}`,
+          message: `Hold ${cl.ownerName}'s ${cl.units} ${cl.ticker} units (${cl.acquiredDate}) for ${cl.daysToLtcg} more days to save ${formatCompactINR(cl.taxSavedByWaitingINR)} in tax.`,
+          actionLabel: 'Open Tax-Smart Rebalance',
+          onAction: () => setActiveTab('rebalance')
+        });
+      });
+    }
+
     return alerts;
-  }, [householdStats, data?.household?.settings?.accuracyThreshold, wealthSnapshots.length]);
+  }, [
+    householdStats,
+    data?.household?.settings?.accuracyThreshold,
+    wealthSnapshots.length,
+    taxLots,
+    taxProfile,
+    memberOptions,
+    fxRates.INR
+  ]);
 
   const unreadAlertBadgeCount = useMemo(
     () =>
@@ -2522,6 +2869,7 @@ export default function App() {
           onForgot={forgotPassword}
           onGoogleLogin={handleGoogleAuth}
           pendingInviteCode={pendingInviteCode}
+          themeNode={<ThemeToggle theme={theme} isDark={isDark} onChange={setTheme} compact />}
         />
       );
     }
@@ -2534,6 +2882,7 @@ export default function App() {
           isJoining={isJoiningFamily}
           initialCode={pendingInviteCode}
           invites={invites}
+          themeNode={<ThemeToggle theme={theme} isDark={isDark} onChange={setTheme} compact />}
         />
       );
     }
@@ -2695,6 +3044,12 @@ export default function App() {
           </div>
 
           <div className="mt-8 pt-6 border-t border-slate-100 flex flex-col gap-3">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[10px] font-black uppercase tracking-wider text-slate-400">
+                Appearance
+              </span>
+              <ThemeToggle theme={theme} isDark={isDark} onChange={setTheme} />
+            </div>
             <button
               type="button"
               onClick={() => openProfileSettings('profile')}
@@ -2784,6 +3139,8 @@ export default function App() {
                   <span className="sm:hidden">Add</span>
                   <span className="hidden sm:inline">Quick Add</span>
                 </button>
+
+                <ThemeToggle compact theme={theme} isDark={isDark} onChange={setTheme} />
 
                 <button
                   type="button"
@@ -3352,13 +3709,20 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="lg:col-span-12 bg-white p-4 md:p-6 rounded-xl border border-slate-200 shadow-sm">
+                    <div
+                      ref={holdingsSectionRef}
+                      className="lg:col-span-12 bg-white p-4 md:p-6 rounded-xl border border-slate-200 shadow-sm"
+                    >
                       <HoldingsExplorer
                         holdings={stats.holdings}
                         fxRate={fxRates.INR}
                         members={memberOptions}
                         showMemberFilter={dashboardView === 'combined'}
                         formatName={shortenAssetName}
+                        householdId={user.householdId || ''}
+                        taxLots={taxLots}
+                        taxProfile={taxProfile}
+                        onSaveTaxLots={handleSaveTaxLots}
                         title={
                           dashboardView === 'combined'
                             ? 'Family Holdings Details'
@@ -3427,6 +3791,9 @@ export default function App() {
                       includeRealEstate={
                         showPropertyInDashboard && realEstateTotals.totalEquityINR > 0
                       }
+                      taxLots={taxLots}
+                      rsuGrants={rsuGrants}
+                      onOpenRsuForecast={() => setActiveTab('rebalance')}
                     />
                   </motion.div>
                 )}
@@ -3471,12 +3838,29 @@ export default function App() {
                     exit={{ opacity: 0, y: -20 }}
                   >
                     <RebalanceView
+                      householdId={user.householdId || ''}
                       stats={stats}
+                      targets={data.household.targets}
+                      members={memberOptions}
                       fxRates={fxRates}
                       householdName={data.household.name}
                       defaultEmail={user.email}
                       threshold={data.household.settings?.accuracyThreshold ?? 95}
                       emailStatus={emailStatus}
+                      taxLots={taxLots}
+                      rsuGrants={rsuGrants}
+                      taxProfile={taxProfile}
+                      realEstateProperties={effectiveRealEstateList}
+                      onSaveTaxProfile={handleSaveTaxProfile}
+                      onSaveRsuGrants={handleSaveRsuGrants}
+                      onConfirmTrancheVested={handleConfirmTrancheVested}
+                      onAskAiCopilot={handleAskAiCopilot}
+                      onJumpToHoldings={() => {
+                        setActiveTab('dashboard');
+                        setTimeout(() => {
+                          holdingsSectionRef.current?.scrollIntoView({ behavior: 'smooth' });
+                        }, 150);
+                      }}
                       onOpenEmailSettings={() => openProfileSettings('email')}
                       onSendRebalanceEmail={handleSendRebalanceEmail}
                     />
@@ -3529,6 +3913,50 @@ export default function App() {
                         </div>
                       </div>
                       <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            openPrintableFamilyIceSheet({
+                              householdName: data.household.name || 'Family Portfolio',
+                              members: memberOptions,
+                              holdings: householdStats?.holdings || stats.holdings,
+                              realEstateProperties: effectiveRealEstateList,
+                              rsuGrants,
+                              nomineeMap: taxProfile.nomineeVerifiedByAccount,
+                              fxRate: fxRates.INR
+                            })
+                          }
+                          className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-indigo-200 bg-indigo-50 text-indigo-700 text-xs font-bold hover:bg-indigo-100 transition-all"
+                          title="Generate printable Emergency Family Asset & Nominee Directory (ICE Sheet)"
+                        >
+                          <FileText size={13} /> Family ICE Vault PDF
+                        </button>
+                        {holdingMetaCounts.hasUSD && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              const csv = buildScheduleFaCsv({
+                                holdings: householdStats?.holdings || stats.holdings,
+                                taxLots,
+                                members: memberOptions,
+                                fxRate: fxRates.INR
+                              });
+                              const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                              const url = URL.createObjectURL(blob);
+                              const a = document.createElement('a');
+                              a.href = url;
+                              a.download = `unitywealth-ITR-Schedule-FA-CY${new Date().getFullYear()}.csv`;
+                              document.body.appendChild(a);
+                              a.click();
+                              document.body.removeChild(a);
+                              URL.revokeObjectURL(url);
+                            }}
+                            className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-emerald-200 bg-emerald-50 text-emerald-700 text-xs font-bold hover:bg-emerald-100 transition-all"
+                            title="Export US Foreign Assets Calendar-Year disclosure worksheet for ITR Schedule FA"
+                          >
+                            <Globe size={13} /> ITR Schedule FA CSV
+                          </button>
+                        )}
                         <button
                           type="button"
                           onClick={() => openProfileSettings('profile')}
@@ -3964,6 +4392,10 @@ export default function App() {
                 fxRates={fxRates}
                 members={memberOptions}
                 categoryContext={detailView.categoryContext}
+                householdId={user.householdId || undefined}
+                taxLots={taxLots}
+                taxProfile={taxProfile}
+                onSaveTaxLots={persistTaxLots}
                 onQuickAddTicker={(ticker) => {
                   setDetailView(null);
                   openQuickAdd('search', ticker);
@@ -4696,6 +5128,10 @@ function DetailViewModal({
   fxRates,
   members,
   categoryContext,
+  householdId,
+  taxLots,
+  taxProfile,
+  onSaveTaxLots,
   onQuickAddTicker,
   onUpdateHolding,
   onDeleteHolding
@@ -4706,6 +5142,10 @@ function DetailViewModal({
   fxRates: Record<string, number>;
   members: { id: string; name: string }[];
   categoryContext?: any;
+  householdId?: string;
+  taxLots?: TaxLot[];
+  taxProfile?: TaxProfileSettings;
+  onSaveTaxLots?: (nextLots: TaxLot[]) => Promise<void> | void;
   onQuickAddTicker: (ticker: string) => void;
   onUpdateHolding: (id: string, nextQty: number, nextPrice?: number) => Promise<void>;
   onDeleteHolding: (id: string) => Promise<void>;
@@ -4827,6 +5267,10 @@ function DetailViewModal({
             compactHeader
             onUpdateHolding={onUpdateHolding}
             onDeleteHolding={onDeleteHolding}
+            householdId={householdId}
+            taxLots={taxLots}
+            taxProfile={taxProfile}
+            onSaveTaxLots={onSaveTaxLots}
           />
         </div>
 

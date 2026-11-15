@@ -14,11 +14,28 @@
     <meta property="og:title" content="UnityWealth" />
     <meta property="og:description" content="Cross-border investment aggregator for families with drift analysis and portfolio sync." />
     <meta property="og:image" content="https://unitywealth.up.railway.app/icon-512.png?v=5" />
-    <meta name="theme-color" content="#ffffff" />
+    <meta name="theme-color" content="#ffffff" id="uw-theme-color" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
     <meta name="apple-mobile-web-app-title" content="UnityWealth" />
+    <script>
+      (function () {
+        try {
+          var pref = localStorage.getItem('uw_theme') || 'light';
+          var isDark =
+            pref === 'dark' ||
+            (pref === 'system' &&
+              window.matchMedia &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          if (isDark) {
+            document.documentElement.classList.add('dark');
+            var meta = document.getElementById('uw-theme-color');
+            if (meta) meta.setAttribute('content', '#020617');
+          }
+        } catch (e) {}
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
