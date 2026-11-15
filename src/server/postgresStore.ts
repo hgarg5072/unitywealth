@@ -460,12 +460,13 @@ export async function deleteWealthSnapshotPg(householdId: string, snapshotMonth:
   );
 }
 
-export async function addNotificationPg(notif: Omit<NotificationRecord, "id" | "isRead" | "createdAt"> & { id?: string; createdAt?: number }): Promise<NotificationRecord> {
+export async function addNotificationPg(notif: Omit<NotificationRecord, "id" | "isRead" | "createdAt"> & { id?: string; createdAt?: number; type?: string }): Promise<NotificationRecord> {
+  const resolvedCategory = (notif.category || (notif as any).type || "system") as NotificationRecord["category"];
   const full: NotificationRecord = {
     id: notif.id || `ntf_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
     householdId: notif.householdId,
     userId: notif.userId || "",
-    category: notif.category,
+    category: resolvedCategory,
     severity: notif.severity || "info",
     title: notif.title,
     message: notif.message,

@@ -490,6 +490,21 @@ export const ProfileFamilyModal: React.FC<ProfileFamilyModalProps> = ({
               </p>
             )}
 
+            {!emailStatus?.configured && (
+              <div className="p-3 rounded-xl bg-indigo-50/70 border border-indigo-100 text-[11px] text-slate-700 space-y-1.5 leading-relaxed">
+                <div className="font-black text-indigo-950">One-Time Gmail OAuth Setup (Free, 24/7 Background Delivery):</div>
+                <div>
+                  1. In Google Cloud Console → <strong>Credentials</strong> → your Web OAuth Client, ensure this Redirect URI is added:{' '}
+                  <code className="px-1.5 py-0.5 rounded bg-white border border-indigo-200 font-mono text-[10px] text-indigo-800 select-all">
+                    {typeof window !== 'undefined' ? `${window.location.origin}/auth/callback` : 'https://unitywealth.up.railway.app/auth/callback'}
+                  </code>
+                </div>
+                <div>
+                  2. Click <strong>Connect Gmail Sender (24/7 OAuth)</strong> below and approve <em>Send email on your behalf</em>.
+                </div>
+              </div>
+            )}
+
             <div className="flex flex-wrap gap-2.5">
               <button
                 type="button"
@@ -498,18 +513,8 @@ export const ProfileFamilyModal: React.FC<ProfileFamilyModalProps> = ({
                 className="px-4 py-2.5 rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 text-xs font-bold transition-all flex items-center gap-2 shadow-sm"
               >
                 {authGmailBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Mail className="w-4 h-4" />}
-                {emailStatus?.configured ? "Re-Authorize Gmail (1-Click Popup)" : "Authorize Gmail Sender (1-Click Free)"}
+                {emailStatus?.configured ? "Reconnect Gmail Sender (24/7 OAuth)" : "Connect Gmail Sender (24/7 OAuth)"}
               </button>
-
-              {emailStatus?.googleOAuthAvailable && (
-                <button
-                  type="button"
-                  onClick={onConnectGoogleOffline}
-                  className="px-3.5 py-2.5 rounded-xl bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 text-xs font-bold transition-all"
-                >
-                  24/7 Background Gmail Link
-                </button>
-              )}
 
               <button
                 type="button"
@@ -517,7 +522,7 @@ export const ProfileFamilyModal: React.FC<ProfileFamilyModalProps> = ({
                 className="px-3.5 py-2.5 rounded-xl bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 text-xs font-bold transition-all flex items-center gap-1.5"
               >
                 <KeyRound className="w-3.5 h-3.5" />
-                API Key / App Password
+                Brevo / Resend API Key
                 {showApiConfig ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
               </button>
 

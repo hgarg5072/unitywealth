@@ -540,7 +540,6 @@ async function startServer() {
       scope: [
         'https://www.googleapis.com/auth/userinfo.email',
         'https://www.googleapis.com/auth/userinfo.profile',
-        'https://www.googleapis.com/auth/gmail.readonly',
         'https://www.googleapis.com/auth/gmail.send'
       ]
     });
@@ -625,26 +624,45 @@ async function startServer() {
       await setAppStateKeyPg(`gmail_tokens:${parsedState.userId || email.toLowerCase()}`, mergedTokens);
       
       res.send(`
+        <!doctype html>
         <html>
-          <body style="font-family:sans-serif;padding:32px;text-align:center;">
+          <head><meta charset="utf-8" /><title>Gmail Connected — UnityWealth</title></head>
+          <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f8fafc;padding:48px 20px;text-align:center;color:#0f172a;">
+            <div style="max-width:420px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:20px;padding:32px;box-shadow:0 10px 28px rgba(15,23,42,0.08);">
+              <div style="width:48px;height:48px;border-radius:14px;background:#dcfce7;color:#15803d;font-size:24px;font-weight:900;line-height:48px;margin:0 auto 14px;">✓</div>
+              <h3 style="margin:0 0 8px;font-size:18px;font-weight:800;">Gmail Sender Connected</h3>
+              <p style="margin:0 0 20px;font-size:13px;color:#475569;line-height:1.5;">
+                <strong>${email}</strong> is now authorized to send Family Invitations &amp; 24/7 Rebalance Reports.
+              </p>
+              <a href="/?emailConnected=1" style="display:inline-block;padding:10px 20px;border-radius:12px;background:#4f46e5;color:#ffffff;text-decoration:none;font-size:13px;font-weight:700;">
+                Return to UnityWealth
+              </a>
+            </div>
             <script>
-              if (window.opener) {
-                window.opener.postMessage({ 
+              (function() {
+                var payload = {
                   type: 'OAUTH_EMAIL_CONNECTED',
                   senderEmail: ${JSON.stringify(email)},
-                  user: ${JSON.stringify(user)}
-                }, '*');
-                window.opener.postMessage({ 
-                  type: 'OAUTH_AUTH_SUCCESS',
-                  user: ${JSON.stringify(user)}
-                }, '*');
-                window.close();
-              } else {
-                window.location.href = '/?emailConnected=1';
-              }
+                  ts: Date.now()
+                };
+                try {
+                  var bc = new BroadcastChannel('uw_email_oauth');
+                  bc.postMessage(payload);
+                  bc.close();
+                } catch (e) {}
+                try {
+                  localStorage.setItem('uw_email_oauth_event', JSON.stringify(payload));
+                } catch (e) {}
+                if (window.opener) {
+                  try {
+                    window.opener.postMessage(payload, '*');
+                  } catch (e) {}
+                }
+                setTimeout(function() {
+                  window.close();
+                }, 350);
+              })();
             </script>
-            <h3>Gmail Sender Connected (${email})</h3>
-            <p>You can close this window and return to UnityWealth.</p>
           </body>
         </html>
       `);
@@ -1252,10 +1270,11 @@ async function startServer() {
           if (emailOutcome.sent) {
             await addNotificationPg({
               householdId,
-              type: "family",
+              category: "family",
               severity: "info",
               title: "Family Invitation Emailed",
               message: `Sent invite code ${code} to ${cleanEmail} via ${emailOutcome.senderEmail || emailOutcome.provider}.`,
+              actionTab: "accounts",
               createdAt: Date.now()
             }).catch(() => {});
           }
@@ -2931,7 +2950,7 @@ async function startServer() {
         return { sent: false, error: "householdId is required" };
       }
 
-      const appUrl = (opts?.baseUrl || process.env.APP_URL || "https://uw.up.railway.app").replace(/\/$/, "");
+      const appUrl = (opts?.baseUrl || process.env.APP_URL || "https://unitywealth.up.railway.app").replace(/\/$/, "");
 
       // Fast path when client passes exact live computed report from RebalanceView
       if (opts?.clientReport && opts.toEmail) {
@@ -2966,10 +2985,11 @@ async function startServer() {
         if (delivery.sent) {
           await addNotificationPg({
             householdId,
-            type: "rebalance",
+            category: "drift",
             severity: "info",
             title: opts.mode === "sip" ? "Zero-Sell SIP Plan Emailed" : "Rebalance Report Emailed",
             message: `Sent ${opts.mode === "sip" ? "Zero-Sell SIP plan" : "rebalance execution plan"} to ${opts.toEmail} (${Number(cr.accuracy || 0).toFixed(1)}% aligned).`,
+            actionTab: "rebalance",
             createdAt: Date.now()
           }).catch(() => {});
         }
@@ -3176,10 +3196,11 @@ async function startServer() {
         await setAppStateKeyPg(lastSentKey, now);
         await addNotificationPg({
           householdId,
-          type: "rebalance",
+          category: "drift",
           severity: accuracy < threshold ? "warning" : "info",
           title: mode === "sip" ? "Zero-Sell SIP Plan Emailed" : "Rebalance Alert Emailed",
           message: `Delivered ${mode === "sip" ? "Zero-Sell SIP plan" : "rebalance report"} (${accuracy.toFixed(1)}% aligned) to ${recipientEmail}.`,
+          actionTab: "rebalance",
           createdAt: now
         }).catch(() => {});
       }

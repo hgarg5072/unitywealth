@@ -470,27 +470,58 @@ export default function App() {
   }, [user?.householdId]);
 
   useEffect(() => {
+    const handleConnected = (senderEmail?: string) => {
+      fetchEmailStatus(user?.householdId);
+      setNotification({
+        message: `Gmail sender connected (${senderEmail || 'Authorized'})! Invites & rebalance alerts are now live.`,
+        type: 'success'
+      });
+    };
+
     const onMessage = (ev: MessageEvent) => {
       if (ev?.data?.type === 'OAUTH_EMAIL_CONNECTED') {
-        fetchEmailStatus(user?.householdId);
-        setNotification({
-          message: `Gmail sender connected (${ev.data.senderEmail || 'Authorized'})! Invites & rebalance alerts are now live.`,
-          type: 'success'
-        });
+        handleConnected(ev.data.senderEmail);
       }
     };
+    const onStorage = (ev: StorageEvent) => {
+      if (ev.key === 'uw_email_oauth_event' && ev.newValue) {
+        try {
+          const parsed = JSON.parse(ev.newValue);
+          if (parsed?.type === 'OAUTH_EMAIL_CONNECTED') {
+            handleConnected(parsed.senderEmail);
+          }
+        } catch {}
+      }
+    };
+
+    let bc: BroadcastChannel | null = null;
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        bc = new BroadcastChannel('uw_email_oauth');
+        bc.onmessage = (ev) => {
+          if (ev?.data?.type === 'OAUTH_EMAIL_CONNECTED') {
+            handleConnected(ev.data.senderEmail);
+          }
+        };
+      }
+    } catch {}
+
     window.addEventListener('message', onMessage);
+    window.addEventListener('storage', onStorage);
     try {
       const params = new URLSearchParams(window.location.search);
       if (params.get('emailConnected') === '1') {
         params.delete('emailConnected');
         const next = window.location.pathname + (params.toString() ? `?${params.toString()}` : '');
         window.history.replaceState({}, '', next);
-        fetchEmailStatus(user?.householdId);
-        setNotification({ message: 'Gmail outgoing email sender connected!', type: 'success' });
+        handleConnected();
       }
     } catch {}
-    return () => window.removeEventListener('message', onMessage);
+    return () => {
+      window.removeEventListener('message', onMessage);
+      window.removeEventListener('storage', onStorage);
+      try { bc?.close(); } catch {}
+    };
   }, [user?.householdId]);
 
   const handleGoogleAuth = async () => {
@@ -525,39 +556,6 @@ export default function App() {
 
   const authorizeGmailViaPopup = async () => {
     if (!auth.currentUser) throw new Error('Please sign in first.');
-    const provider = new GoogleAuthProvider();
-    provider.addScope('https://www.googleapis.com/auth/gmail.send');
-    provider.setCustomParameters({ prompt: 'consent select_account' });
-    // Note: Do NOT replace current Firebase session if user signed in via email/password — capture credential on a secondary flow or link if same account:
-    // Actually signInWithPopup on a standalone secondary auth or direct server OAuth avoids logging out email/password users!
-    // Let's try Firebase popup only if current user is Google OR fall back to /api/auth/google/url popup if different!
-    const isGoogleProvider = auth.currentUser.providerData?.some((p) => p.providerId === 'google.com');
-    if (isGoogleProvider) {
-      const result = await signInWithPopup(auth, provider);
-      const cred = GoogleAuthProvider.credentialFromResult(result);
-      if (!cred?.accessToken) {
-        throw new Error('Google did not return a Gmail send token. Please check the permission box in the popup.');
-      }
-      const idToken = await auth.currentUser.getIdToken();
-      const res = await fetch('/api/email/save-google-token', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
-        body: JSON.stringify({
-          householdId: user?.householdId || null,
-          accessToken: cred.accessToken,
-          senderEmail: result.user.email,
-          senderName: user?.name || result.user.displayName || result.user.email
-        })
-      });
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({}));
-        throw new Error(err.error || 'Failed to save Gmail authorization');
-      }
-      await fetchEmailStatus(user?.householdId);
-      return;
-    }
-
-    // For Email/Password users, open the server Google OAuth popup so their current Firebase session is preserved!
     await connectGoogleOfflineOAuth();
   };
 
@@ -576,7 +574,57 @@ export default function App() {
     const popup = window.open(url, 'uw_google_oauth', `width=${w},height=${h},left=${left},top=${top}`);
     if (!popup) {
       window.location.href = url;
+      return;
     }
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const done = (ok: boolean, err?: string) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (ok) resolve();
+        else reject(new Error(err || 'Gmail authorization window was closed before completion.'));
+      };
+
+      let bc: BroadcastChannel | null = null;
+      try {
+        if (typeof BroadcastChannel !== 'undefined') {
+          bc = new BroadcastChannel('uw_email_oauth');
+          bc.onmessage = (ev) => {
+            if (ev?.data?.type === 'OAUTH_EMAIL_CONNECTED') done(true);
+          };
+        }
+      } catch {}
+
+      const onMsg = (ev: MessageEvent) => {
+        if (ev?.data?.type === 'OAUTH_EMAIL_CONNECTED') done(true);
+      };
+      window.addEventListener('message', onMsg);
+
+      const poll = window.setInterval(async () => {
+        try {
+          const stRes = await fetch(`/api/email/status?householdId=${encodeURIComponent(user?.householdId || '')}`);
+          if (stRes.ok) {
+            const st = await stRes.json();
+            if (st?.configured) {
+              setEmailStatus(st);
+              done(true);
+              return;
+            }
+          }
+        } catch {}
+      }, 2500);
+
+      const timeout = window.setTimeout(() => done(false, 'Gmail authorization timed out.'), 180000);
+
+      function cleanup() {
+        window.removeEventListener('message', onMsg);
+        window.clearInterval(poll);
+        window.clearTimeout(timeout);
+        try { bc?.close(); } catch {}
+      }
+    });
   };
 
   const handleSaveEmailProviderConfig = async (cfg: {
