@@ -5,27 +5,26 @@ dotenv.config();
 import express from "express";
 import path from "path";
 import cors from "cors";
-import fs from "fs";
 import axios from "axios";
-import { Resend } from "resend";
 import { OAuth2Client } from "google-auth-library";
-import { parseStringPromise } from 'xml2js';
 import * as XLSX from "xlsx";
 import https from "https";
 import crypto from "crypto";
 import { initializeApp, getApps, cert } from "firebase-admin/app";
-import { getFirestore, FieldValue } from "firebase-admin/firestore";
+import { getFirestore } from "firebase-admin/firestore";
 import firebaseConfig from "./firebase-applet-config.json";
 import {
   initPostgresStore,
   getPostgresStatus,
-  persistAppStateAsync,
   upsertInviteCodePg,
   getInviteCodePg,
   getInviteByHouseholdPg,
   upsertWealthSnapshotPg,
   getWealthHistoryPg,
+  getMaxWealthSnapshotInrPg,
   deleteWealthSnapshotPg,
+  getRealEstatePg,
+  saveRealEstatePg,
   addNotificationPg,
   getNotificationsPg,
   markNotificationsReadPg,
@@ -48,35 +47,61 @@ import {
   fetchGoogleSheetXlsxBuffer,
   parseRealEstateWorkbook
 } from "./src/server/realEstateSheetImporter";
+import {
+  getAmfiIndex,
+  searchAmfiIndex,
+  findAmfiMatchIndexed
+} from "./src/server/amfiIndex";
+import { LRUCache } from "./src/shared/lruCache";
+import {
+  FX_FALLBACK_RATE,
+  WEALTH_MILESTONES_INR,
+  normalizeInviteCode
+} from "./src/shared/formatters";
+import {
+  DEBT_KEYWORDS_REGEX,
+  computePortfolioStats,
+  computeRebalancePlan
+} from "./src/shared/portfolioMath";
 
-// Initialize Firebase Admin (Lazy helper)
-function getFirestoreInstance() {
-  if (getApps().length === 0) {
-    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-      try {
-        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-        initializeApp({
-          credential: cert(serviceAccount),
-          projectId: firebaseConfig.projectId,
-        });
-      } catch (e) {
-        console.error("[Firestore] Invalid FIREBASE_SERVICE_ACCOUNT JSON, falling back:", e);
-        initializeApp({ projectId: firebaseConfig.projectId });
-      }
-    } else {
+// Lazy Firebase Admin Firestore helper — only initialized if FIREBASE_SERVICE_ACCOUNT is configured
+function getAdminFirestoreOrNull() {
+  if (!process.env.FIREBASE_SERVICE_ACCOUNT) return null;
+  try {
+    if (getApps().length === 0) {
+      const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
       initializeApp({
-        projectId: firebaseConfig.projectId,
+        credential: cert(serviceAccount),
+        projectId: firebaseConfig.projectId
       });
     }
+    return getFirestore(firebaseConfig.firestoreDatabaseId);
+  } catch (e) {
+    console.warn("[Firestore Admin] Invalid FIREBASE_SERVICE_ACCOUNT JSON:", e);
+    return null;
   }
-  return getFirestore(firebaseConfig.firestoreDatabaseId);
 }
 
-const firestore = getFirestoreInstance();
-
-const resend = process.env.RESEND_API_KEY ? new Resend(process.env.RESEND_API_KEY) : null;
-
 const ipv4HttpsAgent = new https.Agent({ family: 4, keepAlive: true });
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  worker: (item: T, idx: number) => Promise<R>
+): Promise<R[]> {
+  if (items.length === 0) return [];
+  const results = new Array<R>(items.length);
+  let cursor = 0;
+  const runners = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (true) {
+      const idx = cursor++;
+      if (idx >= items.length) break;
+      results[idx] = await worker(items[idx], idx);
+    }
+  });
+  await Promise.all(runners);
+  return results;
+}
 
 async function callGeminiJSON(parts: any[]): Promise<string> {
   const apiKey = (process.env.GEMINI_API_KEY || "").trim();
@@ -88,34 +113,22 @@ async function callGeminiJSON(parts: any[]): Promise<string> {
     {
       model: "gemini-3.5-flash-lite",
       timeout: 25000,
-      generationConfig: {
-        responseMimeType: "application/json",
-        temperature: 0.1
-      }
+      generationConfig: { responseMimeType: "application/json", temperature: 0.1 }
     },
     {
       model: "gemini-flash-lite-latest",
       timeout: 25000,
-      generationConfig: {
-        responseMimeType: "application/json",
-        temperature: 0.1
-      }
+      generationConfig: { responseMimeType: "application/json", temperature: 0.1 }
     },
     {
       model: "gemini-3.6-flash",
       timeout: 30000,
-      generationConfig: {
-        responseMimeType: "application/json",
-        temperature: 0.1
-      }
+      generationConfig: { responseMimeType: "application/json", temperature: 0.1 }
     },
     {
       model: "gemini-3.8-flash",
       timeout: 30000,
-      generationConfig: {
-        responseMimeType: "application/json",
-        temperature: 0.1
-      }
+      generationConfig: { responseMimeType: "application/json", temperature: 0.1 }
     }
   ];
 
@@ -137,9 +150,10 @@ async function callGeminiJSON(parts: any[]): Promise<string> {
           headers: { "Content-Type": "application/json" }
         }
       );
-      const outText = response.data?.candidates?.[0]?.content?.parts
-        ?.map((p: any) => p.text || "")
-        .join("") || "";
+      const outText =
+        response.data?.candidates?.[0]?.content?.parts
+          ?.map((p: any) => p.text || "")
+          .join("") || "";
       if (outText) return outText;
       throw new Error(`Empty response from ${candidate.model}`);
     } catch (err: any) {
@@ -160,315 +174,179 @@ async function startServer() {
   const PORT = Number(process.env.PORT) || 3000;
 
   app.use(cors());
-  app.use(express.json({ limit: '50mb' }));
-  app.use(express.urlencoded({ limit: '50mb', extended: true }));
+  app.use(express.json({ limit: "50mb" }));
+  app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
-  const DB_PATH = path.join(process.cwd(), "db.json");
+  // O(1) in-memory Family Invite Code index backed by PostgreSQL (uw_invite_codes)
+  const inviteCodesByCode = new Map<string, any>();
+  const inviteCodeByHousehold = new Map<string, string>();
 
-  // Initial DB if not exists
-  if (!fs.existsSync(DB_PATH)) {
-    fs.writeFileSync(DB_PATH, JSON.stringify({
-      users: {
-        "u_himanshu": { id: "u_himanshu", email: "himgarg@google.com", password: "password", name: "Himanshu Garg", householdId: "h_garg" },
-        "u_nisha": { id: "u_nisha", email: "nndhake@gmail.com", password: "password", name: "Nisha Dhake", householdId: "h_garg" }
-      },
-      households: {
-        "h_garg": {
-          id: "h_garg",
-          name: "Garg Family",
-          members: ["u_himanshu", "u_nisha"],
-          targets: {
-            assetSplit: { Equity: 0.70, Debt: 0.30 },
-            equitySplit: { Indian: 0.60, Foreign: 0.40 },
-            foreignBreakdown: [
-              { 
-                name: "Global Large Cap", 
-                percentage: 50, 
-                tickerWeights: [
-                  { ticker: "GOOGL", weight: 25 },
-                  { ticker: "MSFT", weight: 25 },
-                  { ticker: "AAPL", weight: 25 },
-                  { ticker: "AMZN", weight: 25 }
-                ] 
-              },
-              { 
-                name: "Semiconductors", 
-                percentage: 50, 
-                tickerWeights: [
-                  { ticker: "NVDA", weight: 34 },
-                  { ticker: "AMD", weight: 33 },
-                  { ticker: "TSM", weight: 33 }
-                ] 
-              }
-            ]
-          }
-        }
-      },
-      holdings: [],
-      invites: [],
-      inviteCodes: {}
-    }, null, 2));
-  }
-
-  function getDB() {
-    try {
-      const db = JSON.parse(fs.readFileSync(DB_PATH, "utf-8"));
-      if (!db.invites) db.invites = [];
-      if (!db.inviteCodes) db.inviteCodes = {};
-      return db;
-    } catch (e) {
-      console.error("DB Read failed, returning empty state to prevent crash");
-      return { users: {}, households: {}, holdings: [], invites: [], inviteCodes: {} };
+  function cacheInviteEntry(entry: any) {
+    if (!entry?.code || !entry?.householdId) return;
+    const clean = normalizeInviteCode(entry.code);
+    if (!clean) return;
+    const prevCode = inviteCodeByHousehold.get(entry.householdId);
+    if (prevCode && prevCode !== clean) {
+      inviteCodesByCode.delete(prevCode);
     }
+    const normalizedEntry = { ...entry, code: clean };
+    inviteCodesByCode.set(clean, normalizedEntry);
+    inviteCodeByHousehold.set(entry.householdId, clean);
   }
 
-  function saveDB(data: any) {
-    // Atomic write to prevent corruption
-    const tempPath = DB_PATH + ".tmp";
-    fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
-    fs.renameSync(tempPath, DB_PATH);
-    persistAppStateAsync(data);
-
-    // Create a rotating backup
-    try {
-      const backupDir = path.join(process.cwd(), "db_backups");
-      if (!fs.existsSync(backupDir)) fs.mkdirSync(backupDir, { recursive: true });
-      
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-      const backupPath = path.join(backupDir, `db-backup-${timestamp}.json`);
-      fs.copyFileSync(DB_PATH, backupPath);
-
-      // Keep only last 10 backups
-      const files = fs.readdirSync(backupDir)
-        .filter(f => f.startsWith("db-backup-"))
-        .sort((a, b) => fs.statSync(path.join(backupDir, b)).mtimeMs - fs.statSync(path.join(backupDir, a)).mtimeMs);
-      
-      if (files.length > 10) {
-        files.slice(10).forEach(f => fs.unlinkSync(path.join(backupDir, f)));
-      }
-    } catch (e) {
-      console.error("Backup failed", e);
-    }
-  }
-
-  // --- Firestore Migration ---
-  async function migrateToFirestore() {
-    try {
-      console.log("[Firestore] Checking for existing data...");
-      const usersSnap = await firestore.collection('users').limit(1).get();
-      if (!usersSnap.empty) {
-        console.log("[Firestore] Data already exists, skipping initial migration.");
-        return;
-      }
-
-      console.log("[Firestore] Empty database detected. Migrating local db.json to Firestore...");
-      const dbData = getDB();
-      const batch = firestore.batch();
-
-      // Migrate Users
-      for (const [id, user] of Object.entries(dbData.users)) {
-        const { password, ...safeUser } = user as any;
-        batch.set(firestore.collection('users').doc(id), { 
-          ...safeUser, 
-          createdAt: FieldValue.serverTimestamp() 
-        });
-      }
-
-      // Migrate Households
-      for (const [id, household] of Object.entries(dbData.households)) {
-        batch.set(firestore.collection('households').doc(id), household as any);
-      }
-
-      // Migrate Holdings
-      if (Array.isArray(dbData.holdings)) {
-        for (const holding of dbData.holdings) {
-          batch.set(firestore.collection('holdings').doc((holding as any).id), holding as any);
-        }
-      }
-
-      await batch.commit();
-      console.log("[Firestore] Migration complete.");
-    } catch (e: any) {
-      console.error("[Firestore] Migration failed or API disabled:", e.message);
-      console.log("[Firestore] The app will continue using the local db.json fallback for now.");
-    }
-  }
-
-  // Initialize managed PostgreSQL persistence & hydrate any state across container restarts
+  // Initialize managed PostgreSQL persistence & hydrate invite codes across container restarts
   try {
     const pgInit = await initPostgresStore();
     if (pgInit.connected) {
-      const currentDb = getDB();
-      let hydrated = false;
-      if (pgInit.restoredDbJson && typeof pgInit.restoredDbJson === "object") {
-        if (pgInit.restoredDbJson.users && Object.keys(pgInit.restoredDbJson.users).length > Object.keys(currentDb.users || {}).length) {
-          currentDb.users = { ...currentDb.users, ...pgInit.restoredDbJson.users };
-          hydrated = true;
-        }
-        if (Array.isArray(pgInit.restoredDbJson.invites) && pgInit.restoredDbJson.invites.length > 0) {
-          currentDb.invites = pgInit.restoredDbJson.invites;
-          hydrated = true;
-        }
-        if (pgInit.restoredDbJson.inviteCodes) {
-          currentDb.inviteCodes = { ...currentDb.inviteCodes, ...pgInit.restoredDbJson.inviteCodes };
-          hydrated = true;
+      if (pgInit.restoredDbJson?.inviteCodes && typeof pgInit.restoredDbJson.inviteCodes === "object") {
+        for (const entry of Object.values(pgInit.restoredDbJson.inviteCodes)) {
+          cacheInviteEntry(entry);
         }
       }
-      if (Object.keys(pgInit.restoredInviteCodes).length > 0) {
-        currentDb.inviteCodes = { ...currentDb.inviteCodes, ...pgInit.restoredInviteCodes };
-        hydrated = true;
+      for (const entry of Object.values(pgInit.restoredInviteCodes || {})) {
+        cacheInviteEntry(entry);
       }
-      if (hydrated) {
-        fs.writeFileSync(DB_PATH, JSON.stringify(currentDb, null, 2));
-        console.log(`[Postgres] Hydrated ${Object.keys(currentDb.inviteCodes || {}).length} family invite code(s) into local cache.`);
+      if (inviteCodesByCode.size > 0) {
+        console.log(`[Postgres] Hydrated ${inviteCodesByCode.size} family invite code(s) into O(1) index.`);
       }
     }
   } catch (pgBootErr: any) {
     console.warn("[Postgres] Startup hydration skipped:", pgBootErr.message);
   }
 
-  // Run migration in background to not block startup
-  migrateToFirestore().catch(err => {
-    console.error("[Firestore] Background migration error:", err);
-  });
+  // Bounded LRU caches for Firebase JWT verification & household membership checks
+  const idTokenAuthCache = new LRUCache<string, { uid: string; email: string; name: string }>(500, 5 * 60 * 1000);
+  const householdAccessCache = new LRUCache<string, any>(500, 45 * 1000);
 
-  // --- Data Management APIs ---
-  app.get("/api/admin/export-db", (req, res) => {
-    const db = getDB();
-    res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', 'attachment; filename=unitywealth-backup.json');
-    res.send(JSON.stringify(db, null, 2));
-  });
+  function hashTokenKey(idToken: string): string {
+    return crypto.createHash("sha256").update(idToken).digest("hex");
+  }
 
-  app.post("/api/admin/import-db", (req, res) => {
-    const { data } = req.body;
-    if (!data || typeof data !== 'object') {
-      return res.status(400).json({ error: "Invalid data format" });
+  async function verifyFirebaseIdToken(idToken: string): Promise<{ uid: string; email: string; name: string }> {
+    const cacheKey = hashTokenKey(idToken);
+    const cached = idTokenAuthCache.get(cacheKey);
+    if (cached) return cached;
+
+    const resp = await axios.post(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
+      { idToken },
+      { timeout: 10000, httpsAgent: ipv4HttpsAgent }
+    );
+    const u = resp.data?.users?.[0];
+    if (!u?.localId) {
+      throw new Error("Invalid Firebase authentication token");
     }
-    // Basic validation
-    if (!data.users || !data.households || !data.holdings) {
-       return res.status(400).json({ error: "Data is missing required fields (users, households, holdings)" });
-    }
-    saveDB(data);
-    res.json({ success: true, message: "Database updated successfully" });
-  });
+    const caller = {
+      uid: u.localId,
+      email: (u.email || "").toLowerCase(),
+      name: u.displayName || ""
+    };
+    idTokenAuthCache.set(cacheKey, caller);
+    return caller;
+  }
 
-  app.get("/api/admin/backups", (req, res) => {
-    try {
-      const backupDir = path.join(process.cwd(), "db_backups");
-      if (!fs.existsSync(backupDir)) return res.json([]);
-      const files = fs.readdirSync(backupDir)
-        .filter(f => f.startsWith("db-backup-"))
-        .map(f => ({
-           id: f,
-           time: fs.statSync(path.join(backupDir, f)).mtime
-        }))
-        .sort((a, b) => b.time.getTime() - a.time.getTime());
-      res.json(files);
-    } catch (e) {
-      res.status(500).json({ error: "Failed to list backups" });
-    }
-  });
-
-  app.post("/api/admin/backups/restore", (req, res) => {
-    const { id } = req.body;
-    try {
-      const backupDir = path.join(process.cwd(), "db_backups");
-      const backupPath = path.join(backupDir, id);
-      if (!fs.existsSync(backupPath)) return res.status(404).json({ error: "Backup not found" });
-      
-      const data = JSON.parse(fs.readFileSync(backupPath, "utf-8"));
-      saveDB(data);
-      res.json({ success: true });
-    } catch (e) {
-      res.status(500).json({ error: "Restore failed" });
-    }
-  });
-
-  app.post("/api/auth/check-account", async (req, res) => {
-    const { email } = req.body;
-    if (!email) return res.status(400).json({ error: "Email is required" });
-
-    try {
-      const { getAuth } = await import("firebase-admin/auth");
-      const authAdmin = getAuth();
-      await authAdmin.getUserByEmail(email);
-      res.json({ success: true, message: "Account identified" });
-    } catch (e: any) {
-      if (e.code === 'auth/user-not-found') {
-        res.status(404).json({ error: "No account found for this email address." });
-      } else {
-        res.status(500).json({ error: "Failed to check account: " + e.message });
+  async function refreshFirebaseIdToken(refreshToken: string): Promise<string> {
+    const params = new URLSearchParams();
+    params.set("grant_type", "refresh_token");
+    params.set("refresh_token", refreshToken);
+    const resp = await axios.post(
+      `https://securetoken.googleapis.com/v1/token?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
+      params.toString(),
+      {
+        timeout: 10000,
+        httpsAgent: ipv4HttpsAgent,
+        headers: { "Content-Type": "application/x-www-form-urlencoded" }
       }
+    );
+    if (!resp.data?.id_token) {
+      throw new Error("Failed to refresh household authorization token");
     }
-  });
+    return resp.data.id_token;
+  }
 
-  app.post("/api/auth/force-reset-password", async (req, res) => {
-    const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: "Email and password are required" });
+  async function firestoreRestGet(docPath: string, idToken: string): Promise<any> {
+    const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/${docPath}`;
+    const resp = await axios.get(url, {
+      timeout: 10000,
+      httpsAgent: ipv4HttpsAgent,
+      headers: { Authorization: `Bearer ${idToken}` }
+    });
+    return resp.data;
+  }
 
-    try {
-      const { getAuth } = await import("firebase-admin/auth");
-      const authAdmin = getAuth();
-      const user = await authAdmin.getUserByEmail(email);
-      await authAdmin.updateUser(user.uid, { password });
-      
-      console.log(`[AUTH] Admin-forced password reset for: ${email}`);
-      res.json({ success: true, message: "Password updated successfully" });
-    } catch (e: any) {
-      console.error("[AUTH] Force reset failed:", e);
-      if (e.code === 'auth/user-not-found') {
-        res.status(404).json({ error: "No account found for this email address." });
-      } else {
-        res.status(500).json({ error: "Failed to reset password: " + e.message });
-      }
-    }
-  });
-
-  // Mock Email Logger / Real Resend
-  async function logEmail(to: string, subject: string, body: string) {
-    const logPath = path.join(process.cwd(), "email_logs.txt");
-    let status = "MOCK";
-    let errorDetails = "";
-
-    // Use the provided 'to' address, but we can have a fallback for testing environments
-    const finalTo = to || "hgarg5072@gmail.com";
-
-    if (resend) {
-      try {
-        const fromEmail = (process.env.RESEND_FROM && process.env.RESEND_FROM.includes("@")) 
-                 ? process.env.RESEND_FROM 
-                 : "onboarding@resend.dev";
-
-        const { data, error } = await resend.emails.send({
-          from: fromEmail,
-          to: finalTo,
-          subject: subject,
-          html: body.replace(/\n/g, '<br>'),
-        });
-
-        if (error) {
-          status = "FAILED";
-          // Resend validation errors often mean unverified domain or unverified recipient in sandbox
-          const msg = error.message || "Unknown error";
-          const isValidation = error.name === "validation_error";
-          const resendHint = isValidation ? " (HINT: If using onboarding@resend.dev, you can only send to the email you signed up with. Also check if your Resend API key is valid.)" : "";
-          
-          errorDetails = `${error.name}: ${msg}${resendHint}`;
-          console.error("[RESEND ERROR]", JSON.stringify(error, null, 2));
-        } else {
-          status = "REAL";
-          console.log(`[REAL EMAIL SENT via Resend] To: ${finalTo}, ID: ${data?.id}`);
+  async function firestoreRestPatch(docPath: string, fieldPaths: string[], fields: any, idToken: string): Promise<any> {
+    const maskQuery = fieldPaths.map((f) => `updateMask.fieldPaths=${encodeURIComponent(f)}`).join("&");
+    const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/${docPath}?${maskQuery}`;
+    const resp = await axios.patch(
+      url,
+      { fields },
+      {
+        timeout: 10000,
+        httpsAgent: ipv4HttpsAgent,
+        headers: {
+          Authorization: `Bearer ${idToken}`,
+          "Content-Type": "application/json"
         }
-      } catch (e: any) {
-        status = "ERROR";
-        errorDetails = e.message;
-        console.error("[RESEND EXCEPTION]", e);
       }
+    );
+    return resp.data;
+  }
+
+  async function verifyCallerHouseholdAccess(req: express.Request, householdId: string) {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : String(req.body?.idToken || "");
+    if (!idToken) {
+      throw Object.assign(new Error("Missing authorization token"), { statusCode: 401 });
+    }
+    const caller = await verifyFirebaseIdToken(idToken);
+    const accessKey = `${caller.uid}:${householdId}`;
+    const cachedHhDoc = householdAccessCache.get(accessKey);
+    if (cachedHhDoc) {
+      return { caller, hhDoc: cachedHhDoc };
     }
 
-    const entry = `[${new Date().toISOString()}] [${status}] TO: ${to} (FINAL RECIPIENT: ${finalTo}) | SUBJECT: ${subject}${errorDetails ? ` | ERROR: ${errorDetails}` : ""}\nBODY: ${body}\n------------------\n`;
-    fs.appendFileSync(logPath, entry);
+    const hhDoc = await firestoreRestGet(`households/${householdId}`, idToken);
+    const memberValues: any[] = hhDoc?.fields?.members?.arrayValue?.values || [];
+    const memberIds = memberValues.map((v: any) => v.stringValue).filter(Boolean);
+    if (!memberIds.includes(caller.uid)) {
+      throw Object.assign(new Error("Forbidden: not a member of this household"), { statusCode: 403 });
+    }
+    householdAccessCache.set(accessKey, hhDoc);
+    return { caller, hhDoc };
+  }
+
+  // Shared 30-minute single-flight USD/INR exchange rate cache
+  let fxRateState: { inr: number; ts: number; inFlight: Promise<number> | null } = {
+    inr: FX_FALLBACK_RATE,
+    ts: 0,
+    inFlight: null
+  };
+  const FX_CACHE_TTL_MS = 30 * 60 * 1000;
+
+  async function getUsdInrRate(): Promise<number> {
+    const now = Date.now();
+    if (fxRateState.ts > 0 && now - fxRateState.ts < FX_CACHE_TTL_MS) {
+      return fxRateState.inr;
+    }
+    if (fxRateState.inFlight) return fxRateState.inFlight;
+
+    fxRateState.inFlight = (async () => {
+      try {
+        const res = await axios.get("https://open.er-api.com/v6/latest/USD", { timeout: 5000 });
+        const rate = Number(res.data?.rates?.INR);
+        if (rate > 0) {
+          fxRateState.inr = rate;
+          fxRateState.ts = Date.now();
+        }
+      } catch (err: any) {
+        console.warn("[FX] Rate refresh failed, using cached/fallback:", err.message);
+      }
+      return fxRateState.inr;
+    })().finally(() => {
+      fxRateState.inFlight = null;
+    });
+
+    return fxRateState.inFlight;
   }
 
   // API Routes
@@ -498,26 +376,22 @@ async function startServer() {
   }
 
   function getRedirectUri(req: express.Request) {
-    const host = req.get('host');
-    const protocol = req.get('x-forwarded-proto') || (host?.includes('localhost') ? 'http' : 'https');
-    
-    // Explicitly construct the URI from headers to match what Google sees
+    const host = req.get("host");
+    const protocol = req.get("x-forwarded-proto") || (host?.includes("localhost") ? "http" : "https");
     const detectedUri = `${protocol}://${host}/auth/callback`;
-    
-    console.log(`[Google OAuth Debug] Host: ${host}, Proto: ${protocol}, Detected: ${detectedUri}`);
 
-    if (host && !host.includes('localhost') && !host.startsWith('127.')) {
+    if (host && !host.includes("localhost") && !host.startsWith("127.")) {
       return detectedUri;
     }
 
     if (process.env.APP_URL) {
       const appUrl = process.env.APP_URL.replace(/\/$/, "");
-      if (host?.includes('localhost')) {
+      if (host?.includes("localhost")) {
         return `http://${host}/auth/callback`;
       }
       return `${appUrl}/auth/callback`;
     }
-    
+
     return detectedUri;
   }
 
@@ -532,29 +406,28 @@ async function startServer() {
   app.get("/api/auth/google/url", (req, res) => {
     const client = getGoogleClient(req);
     const redirectUri = getRedirectUri(req);
-    const householdId = typeof req.query.householdId === 'string' ? req.query.householdId : '';
-    const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
-    const loginHint = typeof req.query.loginHint === 'string' && req.query.loginHint
-      ? req.query.loginHint
-      : 'unitywealth.alerts@gmail.com';
-    const statePayload = Buffer.from(JSON.stringify({ householdId, userId })).toString('base64url');
-    console.log(`[Google OAuth] Generating Auth URL (Redirect URI: ${redirectUri}, hint: ${loginHint})`);
-    
+    const householdId = typeof req.query.householdId === "string" ? req.query.householdId : "";
+    const userId = typeof req.query.userId === "string" ? req.query.userId : "";
+    const loginHint =
+      typeof req.query.loginHint === "string" && req.query.loginHint
+        ? req.query.loginHint
+        : "unitywealth.alerts@gmail.com";
+    const statePayload = Buffer.from(JSON.stringify({ householdId, userId })).toString("base64url");
+
     const url = client.generateAuthUrl({
-      access_type: 'offline',
-      prompt: 'consent select_account',
+      access_type: "offline",
+      prompt: "consent select_account",
       login_hint: loginHint,
       state: statePayload,
       scope: [
-        'https://www.googleapis.com/auth/userinfo.email',
-        'https://www.googleapis.com/auth/userinfo.profile',
-        'https://www.googleapis.com/auth/gmail.send'
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+        "https://www.googleapis.com/auth/gmail.send"
       ]
     });
     res.json({ url, redirectUri });
   });
 
-  // 1-Click convenience redirect to authorize unitywealth.alerts@gmail.com as global system sender
   app.get("/connect-sender", (req, res) => {
     const client = getGoogleClient(req);
     const statePayload = Buffer.from(JSON.stringify({ householdId: "", userId: "system_sender" })).toString("base64url");
@@ -574,13 +447,13 @@ async function startServer() {
 
   app.get(["/auth/callback", "/auth/callback/"], async (req, res) => {
     const { code, state } = req.query;
-    if (typeof code !== 'string') return res.status(400).send("No code provided");
+    if (typeof code !== "string") return res.status(400).send("No code provided");
 
     const client = getGoogleClient(req);
     let parsedState: { householdId?: string; userId?: string } = {};
-    if (typeof state === 'string' && state) {
+    if (typeof state === "string" && state) {
       try {
-        parsedState = JSON.parse(Buffer.from(state, 'base64url').toString('utf8'));
+        parsedState = JSON.parse(Buffer.from(state, "base64url").toString("utf8"));
       } catch {
         // ignore invalid state
       }
@@ -590,61 +463,31 @@ async function startServer() {
       const { tokens } = await client.getToken(code);
       client.setCredentials(tokens);
 
-      // Fetch user profile from Google
       const oauth2 = axios.create({
         headers: { Authorization: `Bearer ${tokens.access_token}` }
       });
       const profile = await oauth2.get("https://www.googleapis.com/oauth2/v2/userinfo");
-      const { email, name, id: googleId } = profile.data;
+      const { email, name } = profile.data;
 
-      const db = getDB();
-      let user = Object.values(db.users).find((u: any) => u.email.toLowerCase() === email.toLowerCase()) as any;
       const existingCfg = await resolveEmailConfig(parsedState.householdId);
+      const prevUserTokens = parsedState.userId
+        ? await getAppStateKeyPg<any>(`gmail_tokens:${parsedState.userId}`)
+        : null;
       const mergedTokens = {
         access_token: tokens.access_token || undefined,
-        refresh_token: tokens.refresh_token || existingCfg?.tokens?.refresh_token || user?.googleTokens?.refresh_token || undefined,
+        refresh_token:
+          tokens.refresh_token ||
+          existingCfg?.tokens?.refresh_token ||
+          prevUserTokens?.refresh_token ||
+          undefined,
         expiry_date: tokens.expiry_date || Date.now() + 50 * 60 * 1000,
         scope: tokens.scope || undefined
       };
 
-      if (!user) {
-        const id = parsedState.userId || ("u_" + Math.random().toString(36).substr(2, 9));
-        user = { 
-          id, 
-          email, 
-          name, 
-          googleId,
-          googleTokens: mergedTokens,
-          householdId: parsedState.householdId || null,
-          provider: 'google'
-        };
-        db.users[id] = user;
-        saveDB(db);
-        console.log(`[Google OAuth] Created new user & email sender: ${email}`);
-      } else {
-        user.googleTokens = { ...(user.googleTokens || {}), ...mergedTokens };
-        user.googleId = googleId;
-        if (parsedState.householdId && !user.householdId) {
-          user.householdId = parsedState.householdId;
-        }
-        saveDB(db);
-        console.log(`[Google OAuth] Connected Gmail OAuth tokens for: ${email}`);
-      }
-
-      if (parsedState.userId && parsedState.userId !== user.id) {
-        db.users[parsedState.userId] = {
-          ...(db.users[parsedState.userId] || { id: parsedState.userId, email, name }),
-          googleTokens: mergedTokens,
-          householdId: parsedState.householdId || null
-        };
-        saveDB(db);
-      }
-
       const isOfficial = email.toLowerCase() === "unitywealth.alerts@gmail.com";
-      const resolvedSenderName = isOfficial
-        ? "UnityWealth"
-        : name || "UnityWealth Family Office";
-      await saveHouseholdEmailConfig(parsedState.householdId || user.householdId, {
+      const resolvedSenderName = isOfficial ? "UnityWealth" : name || "UnityWealth Family Office";
+
+      await saveHouseholdEmailConfig(parsedState.householdId || null, {
         provider: "gmail_oauth",
         senderEmail: email,
         senderName: resolvedSenderName,
@@ -652,26 +495,33 @@ async function startServer() {
         updatedAt: Date.now()
       });
       await setAppStateKeyPg(`gmail_tokens:${parsedState.userId || email.toLowerCase()}`, mergedTokens);
-      
+      if (parsedState.userId) {
+        await setAppStateKeyPg(`gmail_tokens:${email.toLowerCase()}`, mergedTokens);
+      }
+
       res.send(`
         <!doctype html>
         <html>
           <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Gmail Connected — UnityWealth</title></head>
           <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f8fafc;padding:40px 16px;text-align:center;color:#0f172a;">
             <div style="max-width:440px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:22px;padding:32px 24px;box-shadow:0 10px 28px rgba(15,23,42,0.08);">
-              <div style="width:52px;height:52px;border-radius:16px;background:${isOfficial ? '#dcfce7' : '#e0e7ff'};color:${isOfficial ? '#15803d' : '#4338ca'};font-size:24px;font-weight:900;line-height:52px;margin:0 auto 14px;">✓</div>
-              <h3 style="margin:0 0 8px;font-size:18px;font-weight:800;">${isOfficial ? 'Official UnityWealth Sender Active!' : 'Gmail Sender Connected'}</h3>
+              <div style="width:52px;height:52px;border-radius:16px;background:${isOfficial ? "#dcfce7" : "#e0e7ff"};color:${isOfficial ? "#15803d" : "#4338ca"};font-size:24px;font-weight:900;line-height:52px;margin:0 auto 14px;">✓</div>
+              <h3 style="margin:0 0 8px;font-size:18px;font-weight:800;">${isOfficial ? "Official UnityWealth Sender Active!" : "Gmail Sender Connected"}</h3>
               <p style="margin:0 0 18px;font-size:13px;color:#475569;line-height:1.55;">
                 All Family Invitations &amp; 24/7 Rebalance Reports will now send from <strong>${resolvedSenderName} &lt;${email}&gt;</strong>.
               </p>
-              ${!isOfficial ? `
+              ${
+                !isOfficial
+                  ? `
               <div style="margin:0 0 18px;padding:12px;border-radius:12px;background:#fffbeb;border:1px solid #fde68a;font-size:12px;color:#92400e;line-height:1.45;">
                 Want to use <strong>unitywealth.alerts@gmail.com</strong> instead?
                 <div style="margin-top:8px;">
                   <a href="/connect-sender" style="display:inline-block;padding:8px 14px;border-radius:9px;background:#0f172a;color:#ffffff;text-decoration:none;font-weight:700;font-size:12px;">Switch to unitywealth.alerts@gmail.com</a>
                 </div>
               </div>
-              ` : ''}
+              `
+                  : ""
+              }
               <a href="/?emailConnected=1" style="display:inline-block;padding:11px 22px;border-radius:12px;background:#4f46e5;color:#ffffff;text-decoration:none;font-size:13px;font-weight:700;">
                 Return to UnityWealth
               </a>
@@ -733,7 +583,9 @@ async function startServer() {
 
       const existing = await resolveEmailConfig(householdId);
       const keepRefresh =
-        existing && (existing.provider === "gmail_oauth" || existing.provider === "gmail_token") && existing.senderEmail?.toLowerCase() === (senderEmail || caller.email).toLowerCase()
+        existing &&
+        (existing.provider === "gmail_oauth" || existing.provider === "gmail_token") &&
+        existing.senderEmail?.toLowerCase() === (senderEmail || caller.email).toLowerCase()
           ? existing.tokens?.refresh_token
           : undefined;
 
@@ -835,11 +687,9 @@ async function startServer() {
   });
 
   app.post("/api/auth/google/save-tokens", async (req, res) => {
-    const { userId, tokens, householdId, email, name } = req.body;
-    const db = getDB();
-    if (db.users[userId]) {
-      db.users[userId].googleTokens = tokens;
-      saveDB(db);
+    const { userId, tokens, householdId, email, name } = req.body || {};
+    if (userId && tokens) {
+      await setAppStateKeyPg(`gmail_tokens:${userId}`, tokens);
     }
     if (tokens?.access_token && email) {
       await saveHouseholdEmailConfig(householdId, {
@@ -853,145 +703,79 @@ async function startServer() {
     res.json({ success: true });
   });
 
-  // --- Gmail Sync Logic ---
-  async function syncGmailForUser(userId: string) {
-    const db = getDB();
-    const user = db.users[userId];
-    if (!user || !user.googleTokens) {
-      throw new Error("User hasn't connected Gmail");
-    }
-
-    const oAuth2Client = new OAuth2Client(
-      process.env.GOOGLE_CLIENT_ID,
-      process.env.GOOGLE_CLIENT_SECRET
-    );
-    oAuth2Client.setCredentials(user.googleTokens);
-
-    // Refresh token if needed
-    oAuth2Client.on('tokens', (tokens) => {
-      if (tokens.refresh_token) {
-        user.googleTokens.refresh_token = tokens.refresh_token;
-      }
-      user.googleTokens.access_token = tokens.access_token;
-      saveDB(getDB()); // Use fresh DB state
-    });
-
-    const { google } = await import('googleapis');
-    const gmail = google.gmail({ version: 'v1', auth: oAuth2Client });
-
-    // Search for emails from CAS providers
-    const queries = [
-      'from:donotreply@camsonline.com "Consolidated Account Statement"',
-      'from:donotreply@kfintech.com "Consolidated Account Statement"',
-      'from:MFCentral "Account Statement"'
-    ];
-
-    let allAttachments: any[] = [];
-
-    for (const q of queries) {
-      const msgs = await gmail.users.messages.list({ userId: 'me', q });
-      if (!msgs.data.messages) continue;
-
-      for (const m of msgs.data.messages) {
-        const msg = await gmail.users.messages.get({ userId: 'me', id: m.id! });
-        const parts = msg.data.payload?.parts || [];
-        
-        for (const part of parts) {
-          if (part.filename && part.filename.toLowerCase().endsWith('.pdf')) {
-            const attachId = part.body?.attachmentId;
-            if (attachId) {
-              const attach = await gmail.users.messages.attachments.get({
-                userId: 'me',
-                messageId: m.id!,
-                id: attachId
-              });
-              if (attach.data.data) {
-                allAttachments.push({
-                  filename: part.filename,
-                  data: attach.data.data, // Base64 encoded
-                  messageId: m.id
-                });
-              }
-            }
-          }
-        }
-      }
-    }
-
-    if (allAttachments.length === 0) return { success: true, count: 0, message: "No CAS statements found in Gmail" };
-
-    // Process only the latest one for now to save tokens/time
-    const latest = allAttachments[0];
-    
-    // Use the existing Gemini extract logic (internal call or refactor)
-    console.log(`[Gmail Sync] Processing attachment: ${latest.filename}`);
-    
-    // We can call the extract function directly or use axios to hit our own endpoint
-    // To keep it simple, we'll try to use the same logic as /api/gemini/extract
-    
-    let promptParts: any[] = [
-      { text: `Extract all investment holdings (Stocks, Mutual Funds, ETFs) from this PDF. \n\n` +
-              "Return as a JSON array of objects with keys: schemeName, originalName, units, nav, assetClass (one of 'Equity', 'Debt', 'Mutual Fund').\n\n" +
-              "STRICT CLEANING RULES for 'schemeName':\n" +
-              "1. IDENTIFY the core name or ticker. \n" +
-              "2. STRIP all plan/option/platform noise.\n" +
-              "3. originalName: MUST be the verbatim name for accurate linking.\n\n" +
-              "- units and nav: Must be numbers.\n" +
-              "- Ignore zero balances." }
-    ];
-
-    promptParts.push({
-      inlineData: {
-        data: latest.data.replace(/-/g, '+').replace(/_/g, '/'), // Convert web-safe base64
-        mimeType: "application/pdf"
-      }
-    });
-
-    const rawJson = await callGeminiJSON(promptParts);
-    const holdings = JSON.parse((rawJson || "[]").replace(/```json/g, "").replace(/```/g, "").trim());
-    
-    // Bulk add to DB
-    if (holdings.length > 0) {
-      const dbInstance = getDB();
-      dbInstance.holdings = dbInstance.holdings.filter((h: any) => !(h.userId === userId && h.source === "GMAIL"));
-      
-      const newHoldings = holdings.map((h: any) => ({
-        id: "h_" + Math.random().toString(36).substr(2, 9),
-        userId,
-        householdId: user.householdId,
-        ticker: h.schemeName,
-        quantity: parseFloat(h.units),
-        assetClass: h.assetClass || "Mutual Fund",
-        currency: "INR",
-        provider: "GMAIL",
-        source: "GMAIL",
-        currentPrice: parseFloat(h.nav),
-        originalName: h.originalName,
-        syncedAt: Date.now()
-      }));
-
-      dbInstance.holdings.push(...newHoldings);
-      saveDB(dbInstance);
-    }
-
-    return { success: true, count: holdings.length, filename: latest.filename };
-  }
-
+  // Lightweight Gmail CAS Sync via Gmail REST API (zero heavy googleapis SDK, metadata-first maxResults=1)
   app.post("/api/sync/gmail", async (req, res) => {
-    const { userId } = req.body;
     try {
-      const result = await syncGmailForUser(userId);
-      res.json(result);
+      const { userId, householdId } = req.body || {};
+      const storedTokens =
+        (userId ? await getAppStateKeyPg<any>(`gmail_tokens:${userId}`) : null) ||
+        (await resolveEmailConfig(householdId))?.tokens;
+
+      if (!storedTokens?.access_token && !storedTokens?.refresh_token) {
+        return res.status(400).json({ error: "User hasn't connected Gmail with statement read access yet." });
+      }
+
+      const oAuth2Client = new OAuth2Client(process.env.GOOGLE_CLIENT_ID, process.env.GOOGLE_CLIENT_SECRET);
+      oAuth2Client.setCredentials(storedTokens);
+      const tokenResp = await oAuth2Client.getAccessToken();
+      const accessToken = tokenResp?.token || storedTokens.access_token;
+      if (!accessToken) {
+        return res.status(401).json({ error: "Gmail token expired. Please reconnect Gmail." });
+      }
+
+      const gmailHttp = axios.create({
+        baseURL: "https://gmail.googleapis.com/gmail/v1/users/me",
+        timeout: 12000,
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+
+      const q =
+        'from:(donotreply@camsonline.com OR donotreply@kfintech.com OR MFCentral) ("Consolidated Account Statement" OR "Account Statement") filename:pdf';
+      const listRes = await gmailHttp.get("/messages", { params: { q, maxResults: 1 } });
+      const latestMsgId = listRes.data?.messages?.[0]?.id;
+      if (!latestMsgId) {
+        return res.json({ success: true, count: 0, message: "No CAS statements found in Gmail" });
+      }
+
+      const msgRes = await gmailHttp.get(`/messages/${encodeURIComponent(latestMsgId)}`);
+      const parts: any[] = msgRes.data?.payload?.parts || [];
+      const pdfPart = parts.find(
+        (p: any) => p?.filename && String(p.filename).toLowerCase().endsWith(".pdf") && p?.body?.attachmentId
+      );
+      if (!pdfPart) {
+        return res.json({ success: true, count: 0, message: "No PDF attachment found on latest CAS email" });
+      }
+
+      const attachRes = await gmailHttp.get(
+        `/messages/${encodeURIComponent(latestMsgId)}/attachments/${encodeURIComponent(pdfPart.body.attachmentId)}`
+      );
+      const base64Data = String(attachRes.data?.data || "").replace(/-/g, "+").replace(/_/g, "/");
+      if (!base64Data) {
+        return res.json({ success: true, count: 0, message: "Empty CAS attachment" });
+      }
+
+      const rawJson = await callGeminiJSON([
+        {
+          text:
+            "Extract all investment holdings (Stocks, Mutual Funds, ETFs) from this PDF.\n" +
+            "Return as a JSON array of objects with keys: schemeName, originalName, units, nav, assetClass ('Equity' | 'Debt' | 'Mutual Fund'). Ignore zero balances."
+        },
+        { inlineData: { data: base64Data, mimeType: "application/pdf" } }
+      ]);
+      const extracted = JSON.parse((rawJson || "[]").replace(/```json/g, "").replace(/```/g, "").trim());
+      res.json({
+        success: true,
+        count: Array.isArray(extracted) ? extracted.length : 0,
+        filename: pdfPart.filename,
+        holdings: Array.isArray(extracted) ? extracted : []
+      });
     } catch (e: any) {
-      console.error("Gmail Sync Error:", e);
-      res.status(500).json({ error: e.message });
+      console.error("Gmail Sync Error:", e?.response?.data || e.message);
+      res.status(500).json({ error: e?.response?.data?.error?.message || e.message || "Gmail sync failed" });
     }
   });
 
-  app.post("/api/sync/request-cas", async (req, res) => {
-    const { email } = req.body;
-    // Mocking the trigger of a CAS request from MFCentral
-    logEmail(email, "CAS Request Triggered", "We have initiated a Consolidated Account Statement request on your behalf via MFCentral. You will receive an email from CAMS/KFintech shortly. Once received, our sync engine will pick it up automatically.");
+  app.post("/api/sync/request-cas", async (_req, res) => {
     res.json({ success: true, message: "CAS request initiated" });
   });
 
@@ -1005,135 +789,14 @@ async function startServer() {
     const result = await sendHouseholdEmail({ householdId, to: String(email).trim(), subject, text, html });
     res.json({
       success: result.sent,
-      message: result.sent ? `Test email sent via ${result.provider} (${result.senderEmail})` : (result.error || "Email not sent"),
+      message: result.sent
+        ? `Test email sent via ${result.provider} (${result.senderEmail})`
+        : result.error || "Email not sent",
       ...result
     });
   });
 
-  app.post("/api/auth/signup", (req, res) => {
-    const { email, password, name } = req.body;
-    const db = getDB();
-    const normalizedEmail = (email || "").trim().toLowerCase();
-    
-    if (!normalizedEmail || !password) {
-      return res.status(400).json({ error: "Email and password are required" });
-    }
-
-    if (Object.values(db.users).find((u: any) => u.email.toLowerCase() === normalizedEmail)) {
-      return res.status(400).json({ error: "An account with this email already exists." });
-    }
-    const id = "u_" + Math.random().toString(36).substr(2, 9);
-    const newUser = { 
-      id, 
-      email: normalizedEmail, 
-      password: (password || "").trim(), 
-      name: (name || "New User").trim(), 
-      householdId: null 
-    };
-    db.users[id] = newUser;
-    saveDB(db);
-
-    logEmail(normalizedEmail, "Welcome to UnityWealth", `Hi ${name}, welcome! Your account is ready.`);
-    res.json(newUser);
-  });
-
-  app.post("/api/auth/login", (req, res) => {
-    const { email, password } = req.body;
-    const db = getDB();
-    const normalizedEmail = (email || "").trim().toLowerCase();
-    const normalizedPass = (password || "").trim();
-
-    const user: any = Object.values(db.users).find((u: any) => u.email.toLowerCase() === normalizedEmail);
-    
-    if (!user) {
-      return res.status(404).json({ error: `No account found for '${email}'. Please sign up first.` });
-    }
-    
-    if (user.password !== normalizedPass) {
-      return res.status(401).json({ error: "Incorrect password. Please try again or reset it." });
-    }
-
-    res.json(user);
-  });
-
-  app.post("/api/auth/forgot-password", async (req, res) => {
-    const { email } = req.body;
-    const db = getDB();
-    const normalizedEmail = (email || "").trim().toLowerCase();
-    const user: any = Object.values(db.users).find((u: any) => u.email.toLowerCase() === normalizedEmail);
-    
-    if (!user) {
-      return res.status(404).json({ error: "This email is not registered with us." });
-    }
-
-    const resetCode = Math.floor(100000 + Math.random() * 900000).toString();
-    user.resetCode = resetCode;
-    saveDB(db);
-
-    // Non-blocking email send
-    logEmail(
-      normalizedEmail, 
-      "UnityWealth: Password Reset Code", 
-      `Hi ${user.name},\n\nYour 6-digit password reset code is: ${resetCode}\n\nThis code will expire once used or if a new one is requested.`
-    ).catch(e => console.error("Forgot Pass email failed", e));
-
-    res.json({ success: true, message: "Reset code sent to your email" });
-  });
-
-  app.post("/api/auth/reset-password", (req, res) => {
-    const { email, newPassword, code } = req.body;
-    const db = getDB();
-    const normalizedEmail = (email || "").trim().toLowerCase();
-    const user: any = Object.values(db.users).find((u: any) => u.email.toLowerCase() === normalizedEmail);
-
-    if (!user) {
-      return res.status(404).json({ error: "User not found" });
-    }
-
-    if (!user.resetCode || user.resetCode !== (code || "").trim()) {
-      return res.status(401).json({ error: "Invalid or expired reset code." });
-    }
-
-    user.password = (newPassword || "").trim();
-    delete user.resetCode;
-    saveDB(db);
-
-    res.json({ success: true, message: "Password updated successfully" });
-  });
-
-  app.post("/api/household/create", (req, res) => {
-    const { userId, name } = req.body;
-    const db = getDB();
-    const householdId = "h_" + Math.random().toString(36).substr(2, 9);
-    db.households[householdId] = {
-      id: householdId,
-      name,
-      members: [userId],
-      settings: {},
-      targets: {
-         assetSplit: { Equity: 0.70, Debt: 0.30 },
-         equitySplit: { Indian: 0.60, Foreign: 0.40 },
-         foreignBreakdown: [
-            { name: "Magnificent 7", percentage: 100, tickers: ["GOOGL", "MSFT", "AAPL", "AMZN", "NVDA", "META", "TSLA"] }
-         ]
-      }
-    };
-    if (db.users[userId]) {
-      db.users[userId].householdId = householdId;
-    }
-    saveDB(db);
-    res.json(db.households[householdId]);
-  });
-
-  function normalizeInviteCode(raw: string): string {
-    return String(raw || "")
-      .trim()
-      .toUpperCase()
-      .replace(/^UW[\-\s]*/i, "")
-      .replace(/[^A-Z0-9]/g, "");
-  }
-
-  function generateInviteCode(existingCodes: Record<string, any>): string {
+  function generateInviteCode(): string {
     const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
     for (let attempt = 0; attempt < 20; attempt++) {
       let code = "";
@@ -1141,76 +804,12 @@ async function startServer() {
       for (let i = 0; i < 6; i++) {
         code += alphabet[bytes[i] % alphabet.length];
       }
-      if (!existingCodes[code]) return code;
+      if (!inviteCodesByCode.has(code)) return code;
     }
     return crypto.randomBytes(3).toString("hex").toUpperCase();
   }
 
-  async function verifyFirebaseIdToken(idToken: string): Promise<{ uid: string; email: string; name: string }> {
-    const resp = await axios.post(
-      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
-      { idToken },
-      { timeout: 10000, httpsAgent: ipv4HttpsAgent }
-    );
-    const u = resp.data?.users?.[0];
-    if (!u?.localId) {
-      throw new Error("Invalid Firebase authentication token");
-    }
-    return {
-      uid: u.localId,
-      email: (u.email || "").toLowerCase(),
-      name: u.displayName || ""
-    };
-  }
-
-  async function refreshFirebaseIdToken(refreshToken: string): Promise<string> {
-    const params = new URLSearchParams();
-    params.set("grant_type", "refresh_token");
-    params.set("refresh_token", refreshToken);
-    const resp = await axios.post(
-      `https://securetoken.googleapis.com/v1/token?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
-      params.toString(),
-      {
-        timeout: 10000,
-        httpsAgent: ipv4HttpsAgent,
-        headers: { "Content-Type": "application/x-www-form-urlencoded" }
-      }
-    );
-    if (!resp.data?.id_token) {
-      throw new Error("Failed to refresh household authorization token");
-    }
-    return resp.data.id_token;
-  }
-
-  async function firestoreRestGet(docPath: string, idToken: string): Promise<any> {
-    const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/${docPath}`;
-    const resp = await axios.get(url, {
-      timeout: 10000,
-      httpsAgent: ipv4HttpsAgent,
-      headers: { Authorization: `Bearer ${idToken}` }
-    });
-    return resp.data;
-  }
-
-  async function firestoreRestPatch(docPath: string, fieldPaths: string[], fields: any, idToken: string): Promise<any> {
-    const maskQuery = fieldPaths.map(f => `updateMask.fieldPaths=${encodeURIComponent(f)}`).join("&");
-    const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents/${docPath}?${maskQuery}`;
-    const resp = await axios.patch(
-      url,
-      { fields },
-      {
-        timeout: 10000,
-        httpsAgent: ipv4HttpsAgent,
-        headers: {
-          Authorization: `Bearer ${idToken}`,
-          "Content-Type": "application/json"
-        }
-      }
-    );
-    return resp.data;
-  }
-
-  // Register or sync a household's shareable Invite Code (backed by member auth)
+  // Register or sync a household's shareable Invite Code (backed by member auth + PostgreSQL)
   app.post("/api/household/invite-code", async (req, res) => {
     try {
       const authHeader = req.headers.authorization || "";
@@ -1221,43 +820,33 @@ async function startServer() {
         return res.status(400).json({ error: "Missing authentication token or householdId" });
       }
 
-      const caller = await verifyFirebaseIdToken(idToken);
-      const hhDoc = await firestoreRestGet(`households/${householdId}`, idToken);
-      const memberValues: any[] = hhDoc?.fields?.members?.arrayValue?.values || [];
-      const memberIds = memberValues.map((v: any) => v.stringValue).filter(Boolean);
-
-      if (!memberIds.includes(caller.uid)) {
-        return res.status(403).json({ error: "Only an existing household member can generate an invite code." });
-      }
-
+      const { caller, hhDoc } = await verifyCallerHouseholdAccess(req, householdId);
       const resolvedHouseholdName =
-        householdName ||
-        hhDoc?.fields?.name?.stringValue ||
-        "Family Portfolio";
+        householdName || hhDoc?.fields?.name?.stringValue || "Family Portfolio";
       const firestoreStoredCode = normalizeInviteCode(
         hhDoc?.fields?.settings?.mapValue?.fields?.inviteCode?.stringValue || ""
       );
 
-      const db = getDB();
-      if (!db.inviteCodes) db.inviteCodes = {};
+      const existingCodeForHh = inviteCodeByHousehold.get(householdId);
+      let existingEntry = existingCodeForHh ? inviteCodesByCode.get(existingCodeForHh) : null;
+      if (!existingEntry) {
+        existingEntry = await getInviteByHouseholdPg(householdId);
+        if (existingEntry) cacheInviteEntry(existingEntry);
+      }
 
-      // Find existing code for this household, or use preferredCode / firestoreStoredCode, or generate a new 6-char code
-      let code = "";
-      const existingEntry = Object.values(db.inviteCodes).find((entry: any) => entry.householdId === householdId) as any;
       const requestedClean = normalizeInviteCode(preferredCode || firestoreStoredCode);
+      let code = "";
+      const requestedOwner = requestedClean ? inviteCodesByCode.get(requestedClean) : null;
 
-      if (requestedClean && requestedClean.length >= 4 && (!db.inviteCodes[requestedClean] || db.inviteCodes[requestedClean].householdId === householdId)) {
+      if (requestedClean && requestedClean.length >= 4 && (!requestedOwner || requestedOwner.householdId === householdId)) {
         code = requestedClean;
-        if (existingEntry && existingEntry.code !== code) {
-          delete db.inviteCodes[existingEntry.code];
-        }
       } else if (existingEntry?.code) {
         code = existingEntry.code;
       } else {
-        code = generateInviteCode(db.inviteCodes);
+        code = generateInviteCode();
       }
 
-      db.inviteCodes[code] = {
+      const entry = {
         code,
         householdId,
         householdName: resolvedHouseholdName,
@@ -1268,6 +857,8 @@ async function startServer() {
         lastTokenAt: Date.now(),
         updatedAt: Date.now()
       };
+      cacheInviteEntry(entry);
+      await upsertInviteCodePg(entry);
 
       const shareBaseUrl = (process.env.SHORT_URL || resolveRequestBaseUrl(req)).replace(/\/$/, "");
       const joinUrl = `${shareBaseUrl}/j/${code}`;
@@ -1276,21 +867,6 @@ async function startServer() {
       if (toEmail && typeof toEmail === "string") {
         const cleanEmail = toEmail.trim().toLowerCase();
         if (cleanEmail) {
-          const alreadyPending = db.invites.find(
-            (i: any) => i.toEmail === cleanEmail && i.householdId === householdId && i.status === "pending"
-          );
-          if (!alreadyPending) {
-            db.invites.push({
-              id: Date.now().toString(),
-              fromUserId: caller.uid,
-              toEmail: cleanEmail,
-              householdId,
-              householdName: resolvedHouseholdName,
-              inviteCode: code,
-              status: "pending"
-            });
-          }
-
           const content = buildInvitationEmailContent({
             householdName: resolvedHouseholdName,
             inviterName: inviterName || caller.name || caller.email || "A family member",
@@ -1319,9 +895,6 @@ async function startServer() {
         }
       }
 
-      saveDB(db);
-      await upsertInviteCodePg(db.inviteCodes[code]);
-
       res.json({
         success: true,
         code,
@@ -1336,13 +909,13 @@ async function startServer() {
         mailtoUrl: emailOutcome?.mailtoUrl
       });
     } catch (e: any) {
-      const status = e?.response?.status === 403 ? 403 : 500;
+      const status = e?.statusCode || (e?.response?.status === 403 ? 403 : 500);
       console.error("[InviteCode] Error:", e?.response?.data || e.message);
       res.status(status).json({ error: e?.response?.data?.error?.message || e.message || "Failed to generate invite code" });
     }
   });
 
-  // Short invite redirect link (e.g. https://uw.up.railway.app/j/K7M4P9 -> /?invite=K7M4P9)
+  // Short invite redirect link (e.g. https://unitywealth.up.railway.app/j/K7M4P9 -> /?invite=K7M4P9)
   app.get("/j/:code", (req, res) => {
     const clean = normalizeInviteCode(req.params.code);
     return res.redirect(302, clean ? `/?invite=${encodeURIComponent(clean)}` : "/");
@@ -1352,16 +925,15 @@ async function startServer() {
   app.get("/api/household/invite-info/:code", async (req, res) => {
     const code = normalizeInviteCode(req.params.code);
     if (!code) return res.status(400).json({ error: "Invite code is required" });
-    const db = getDB();
-    let entry = db.inviteCodes?.[code];
+    let entry = inviteCodesByCode.get(code);
     if (!entry) {
       entry = await getInviteCodePg(code);
-      if (entry) {
-        db.inviteCodes[code] = entry;
-      }
+      if (entry) cacheInviteEntry(entry);
     }
     if (!entry) {
-      return res.status(404).json({ error: "Invalid or expired invite code. Ask your family admin to open Invite and copy the latest code." });
+      return res.status(404).json({
+        error: "Invalid or expired invite code. Ask your family admin to open Invite and copy the latest code."
+      });
     }
     res.json({
       valid: true,
@@ -1372,7 +944,7 @@ async function startServer() {
     });
   });
 
-  // Redeem an Invite Code (or pending email invite) and add the authenticated user to the household
+  // Redeem an Invite Code and add the authenticated user to the household
   app.post("/api/household/redeem-invite", async (req, res) => {
     try {
       const authHeader = req.headers.authorization || "";
@@ -1384,20 +956,20 @@ async function startServer() {
       }
 
       const joiner = await verifyFirebaseIdToken(joinerIdToken);
-      const db = getDB();
       const cleanCode = normalizeInviteCode(rawCode || "");
 
       let entry: any = null;
-      if (cleanCode && db.inviteCodes?.[cleanCode]) {
-        entry = db.inviteCodes[cleanCode];
+      if (cleanCode && inviteCodesByCode.has(cleanCode)) {
+        entry = inviteCodesByCode.get(cleanCode);
       } else if (cleanCode) {
         entry = await getInviteCodePg(cleanCode);
-        if (entry) db.inviteCodes[cleanCode] = entry;
+        if (entry) cacheInviteEntry(entry);
       } else if (requestedHouseholdId) {
-        entry = Object.values(db.inviteCodes || {}).find((e: any) => e.householdId === requestedHouseholdId);
+        const hhCode = inviteCodeByHousehold.get(requestedHouseholdId);
+        entry = hhCode ? inviteCodesByCode.get(hhCode) : null;
         if (!entry) {
           entry = await getInviteByHouseholdPg(requestedHouseholdId);
-          if (entry?.code) db.inviteCodes[entry.code] = entry;
+          if (entry) cacheInviteEntry(entry);
         }
       }
 
@@ -1442,20 +1014,11 @@ async function startServer() {
         );
       }
 
-      // Mark any matching local email invite accepted
-      let dbChanged = false;
-      (db.invites || []).forEach((inv: any) => {
-        if (inv.householdId === entry.householdId && inv.toEmail === joiner.email && inv.status === "pending") {
-          inv.status = "accepted";
-          dbChanged = true;
-        }
-      });
-      if (dbChanged || entry.lastTokenAt) {
-        saveDB(db);
-      }
-
       const resolvedHouseholdName = hhDoc?.fields?.name?.stringValue || entry.householdName || "Family Portfolio";
+      cacheInviteEntry(entry);
       await upsertInviteCodePg(entry);
+      householdAccessCache.delete(`${joiner.uid}:${entry.householdId}`);
+
       await addNotificationPg({
         householdId: entry.householdId,
         userId: joiner.uid,
@@ -1477,23 +1040,6 @@ async function startServer() {
       });
     }
   });
-
-  // Helper to verify caller belongs to a household via Firebase REST
-  async function verifyCallerHouseholdAccess(req: express.Request, householdId: string) {
-    const authHeader = req.headers.authorization || "";
-    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : String(req.body?.idToken || "");
-    if (!idToken) {
-      throw Object.assign(new Error("Missing authorization token"), { statusCode: 401 });
-    }
-    const caller = await verifyFirebaseIdToken(idToken);
-    const hhDoc = await firestoreRestGet(`households/${householdId}`, idToken);
-    const memberValues: any[] = hhDoc?.fields?.members?.arrayValue?.values || [];
-    const memberIds = memberValues.map((v: any) => v.stringValue).filter(Boolean);
-    if (!memberIds.includes(caller.uid)) {
-      throw Object.assign(new Error("Forbidden: not a member of this household"), { statusCode: 403 });
-    }
-    return { caller, hhDoc };
-  }
 
   // --- Wealth History & Monthly Net Worth Tracking (PostgreSQL-backed) ---
   app.get("/api/wealth-history/:householdId", async (req, res) => {
@@ -1534,18 +1080,6 @@ async function startServer() {
     }
   });
 
-  const WEALTH_MILESTONES_INR = [
-    25_00_000,
-    50_00_000,
-    1_00_00_000,
-    1_50_00_000,
-    2_00_00_000,
-    2_50_00_000,
-    5_00_00_000,
-    10_00_00_000,
-    25_00_00_000
-  ];
-
   function formatMilestoneCroreLakh(val: number): string {
     if (val >= 1_00_00_000) return `₹${(val / 1_00_00_000).toFixed(val % 1_00_00_000 === 0 ? 0 : 1)} Cr`;
     return `₹${(val / 1_00_000).toFixed(0)} Lakh`;
@@ -1585,21 +1119,22 @@ async function startServer() {
         ? String(snapshotMonth)
         : defaultMonth;
 
-      const existingHistory = await getWealthHistoryPg(householdId);
-      const previousMax = existingHistory.reduce((m, s) => Math.max(m, s.totalINR), 0);
+      // Single lightweight SQL MAX(total_inr) query instead of fetching full JSONB snapshot history twice
+      const previousMax = await getMaxWealthSnapshotInrPg(householdId, cleanMonth);
+      const rate = Number(fxRate) || FX_FALLBACK_RATE;
 
       const saved = await upsertWealthSnapshotPg({
         householdId,
         snapshotMonth: cleanMonth,
         recordedAt: Date.now(),
         totalINR: Number(totalINR) || 0,
-        totalUSD: Number(totalUSD) || (Number(totalINR) / (Number(fxRate) || 84)),
+        totalUSD: Number(totalUSD) || Number(totalINR) / rate,
         indianEquityINR: Number(indianEquityINR) || 0,
         foreignEquityINR: Number(foreignEquityINR) || 0,
         debtINR: Number(debtINR) || 0,
         realEstateEquityINR: Number(realEstateEquityINR) || 0,
         realEstateLoanINR: Number(realEstateLoanINR) || 0,
-        fxRate: Number(fxRate) || 84,
+        fxRate: rate,
         holdingsCount: Number(holdingsCount) || 0,
         memberBreakdown: Array.isArray(memberBreakdown) ? memberBreakdown : [],
         providerBreakdown: providerBreakdown && typeof providerBreakdown === "object" ? providerBreakdown : {},
@@ -1609,7 +1144,6 @@ async function startServer() {
         note: String(note || "")
       });
 
-      // Check if a new net worth milestone was crossed!
       if (previousMax > 0 && saved.totalINR > previousMax) {
         const newlyCrossed = WEALTH_MILESTONES_INR.filter(
           (ms) => previousMax < ms && saved.totalINR >= ms
@@ -1664,7 +1198,7 @@ async function startServer() {
       }
 
       const { caller } = await verifyCallerHouseholdAccess(req, householdId);
-      const rate = Number(fxRate) > 0 ? Number(fxRate) : 84;
+      const rate = Number(fxRate) > 0 ? Number(fxRate) : FX_FALLBACK_RATE;
       const indEq = Number(indianEquityINR) >= 0 ? Number(indianEquityINR) : Math.round(resolvedTotal * 0.42);
       const forEq = Number(foreignEquityINR) >= 0 ? Number(foreignEquityINR) : Math.round(resolvedTotal * 0.28);
       const debtVal = Number(debtINR) >= 0 ? Number(debtINR) : Math.max(0, resolvedTotal - indEq - forEq);
@@ -1709,13 +1243,13 @@ async function startServer() {
     }
   });
 
-  // --- Real Estate, Installment Ledger & Home Loan Persistence + Sheet Import ---
+  // --- Dedicated PostgreSQL Real Estate Persistence (uw_real_estate) + Sheet Import ---
   app.get("/api/real-estate/:householdId", async (req, res) => {
     try {
       const { householdId } = req.params;
       await verifyCallerHouseholdAccess(req, householdId);
-      const saved = await getAppStateKeyPg<any[]>(`real_estate:${householdId}`);
-      res.json({ properties: Array.isArray(saved) ? saved : [] });
+      const properties = await getRealEstatePg(householdId);
+      res.json({ properties });
     } catch (e: any) {
       const code = e.statusCode || 500;
       res.status(code).json({ error: e.message || "Failed to load real estate records" });
@@ -1727,7 +1261,7 @@ async function startServer() {
       const { householdId } = req.params;
       await verifyCallerHouseholdAccess(req, householdId);
       const properties = Array.isArray(req.body?.properties) ? req.body.properties : [];
-      await setAppStateKeyPg(`real_estate:${householdId}`, properties);
+      await saveRealEstatePg(householdId, properties);
       res.json({ success: true, properties });
     } catch (e: any) {
       const code = e.statusCode || 500;
@@ -1817,206 +1351,34 @@ async function startServer() {
     }
   });
 
-  app.post("/api/household/invite", (req, res) => {
-    const { fromUserId, toEmail, householdId } = req.body;
-    const db = getDB();
-    const inviteId = Date.now().toString();
-    const fromUser = db.users[fromUserId];
-    const household = db.households[householdId];
-
-    db.invites.push({ 
-      id: inviteId,
-      fromUserId, 
-      toEmail: toEmail.toLowerCase(), 
-      householdId, 
-      status: "pending" 
-    });
-    saveDB(db);
-
-    logEmail(
-      toEmail, 
-      "UnityWealth Household Invitation", 
-      `${fromUser?.name || 'A family member'} invited you to join their household '${household?.name}' on UnityWealth.`
-    );
-
-    res.json({ success: true });
-  });
-
-  app.get("/api/invites/:email", (req, res) => {
-    const db = getDB();
-    const email = req.params.email.toLowerCase();
-    const invites = db.invites.filter((i: any) => i.toEmail === email && i.status === "pending");
-    
-    // Map with household name for UI context
-    const enriched = invites.map((inv: any) => ({
-      ...inv,
-      householdName: db.households[inv.householdId]?.name || "Family Group"
-    }));
-    
-    res.json(enriched);
-  });
-
-  app.post("/api/household/join", (req, res) => {
-    const { userId, inviteId } = req.body;
-    const db = getDB();
-    const inviteIdx = db.invites.findIndex((i: any) => i.id === inviteId);
-    if (inviteIdx === -1) return res.status(404).json({ error: "Invite not found" });
-    
-    const invite = db.invites[inviteIdx];
-    db.households[invite.householdId].members.push(userId);
-    db.users[userId].householdId = invite.householdId;
-    db.invites[inviteIdx].status = "accepted";
-    saveDB(db);
-    res.json({ success: true, householdId: invite.householdId });
-  });
-
-  app.delete("/api/household/:householdId/members/:memberId", (req, res) => {
-    const { householdId, memberId } = req.params;
-    const db = getDB();
-    const household = db.households[householdId];
-    if (!household) return res.status(404).json({ error: "Household not found" });
-
-    // Remove from household members
-    household.members = household.members.filter((m: string) => m !== memberId);
-    
-    // Update user record
-    if (db.users[memberId]) {
-      db.users[memberId].householdId = null;
-    }
-
-    // Remove holdings associated with this user and household
-    db.holdings = db.holdings.filter((h: any) => !(h.userId === memberId && h.householdId === householdId));
-
-    saveDB(db);
-    res.json({ success: true });
-  });
-
-  app.post("/api/household/add-member-manual", (req, res) => {
-    const { householdId, name, email } = req.body;
-    const db = getDB();
-    const household = db.households[householdId];
-    if (!household) return res.status(404).json({ error: "Household not found" });
-
-    const id = "u_" + Math.random().toString(36).substr(2, 9);
-    const newUser = { 
-      id, 
-      email: email.toLowerCase(), 
-      password: "password", // default for manual members
-      name, 
-      householdId,
-      isManual: true 
-    };
-    
-    db.users[id] = newUser;
-    household.members.push(id);
-    saveDB(db);
-    res.json(newUser);
-  });
-
-  let amfiCache: any[] = [];
-  let lastAmfiFetch = 0;
-
-  async function getAmfiData() {
-    const now = Date.now();
-    // Cache for 12 hours
-    if (amfiCache.length > 0 && (now - lastAmfiFetch < 12 * 60 * 60 * 1000)) {
-      return amfiCache;
-    }
-
-    try {
-      console.log("Fetching AMFI data...");
-      const response = await axios.get("https://www.amfiindia.com/spages/NAVAll.txt", {
-        timeout: 10000,
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-      });
-      const text = response.data;
-      const lines = text.split(/\r?\n/);
-      const results: any[] = [];
-
-      lines.forEach((line: string) => {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.includes('Open Ended Schemes') || trimmed.includes('Close Ended Schemes')) return;
-
-        const parts = trimmed.includes(';') ? trimmed.split(';') : trimmed.split('|');
-        
-        if (parts.length >= 4) {
-          // Robust heuristic: NAV is typically a numeric value with decimal points, usually after scheme name
-          let navIdx = -1;
-          for (let i = parts.length - 1; i >= 2; i--) {
-            const p = parts[i].trim();
-            if (p && !isNaN(parseFloat(p)) && p.includes('.') && !p.includes('-')) {
-               navIdx = i;
-               break;
-            }
-          }
-
-          if (navIdx !== -1) {
-            // AMFI formats include 6-part (Code;ISIN1;ISIN2;Name;NAV;Date) and
-            // 8-part (Code;ISIN1;ISIN2;SchemeName;Plan;Option;NAV;Date)
-            const isins = parts
-              .slice(1, navIdx)
-              .map(s => s.trim().toUpperCase())
-              .filter(s => /^INF[A-Z0-9]{9}$/.test(s));
-            const nameParts = parts
-              .slice(1, navIdx)
-              .map(s => s.trim())
-              .filter(s => s && s !== '-' && !/^INF[A-Z0-9]{9}$/i.test(s) && !/^[A-Z0-9]{12}$/.test(s));
-            const fullName = nameParts.join(' - ');
-
-            const price = parseFloat(parts[navIdx]);
-            if (!isNaN(price) && fullName) {
-              results.push({
-                symbol: parts[0].trim(),
-                shortname: fullName,
-                isins,
-                currentPrice: price,
-                typeDisp: 'MUTUAL_FUND',
-                exchDisp: 'AMFI',
-                isIndia: true
-              });
-            }
-          }
-        }
-      });
-
-      console.log(`AMFI Parse complete. Found ${results.length} schemes.`);
-      amfiCache = results;
-      lastAmfiFetch = now;
-      return results;
-    } catch (e) {
-      console.error("AMFI Fetch failed:", e);
-      return amfiCache;
-    }
-  }
-
+  // --- Market Data, Bounded Quote & History Caches, and Batched Scanners ---
   const YAHOO_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-    'Accept': 'application/json'
+    "User-Agent":
+      "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    Accept: "application/json"
   };
 
-  const stockQuoteCache = new Map<string, { price: number; ts: number }>();
-  const QUOTE_CACHE_TTL_MS = 60 * 1000;
+  const stockQuoteCache = new LRUCache<string, number>(2500, 60 * 1000);
+  const assetHistoryCache = new LRUCache<string, any>(500, 6 * 60 * 60 * 1000);
 
   function toYahooSymbol(raw: string): string {
-    let sym = raw.trim().toUpperCase();
-    if (sym.includes(':')) {
-      const [exch, ticker] = sym.split(':');
-      if (exch === 'NSE') return `${ticker}.NS`;
-      if (exch === 'BSE') return `${ticker}.BO`;
+    const sym = raw.trim().toUpperCase();
+    if (sym.includes(":")) {
+      const [exch, ticker] = sym.split(":");
+      if (exch === "NSE") return `${ticker}.NS`;
+      if (exch === "BSE") return `${ticker}.BO`;
       return ticker;
     }
-    if (sym.endsWith('.NSE')) return sym.replace(/\.NSE$/, '.NS');
-    if (sym.endsWith('.BSE')) return sym.replace(/\.BSE$/, '.BO');
-    if (sym.endsWith('.US')) return sym.replace(/\.US$/, '');
-    if (sym === 'BTC' || sym === 'BITCOIN') return 'BTC-USD';
-    if (sym === 'ETH' || sym === 'ETHEREUM') return 'ETH-USD';
+    if (sym.endsWith(".NSE")) return sym.replace(/\.NSE$/, ".NS");
+    if (sym.endsWith(".BSE")) return sym.replace(/\.BSE$/, ".BO");
+    if (sym.endsWith(".US")) return sym.replace(/\.US$/, "");
+    if (sym === "BTC" || sym === "BITCOIN") return "BTC-USD";
+    if (sym === "ETH" || sym === "ETHEREUM") return "ETH-USD";
     return sym;
   }
 
   async function fetchYahooChartPrice(yahooSym: string): Promise<number | null> {
-    const hosts = ['query1.finance.yahoo.com', 'query2.finance.yahoo.com'];
+    const hosts = ["query1.finance.yahoo.com", "query2.finance.yahoo.com"];
     for (const host of hosts) {
       try {
         const res = await axios.get(
@@ -2024,7 +1386,7 @@ async function startServer() {
           { timeout: 6000, headers: YAHOO_HEADERS }
         );
         const price = res.data?.chart?.result?.[0]?.meta?.regularMarketPrice;
-        if (typeof price === 'number' && price > 0) {
+        if (typeof price === "number" && price > 0) {
           return price;
         }
       } catch {
@@ -2037,24 +1399,24 @@ async function startServer() {
   async function fetchYahooPriceForSymbol(symbol: string): Promise<number | null> {
     const yahooSym = toYahooSymbol(symbol);
     let price = await fetchYahooChartPrice(yahooSym);
-    if (!price && yahooSym.endsWith('.NS')) {
-      price = await fetchYahooChartPrice(yahooSym.replace(/\.NS$/, '.BO'));
+    if (!price && yahooSym.endsWith(".NS")) {
+      price = await fetchYahooChartPrice(yahooSym.replace(/\.NS$/, ".BO"));
     }
     return price;
   }
 
   function toTradingViewIndiaTicker(raw: string): { primary: string; fallback?: string } {
-    let sym = raw.trim().toUpperCase();
-    if (sym.includes(':')) {
-      const [exch, ticker] = sym.split(':');
-      if (exch === 'BSE') return { primary: `BSE:${ticker}`, fallback: `NSE:${ticker}` };
+    const sym = raw.trim().toUpperCase();
+    if (sym.includes(":")) {
+      const [exch, ticker] = sym.split(":");
+      if (exch === "BSE") return { primary: `BSE:${ticker}`, fallback: `NSE:${ticker}` };
       return { primary: `NSE:${ticker}`, fallback: `BSE:${ticker}` };
     }
-    if (sym.endsWith('.BO') || sym.endsWith('.BSE')) {
-      const base = sym.replace(/\.(BO|BSE)$/, '');
+    if (sym.endsWith(".BO") || sym.endsWith(".BSE")) {
+      const base = sym.replace(/\.(BO|BSE)$/, "");
       return { primary: `BSE:${base}`, fallback: `NSE:${base}` };
     }
-    const base = sym.replace(/\.(NS|NSE)$/, '');
+    const base = sym.replace(/\.(NS|NSE)$/, "");
     return { primary: `NSE:${base}`, fallback: `BSE:${base}` };
   }
 
@@ -2073,17 +1435,17 @@ async function startServer() {
 
     try {
       const res = await axios.post(
-        'https://scanner.tradingview.com/india/scan',
+        "https://scanner.tradingview.com/india/scan",
         {
           symbols: { tickers: Array.from(tickerSet) },
-          columns: ['close']
+          columns: ["close"]
         },
-        { timeout: 6000, headers: { 'Content-Type': 'application/json', 'User-Agent': YAHOO_HEADERS['User-Agent'] } }
+        { timeout: 6000, headers: { "Content-Type": "application/json", "User-Agent": YAHOO_HEADERS["User-Agent"] } }
       );
       const tvPrices = new Map<string, number>();
       for (const item of res.data?.data || []) {
         const price = item?.d?.[0];
-        if (item?.s && typeof price === 'number' && price > 0) {
+        if (item?.s && typeof price === "number" && price > 0) {
           tvPrices.set(String(item.s).toUpperCase(), price);
         }
       }
@@ -2093,57 +1455,83 @@ async function startServer() {
         if (p) out[sym] = p;
       }
     } catch (e: any) {
-      console.warn('[TradingView India] Quote batch failed:', e.message);
+      console.warn("[TradingView India] Quote batch failed:", e.message);
     }
     return out;
   }
 
-  async function fetchTradingViewUSPrice(symbol: string): Promise<number | null> {
-    const clean = symbol.trim().toUpperCase().replace(/\.US$/, '');
+  // Batched US TradingView quote lookup: 1 POST for all symbols instead of N serial POSTs
+  async function fetchTradingViewUSPricesBatch(symbols: string[]): Promise<Record<string, number>> {
+    const out: Record<string, number> = {};
+    if (symbols.length === 0) return out;
+
+    const exchanges = ["NASDAQ", "NYSE", "AMEX", "CBOE", "OTC"];
+    const tickerSet = new Set<string>();
+    const cleanBySymbol = new Map<string, string>();
+
+    for (const sym of symbols) {
+      const clean = sym.trim().toUpperCase().replace(/\.US$/, "");
+      cleanBySymbol.set(sym, clean);
+      for (const ex of exchanges) {
+        tickerSet.add(`${ex}:${clean}`);
+      }
+    }
+
     try {
       const res = await axios.post(
-        'https://scanner.tradingview.com/america/scan',
+        "https://scanner.tradingview.com/america/scan",
         {
-          symbols: { tickers: [`NASDAQ:${clean}`, `NYSE:${clean}`, `AMEX:${clean}`, `CBOE:${clean}`, `OTC:${clean}`] },
-          columns: ['close']
+          symbols: { tickers: Array.from(tickerSet) },
+          columns: ["close"]
         },
-        { timeout: 5000, headers: { 'Content-Type': 'application/json', 'User-Agent': YAHOO_HEADERS['User-Agent'] } }
+        { timeout: 6000, headers: { "Content-Type": "application/json", "User-Agent": YAHOO_HEADERS["User-Agent"] } }
       );
+      const tvPrices = new Map<string, number>();
       for (const item of res.data?.data || []) {
         const price = item?.d?.[0];
-        if (typeof price === 'number' && price > 0) return price;
+        if (item?.s && typeof price === "number" && price > 0) {
+          tvPrices.set(String(item.s).toUpperCase(), price);
+        }
       }
-    } catch {
-      // ignore
+      for (const sym of symbols) {
+        const clean = cleanBySymbol.get(sym)!;
+        for (const ex of exchanges) {
+          const p = tvPrices.get(`${ex}:${clean}`);
+          if (p) {
+            out[sym] = p;
+            break;
+          }
+        }
+      }
+    } catch (e: any) {
+      console.warn("[TradingView US] Quote batch failed:", e.message);
     }
-    return null;
+    return out;
   }
 
   async function fetchLiveStockPrices(symbols: string[]) {
     if (symbols.length === 0) return {};
 
-    const now = Date.now();
     const priceMap: Record<string, number> = {};
     const uncached: string[] = [];
 
     for (const sym of symbols) {
-      const cached = stockQuoteCache.get(sym.toUpperCase());
-      if (cached && now - cached.ts < QUOTE_CACHE_TTL_MS) {
-        priceMap[sym] = cached.price;
+      const cachedPrice = stockQuoteCache.get(sym.toUpperCase());
+      if (cachedPrice && cachedPrice > 0) {
+        priceMap[sym] = cachedPrice;
       } else {
         uncached.push(sym);
       }
     }
 
     if (uncached.length > 0) {
-      // Check shared PostgreSQL quote cache so hundreds of concurrent users reuse fresh quotes
       const pgQuotes = await getCachedQuotesPg(uncached, 3 * 60 * 1000);
       for (let i = uncached.length - 1; i >= 0; i--) {
         const sym = uncached[i];
         const hit = pgQuotes[sym.toUpperCase()];
         if (hit && hit.price > 0) {
           priceMap[sym] = hit.price;
-          stockQuoteCache.set(sym.toUpperCase(), { price: hit.price, ts: hit.updatedAt });
+          stockQuoteCache.set(sym.toUpperCase(), hit.price);
           uncached.splice(i, 1);
         }
       }
@@ -2156,87 +1544,108 @@ async function startServer() {
 
     const isIndiaSymbol = (s: string) => {
       const u = s.toUpperCase();
-      return u.endsWith('.NS') || u.endsWith('.BO') || u.endsWith('.NSE') || u.endsWith('.BSE') || u.includes(':NSE') || u.includes(':BSE') || u.startsWith('NSE:') || u.startsWith('BSE:');
+      return (
+        u.endsWith(".NS") ||
+        u.endsWith(".BO") ||
+        u.endsWith(".NSE") ||
+        u.endsWith(".BSE") ||
+        u.includes(":NSE") ||
+        u.includes(":BSE") ||
+        u.startsWith("NSE:") ||
+        u.startsWith("BSE:")
+      );
     };
 
     const indiaStocks = uncached.filter(isIndiaSymbol);
-    const potentialUS = uncached.filter(s => !isIndiaSymbol(s));
+    const potentialUS = uncached.filter((s) => !isIndiaSymbol(s));
 
-    console.log(`[fetchLiveStockPrices] Symbols: ${uncached.join(', ')}. Finnhub: ${FINNHUB_KEY ? 'Present' : 'MISSING'}. TV-India: Active.`);
-
-    // --- Task A: TradingView India batch quote for NSE/BSE (.NS / .BO), with Yahoo/AV fallback ---
     const indiaTask = (async () => {
       if (indiaStocks.length === 0) return;
       const tvResults = await fetchTradingViewIndiaPrices(indiaStocks);
       for (const [sym, price] of Object.entries(tvResults)) {
         priceMap[sym] = price;
-        stockQuoteCache.set(sym.toUpperCase(), { price, ts: Date.now() });
+        stockQuoteCache.set(sym.toUpperCase(), price);
       }
 
-      const missingIndia = indiaStocks.filter(s => !priceMap[s]);
-      await Promise.all(missingIndia.map(async (symbol) => {
+      const missingIndia = indiaStocks.filter((s) => !priceMap[s]);
+      await mapWithConcurrency(missingIndia, 6, async (symbol) => {
         const yPrice = await fetchYahooPriceForSymbol(symbol);
         if (yPrice) {
           priceMap[symbol] = yPrice;
-          stockQuoteCache.set(symbol.toUpperCase(), { price: yPrice, ts: Date.now() });
+          stockQuoteCache.set(symbol.toUpperCase(), yPrice);
           return;
         }
         if (AV_KEY) {
           try {
-            const avSym = toYahooSymbol(symbol).replace(/\.NS$/, '.BSE').replace(/\.BO$/, '.BSE');
-            const res = await axios.get(`https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(avSym)}&apikey=${AV_KEY}`, { timeout: 6000 });
+            const avSym = toYahooSymbol(symbol).replace(/\.NS$/, ".BSE").replace(/\.BO$/, ".BSE");
+            const res = await axios.get(
+              `https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol=${encodeURIComponent(avSym)}&apikey=${AV_KEY}`,
+              { timeout: 6000 }
+            );
             const priceStr = res.data?.["Global Quote"]?.["05. price"];
             if (priceStr && parseFloat(priceStr) > 0) {
               const p = parseFloat(priceStr);
               priceMap[symbol] = p;
-              stockQuoteCache.set(symbol.toUpperCase(), { price: p, ts: Date.now() });
+              stockQuoteCache.set(symbol.toUpperCase(), p);
             }
           } catch (e: any) {
             console.warn(`[AlphaVantage] Fallback failed for ${symbol}: ${e.message}`);
           }
         }
-      }));
+      });
     })();
 
-    // --- Task B: Finnhub primary for US Stocks & Crypto, with TradingView US + India fallback ---
     const usTask = (async () => {
-      await Promise.all(potentialUS.map(async (symbol) => {
-        if (FINNHUB_KEY) {
-          try {
-            let sym = symbol.toUpperCase().replace(/\.US$/, '');
-            if (sym === 'BTC' || sym === 'BITCOIN') sym = 'BINANCE:BTCUSDT';
-            else if (sym === 'ETH' || sym === 'ETHEREUM') sym = 'BINANCE:ETHUSDT';
+      if (potentialUS.length === 0) return;
 
-            const res = await axios.get(`https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(sym)}&token=${FINNHUB_KEY}`, {
-              timeout: 5000,
-              headers: { 'User-Agent': 'Mozilla/5.0' }
-            });
+      if (FINNHUB_KEY) {
+        await mapWithConcurrency(potentialUS, 8, async (symbol) => {
+          try {
+            let sym = symbol.toUpperCase().replace(/\.US$/, "");
+            if (sym === "BTC" || sym === "BITCOIN") sym = "BINANCE:BTCUSDT";
+            else if (sym === "ETH" || sym === "ETHEREUM") sym = "BINANCE:ETHUSDT";
+
+            const res = await axios.get(
+              `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(sym)}&token=${FINNHUB_KEY}`,
+              { timeout: 5000, headers: { "User-Agent": "Mozilla/5.0" } }
+            );
             if (res.data?.c && res.data.c > 0) {
               priceMap[symbol] = res.data.c;
-              stockQuoteCache.set(symbol.toUpperCase(), { price: res.data.c, ts: Date.now() });
-              return;
+              stockQuoteCache.set(symbol.toUpperCase(), res.data.c);
             }
           } catch (e: any) {
             console.warn(`[Finnhub] Failed for ${symbol}: ${e.message}`);
           }
+        });
+      }
+
+      // Single batched TradingView America scan for all remaining US tickers
+      const missingUS = potentialUS.filter((s) => !priceMap[s]);
+      if (missingUS.length > 0) {
+        const tvUsMap = await fetchTradingViewUSPricesBatch(missingUS);
+        for (const [sym, price] of Object.entries(tvUsMap)) {
+          priceMap[sym] = price;
+          stockQuoteCache.set(sym.toUpperCase(), price);
         }
-        const tvUsPrice = await fetchTradingViewUSPrice(symbol);
-        if (tvUsPrice) {
-          priceMap[symbol] = tvUsPrice;
-          stockQuoteCache.set(symbol.toUpperCase(), { price: tvUsPrice, ts: Date.now() });
-          return;
+      }
+
+      // Final India NSE fallback for bare Indian symbols without .NS suffix
+      const stillMissing = potentialUS.filter((s) => !priceMap[s]);
+      if (stillMissing.length > 0) {
+        const nsSymbols = stillMissing.map((s) => `${s}.NS`);
+        const tvIn = await fetchTradingViewIndiaPrices(nsSymbols);
+        for (const sym of stillMissing) {
+          const p = tvIn[`${sym}.NS`];
+          if (p) {
+            priceMap[sym] = p;
+            stockQuoteCache.set(sym.toUpperCase(), p);
+          }
         }
-        const tvIn = await fetchTradingViewIndiaPrices([`${symbol}.NS`]);
-        if (tvIn[`${symbol}.NS`]) {
-          priceMap[symbol] = tvIn[`${symbol}.NS`];
-          stockQuoteCache.set(symbol.toUpperCase(), { price: tvIn[`${symbol}.NS`], ts: Date.now() });
-        }
-      }));
+      }
     })();
 
     await Promise.all([indiaTask, usTask]);
 
-    // Persist newly fetched quotes into shared PostgreSQL cache asynchronously
     const newlyFetched = uncached
       .filter((sym) => priceMap[sym] && priceMap[sym] > 0)
       .map((sym) => ({
@@ -2249,11 +1658,10 @@ async function startServer() {
       upsertCachedQuotesPg(newlyFetched).catch(() => {});
     }
 
-    console.log(`Live Stock Fetch: Found ${Object.keys(priceMap).length} of ${symbols.length} symbols.`);
     return priceMap;
   }
 
-  // Live Global Market Benchmarks (Nifty 50, S&P 500, NASDAQ 100, Gold, USD/INR) cached for multi-user scale
+  // Live Global Market Benchmarks cached for multi-user scale
   let benchmarkCache: { data: any[]; ts: number } | null = null;
   app.get("/api/market/benchmarks", async (req, res) => {
     const now = Date.now();
@@ -2262,7 +1670,7 @@ async function startServer() {
     }
 
     try {
-      const [tvIndia, tvGlobal, fxRes] = await Promise.all([
+      const [tvIndia, tvGlobal, usdInr] = await Promise.all([
         axios
           .post(
             "https://scanner.tradingview.com/india/scan",
@@ -2283,7 +1691,7 @@ async function startServer() {
             { timeout: 5000, headers: { "Content-Type": "application/json", "User-Agent": YAHOO_HEADERS["User-Agent"] } }
           )
           .catch(() => ({ data: { data: [] } })),
-        axios.get("https://open.er-api.com/v6/latest/USD", { timeout: 5000 }).catch(() => ({ data: { rates: { INR: 84.0 } } }))
+        getUsdInrRate()
       ]);
 
       const tvMap = new Map<string, { price: number; changePct: number }>();
@@ -2301,7 +1709,6 @@ async function startServer() {
       const spy = tvMap.get("AMEX:SPY");
       const qqq = tvMap.get("NASDAQ:QQQ");
       const gld = tvMap.get("AMEX:GLD");
-      const usdInr = Number(fxRes.data?.rates?.INR) || 84.0;
 
       const benchmarks = [
         nifty ? { id: "nifty50", label: "NIFTY 50", value: nifty.price, changePct: nifty.changePct, prefix: "" } : null,
@@ -2314,7 +1721,7 @@ async function startServer() {
 
       benchmarkCache = { data: benchmarks, ts: now };
       res.json({ benchmarks, cachedAt: now });
-    } catch (e: any) {
+    } catch {
       res.json({ benchmarks: benchmarkCache?.data || [], cachedAt: now });
     }
   });
@@ -2322,40 +1729,23 @@ async function startServer() {
   app.get("/api/mf/search", async (req, res) => {
     const { q } = req.query;
     if (!q) return res.json([]);
-    const query = (q as string).toLowerCase().trim();
-    const tokens = query.split(/\s+/).filter(Boolean);
-
-    const data = await getAmfiData();
-    const filtered = data
-      .filter(item => {
-        if (item.symbol && item.symbol.toLowerCase().includes(query)) return true;
-        if (!item.shortname) return false;
-        const nameLower = item.shortname.toLowerCase();
-        return tokens.every(tok => nameLower.includes(tok));
-      })
-      .sort((a, b) => {
-        const aDirectGrowth = a.shortname.includes('Direct') && a.shortname.includes('Growth') ? 0 : 1;
-        const bDirectGrowth = b.shortname.includes('Direct') && b.shortname.includes('Growth') ? 0 : 1;
-        return aDirectGrowth - bDirectGrowth;
-      })
-      .slice(0, 15);
-
-    console.log(`MF Search for "${query}" found ${filtered.length} results.`);
+    const amfiIndex = await getAmfiIndex();
+    const filtered = searchAmfiIndex(amfiIndex, String(q), 15);
     res.json(filtered);
   });
 
   app.get("/api/tickers/search", async (req, res) => {
     const { q } = req.query;
     if (!q) return res.json([]);
-    
+
     try {
       const rawQuery = String(q).trim();
       const wantsEtf = /\b(etf|etfs|etp|etn)\b/i.test(rawQuery);
       const strippedQuery = rawQuery
-        .replace(/^(NSE|BSE|NASDAQ|NYSE|AMEX|CBOE):/i, '')
-        .replace(/\.(NS|BO|NSE|BSE|US)$/i, '')
-        .replace(/\b(etf|etfs|etp|etn|stock|stocks|share|shares)\b/gi, ' ')
-        .replace(/\s+/g, ' ')
+        .replace(/^(NSE|BSE|NASDAQ|NYSE|AMEX|CBOE):/i, "")
+        .replace(/\.(NS|BO|NSE|BSE|US)$/i, "")
+        .replace(/\b(etf|etfs|etp|etn|stock|stocks|share|shares)\b/gi, " ")
+        .replace(/\s+/g, " ")
         .trim();
       const coreQuery = strippedQuery || rawQuery;
       const queryTokens = coreQuery.split(/\s+/).filter(Boolean).slice(0, 3);
@@ -2364,45 +1754,44 @@ async function startServer() {
       const results: any[] = [];
       const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
 
-      // Run TradingView US (NASDAQ/NYSE/AMEX/CBOE incl. ETFs like DRAM) + TradingView India (NSE/BSE) + Finnhub in parallel
       const [usTvQuotes, indiaQuotes, finnhubQuotes] = await Promise.all([
         (async () => {
           if (queryTokens.length === 0) return [];
           try {
             const tvUsRes = await axios.post(
-              'https://scanner.tradingview.com/america/scan',
+              "https://scanner.tradingview.com/america/scan",
               {
                 filter: queryTokens.map((tok) => ({
-                  left: 'name,description',
-                  operation: 'match',
+                  left: "name,description",
+                  operation: "match",
                   right: tok
                 })),
-                options: { lang: 'en' },
-                markets: ['america'],
-                columns: ['name', 'description', 'close', 'currency', 'exchange', 'type', 'subtype'],
-                sort: { sortBy: 'market_cap_basic', sortOrder: 'desc' },
+                options: { lang: "en" },
+                markets: ["america"],
+                columns: ["name", "description", "close", "currency", "exchange", "type", "subtype"],
+                sort: { sortBy: "market_cap_basic", sortOrder: "desc" },
                 range: [0, 12]
               },
-              { timeout: 6000, headers: { 'Content-Type': 'application/json', 'User-Agent': YAHOO_HEADERS['User-Agent'] } }
+              { timeout: 6000, headers: { "Content-Type": "application/json", "User-Agent": YAHOO_HEADERS["User-Agent"] } }
             );
             return (tvUsRes.data?.data || [])
               .filter((item: any) => {
-                const sym = String(item?.d?.[0] || '');
-                return sym && !sym.includes('/') && !sym.includes('.');
+                const sym = String(item?.d?.[0] || "");
+                return sym && !sym.includes("/") && !sym.includes(".");
               })
               .map((item: any) => {
                 const [ticker, desc, close, , exch, assetType, subType] = item.d || [];
-                const price = typeof close === 'number' && close > 0 ? close : 0;
+                const price = typeof close === "number" && close > 0 ? close : 0;
                 const sym = String(ticker).toUpperCase();
-                const isFund = assetType === 'fund' || String(subType || '').toLowerCase().includes('etf');
+                const isFund = assetType === "fund" || String(subType || "").toLowerCase().includes("etf");
                 if (price > 0) {
-                  stockQuoteCache.set(sym, { price, ts: Date.now() });
+                  stockQuoteCache.set(sym, price);
                 }
                 return {
                   symbol: sym,
                   shortname: desc || sym,
-                  exchDisp: exch || 'US',
-                  typeDisp: isFund ? 'ETF' : 'EQUITY',
+                  exchDisp: exch || "US",
+                  typeDisp: isFund ? "ETF" : "EQUITY",
                   currentPrice: price,
                   isIndia: false
                 };
@@ -2416,34 +1805,34 @@ async function startServer() {
           if (queryTokens.length === 0) return [];
           try {
             const tvRes = await axios.post(
-              'https://scanner.tradingview.com/india/scan',
+              "https://scanner.tradingview.com/india/scan",
               {
                 filter: queryTokens.map((tok) => ({
-                  left: 'name,description',
-                  operation: 'match',
+                  left: "name,description",
+                  operation: "match",
                   right: tok
                 })),
-                options: { lang: 'en' },
-                markets: ['india'],
-                columns: ['name', 'description', 'close', 'currency', 'exchange', 'type'],
-                sort: { sortBy: 'market_cap_basic', sortOrder: 'desc' },
+                options: { lang: "en" },
+                markets: ["india"],
+                columns: ["name", "description", "close", "currency", "exchange", "type"],
+                sort: { sortBy: "market_cap_basic", sortOrder: "desc" },
                 range: [0, 8]
               },
-              { timeout: 6000, headers: { 'Content-Type': 'application/json', 'User-Agent': YAHOO_HEADERS['User-Agent'] } }
+              { timeout: 6000, headers: { "Content-Type": "application/json", "User-Agent": YAHOO_HEADERS["User-Agent"] } }
             );
             return (tvRes.data?.data || []).map((item: any) => {
               const [ticker, desc, close, , exch, assetType] = item.d || [];
-              const suffix = exch === 'BSE' ? '.BO' : '.NS';
+              const suffix = exch === "BSE" ? ".BO" : ".NS";
               const sym = `${ticker}${suffix}`;
-              const price = typeof close === 'number' && close > 0 ? close : 0;
+              const price = typeof close === "number" && close > 0 ? close : 0;
               if (price > 0) {
-                stockQuoteCache.set(sym.toUpperCase(), { price, ts: Date.now() });
+                stockQuoteCache.set(sym.toUpperCase(), price);
               }
               return {
                 symbol: sym,
                 shortname: desc || ticker,
-                exchDisp: exch || 'NSE',
-                typeDisp: assetType === 'fund' ? 'ETF' : 'EQUITY',
+                exchDisp: exch || "NSE",
+                typeDisp: assetType === "fund" ? "ETF" : "EQUITY",
                 currentPrice: price,
                 isIndia: true
               };
@@ -2461,18 +1850,20 @@ async function startServer() {
               { timeout: 5000 }
             );
             return (fRes.data?.result || [])
-              .filter((quote: any) => ['Common Stock', 'ETF', 'ETP', 'REIT', 'ADR'].includes(quote.type) && !quote.symbol.includes('.'))
+              .filter(
+                (quote: any) =>
+                  ["Common Stock", "ETF", "ETP", "REIT", "ADR"].includes(quote.type) && !quote.symbol.includes(".")
+              )
               .slice(0, 8)
               .map((quote: any) => ({
                 symbol: toYahooSymbol(quote.symbol),
                 shortname: quote.description,
-                exchDisp: 'US',
-                typeDisp: quote.type === 'ETP' || quote.type === 'ETF' ? 'ETF' : quote.type,
+                exchDisp: "US",
+                typeDisp: quote.type === "ETP" || quote.type === "ETF" ? "ETF" : quote.type,
                 currentPrice: 0,
                 isIndia: false
               }));
           } catch {
-            console.warn("Finnhub search failed");
             return [];
           }
         })()
@@ -2480,27 +1871,26 @@ async function startServer() {
 
       results.push(...usTvQuotes, ...indiaQuotes, ...finnhubQuotes);
 
-      // De-duplicate by symbol and rank exact/prefix/ETF/word-boundary matches first
       const seen = new Set<string>();
       const deduped = results.filter((item) => {
-        const key = String(item.symbol || '').toUpperCase();
+        const key = String(item.symbol || "").toUpperCase();
         if (!key || seen.has(key)) return false;
         seen.add(key);
         return true;
       });
 
-      const escapedWord = coreQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-      const wordBoundaryRe = escapedWord ? new RegExp(`\\b${escapedWord}\\b`, 'i') : null;
+      const escapedWord = coreQuery.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const wordBoundaryRe = escapedWord ? new RegExp(`\\b${escapedWord}\\b`, "i") : null;
 
       deduped.sort((a, b) => {
         const score = (item: any) => {
-          const baseSym = String(item.symbol || '').toUpperCase().replace(/\.(NS|BO)$/, '');
-          const desc = String(item.shortname || '');
+          const baseSym = String(item.symbol || "").toUpperCase().replace(/\.(NS|BO)$/, "");
+          const desc = String(item.shortname || "");
           let s = 0;
           if (baseSym === upperCore) s += 200;
           else if (baseSym.startsWith(upperCore)) s += 80;
           if (wordBoundaryRe && (wordBoundaryRe.test(baseSym) || wordBoundaryRe.test(desc))) s += 45;
-          if (wantsEtf && item.typeDisp === 'ETF') s += 60;
+          if (wantsEtf && item.typeDisp === "ETF") s += 60;
           if (item.currentPrice > 0) s += 10;
           return s;
         };
@@ -2508,8 +1898,6 @@ async function startServer() {
       });
 
       const uniqueResults = deduped.slice(0, 12);
-
-      // Fetch prices for any search results that didn't already include a price (e.g. Finnhub US hits)
       const missingPriceSymbols = uniqueResults.filter((r: any) => !r.currentPrice).map((r: any) => r.symbol);
       if (missingPriceSymbols.length > 0) {
         try {
@@ -2532,11 +1920,10 @@ async function startServer() {
   app.get("/api/quote/:symbol", async (req, res) => {
     const { symbol } = req.params;
     try {
-      // Check AMFI first in case symbol is an AMFI scheme code
-      const mfData = await getAmfiData();
-      const mf = mfData.find(m => m.symbol === symbol);
+      const amfiIndex = await getAmfiIndex();
+      const mf = amfiIndex.byCode.get(String(symbol).trim());
       if (mf) {
-        return res.json({ symbol, price: mf.currentPrice, provider: 'AMFI' });
+        return res.json({ symbol, price: mf.currentPrice, provider: "AMFI" });
       }
 
       const priceMap = await fetchLiveStockPrices([symbol]);
@@ -2545,64 +1932,10 @@ async function startServer() {
       } else {
         res.status(404).json({ error: "Price not found" });
       }
-    } catch (e) {
+    } catch {
       res.status(500).json({ error: "Failed to fetch price" });
     }
   });
-
-  function findAmfiMatch(mfData: any[], holding: any) {
-    const ticker = String(holding.ticker || '').trim();
-    const orig = String(holding.originalName || '').trim();
-    const explicitIsin = String(holding.isin || '').trim().toUpperCase();
-    const embeddedIsinMatch = `${explicitIsin} ${orig} ${ticker}`.match(/\b(INF[A-Z0-9]{9})\b/i);
-    if (embeddedIsinMatch) {
-      const targetIsin = embeddedIsinMatch[1].toUpperCase();
-      const byIsin = mfData.find(m => Array.isArray(m.isins) && m.isins.includes(targetIsin));
-      if (byIsin) return byIsin;
-    }
-
-    const exact = mfData.find(m => m.symbol === ticker || (orig && m.shortname === orig) || (ticker && m.shortname === ticker));
-    if (exact) return exact;
-
-    const rawName = orig || ticker;
-    const cleanedTarget = rawName
-      .replace(/,?\s*ISIN\s*:.*$/i, '')
-      .replace(/\(formerly[^)]*\)/gi, '')
-      .replace(/\(erstwhile[^)]*\)/gi, '')
-      .replace(/^[A-Z0-9]{3,10}\s*[-–—]\s*/i, '')
-      .toLowerCase();
-    const wantsDirect = /\bdirect\b/.test(cleanedTarget);
-    const wantsIdcw = /\b(idcw|dividend|payout|reinvestment)\b/.test(cleanedTarget);
-    const stopWords = new Set(['fund', 'scheme', 'plan', 'option', 'direct', 'regular', 'growth', 'idcw', 'dividend', 'payout', 'reinvestment', 'india', 'mutual', 'open', 'ended', 'equity', 'g', 'd']);
-    const coreTokens = cleanedTarget
-      .replace(/[^a-z0-9 ]/g, ' ')
-      .split(/\s+/)
-      .filter(t => t.length >= 2 && !stopWords.has(t));
-
-    if (coreTokens.length < 2) return null;
-
-    const candidates = mfData.filter(m => {
-      const mLower = String(m.shortname || '').toLowerCase();
-      return coreTokens.every(tok => mLower.includes(tok));
-    });
-    if (candidates.length === 0) return null;
-
-    candidates.sort((a, b) => {
-      const aL = String(a.shortname || '').toLowerCase();
-      const bL = String(b.shortname || '').toLowerCase();
-      const aPlanScore = (wantsDirect ? aL.includes('direct') : !aL.includes('direct')) ? 0 : 1;
-      const bPlanScore = (wantsDirect ? bL.includes('direct') : !bL.includes('direct')) ? 0 : 1;
-      if (aPlanScore !== bPlanScore) return aPlanScore - bPlanScore;
-      const aOptScore = (wantsIdcw ? (aL.includes('idcw') || aL.includes('dividend')) : aL.includes('growth')) ? 0 : 1;
-      const bOptScore = (wantsIdcw ? (bL.includes('idcw') || bL.includes('dividend')) : bL.includes('growth')) ? 0 : 1;
-      if (aOptScore !== bOptScore) return aOptScore - bOptScore;
-      return aL.length - bL.length;
-    });
-    return candidates[0];
-  }
-
-  const assetHistoryCache = new Map<string, { ts: number; payload: any }>();
-  const ASSET_HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
 
   function formatShortHistoryLabel(isoDate: string, rangeKey: string): string {
     const [y, m, d] = isoDate.split("-");
@@ -2633,22 +1966,23 @@ async function startServer() {
     const rangeKey = (["6M", "1Y", "3Y", "ALL"].includes(rangeRaw) ? rangeRaw : "1Y") as "6M" | "1Y" | "3Y" | "ALL";
     const cacheKey = `${rawSymbol.toUpperCase()}|${rawName.toLowerCase().slice(0, 40)}|${rangeKey}`;
 
-    const cached = assetHistoryCache.get(cacheKey);
-    if (cached && Date.now() - cached.ts < ASSET_HISTORY_TTL_MS) {
-      return res.json(cached.payload);
+    const cachedPayload = assetHistoryCache.get(cacheKey);
+    if (cachedPayload) {
+      return res.json(cachedPayload);
     }
 
     const windowDays = rangeKey === "6M" ? 185 : rangeKey === "1Y" ? 366 : rangeKey === "3Y" ? 1096 : 1826;
     const minTsMs = Date.now() - windowDays * 24 * 60 * 60 * 1000;
 
     try {
-      // 1. Check if this is an Indian Mutual Fund (AMFI scheme code or ISIN/name match)
       let schemeCode = /^\d{5,6}$/.test(rawSymbol) ? rawSymbol : "";
       if (!schemeCode && (rawName || rawSymbol)) {
-        const isExplicitStock = /\.(NS|BO|NSE|BSE|US)$/i.test(rawSymbol) || (/^[A-Z]{1,5}$/.test(rawSymbol) && !rawName.toLowerCase().includes("fund"));
+        const isExplicitStock =
+          /\.(NS|BO|NSE|BSE|US)$/i.test(rawSymbol) ||
+          (/^[A-Z]{1,5}$/.test(rawSymbol) && !rawName.toLowerCase().includes("fund"));
         if (!isExplicitStock) {
-          const mfData = await getAmfiData();
-          const mf = findAmfiMatch(mfData, { ticker: rawSymbol, originalName: rawName });
+          const amfiIndex = await getAmfiIndex();
+          const mf = findAmfiMatchIndexed(amfiIndex, { ticker: rawSymbol, originalName: rawName });
           if (mf?.symbol && /^\d{5,6}$/.test(String(mf.symbol))) {
             schemeCode = String(mf.symbol);
           }
@@ -2691,7 +2025,7 @@ async function startServer() {
               changePct: first > 0 ? Number((((last - first) / first) * 100).toFixed(2)) : 0,
               points: sampled
             };
-            assetHistoryCache.set(cacheKey, { ts: Date.now(), payload });
+            assetHistoryCache.set(cacheKey, payload);
             return res.json(payload);
           }
         } catch (mfErr: any) {
@@ -2699,7 +2033,6 @@ async function startServer() {
         }
       }
 
-      // 2. Stock / ETF History via Yahoo Finance v8 chart (query1 + query2, plus .BO fallback for .NS)
       const yahooPrimary = toYahooSymbol(rawSymbol);
       const yRange = rangeKey === "6M" ? "6mo" : rangeKey === "1Y" ? "1y" : rangeKey === "3Y" ? "3y" : "5y";
       const yInterval = rangeKey === "6M" || rangeKey === "1Y" ? "1wk" : "1mo";
@@ -2742,7 +2075,7 @@ async function startServer() {
                 changePct: first > 0 ? Number((((last - first) / first) * 100).toFixed(2)) : 0,
                 points: sampled
               };
-              assetHistoryCache.set(cacheKey, { ts: Date.now(), payload });
+              assetHistoryCache.set(cacheKey, payload);
               return res.json(payload);
             }
           } catch {
@@ -2751,7 +2084,6 @@ async function startServer() {
         }
       }
 
-      // 3. Fallback: TradingView multi-horizon performance anchor points (always reliable on cloud IPs)
       const isIndia = /\.(NS|BO|NSE|BSE)$/i.test(yahooPrimary);
       try {
         const tvTickers = isIndia
@@ -2808,7 +2140,7 @@ async function startServer() {
               changePct: first > 0 ? Number((((last - first) / first) * 100).toFixed(2)) : 0,
               points: pts
             };
-            assetHistoryCache.set(cacheKey, { ts: Date.now(), payload });
+            assetHistoryCache.set(cacheKey, payload);
             return res.json(payload);
           }
         }
@@ -2821,210 +2153,6 @@ async function startServer() {
       console.error("[AssetHistory] Error:", e.message);
       res.status(500).json({ error: "Failed to load asset history" });
     }
-  });
-
-  app.post("/api/portfolio/refresh", async (req, res) => {
-    const householdId = (req.query.householdId as string) || req.body?.householdId;
-    const clientHoldings: any[] | undefined = Array.isArray(req.body?.holdings) ? req.body.holdings : undefined;
-
-    try {
-      let holdingsToRefresh: any[] = clientHoldings || [];
-
-      if (holdingsToRefresh.length === 0 && householdId) {
-        try {
-          const snap = await firestore.collection('holdings').where('householdId', '==', householdId).get();
-          holdingsToRefresh = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-        } catch {
-          const db = getDB();
-          holdingsToRefresh = db.holdings.filter((h: any) => h.householdId === householdId);
-        }
-      }
-
-      const mfData = await getAmfiData();
-      const updates: Record<string, { currentPrice: number; provider: string }> = {};
-      const stockHoldings: any[] = [];
-
-      for (const h of holdingsToRefresh) {
-        const mf = findAmfiMatch(mfData, h);
-        if (mf && mf.currentPrice > 0) {
-          updates[h.id] = { currentPrice: mf.currentPrice, provider: 'AMFI' };
-        } else if (h.ticker && h.ticker !== 'MANUAL') {
-          stockHoldings.push(h);
-        }
-      }
-
-      if (stockHoldings.length > 0) {
-        const uniqueSymbols = Array.from(new Set(stockHoldings.map(h => String(h.ticker))));
-        const stockPrices = await fetchLiveStockPrices(uniqueSymbols);
-        for (const h of stockHoldings) {
-          if (stockPrices[h.ticker]) {
-            updates[h.id] = { currentPrice: stockPrices[h.ticker], provider: 'Market-Live' };
-          }
-        }
-      }
-
-      // Best-effort server-side persistence (Firestore if credentials exist, plus local db.json)
-      if (Object.keys(updates).length > 0) {
-        try {
-          const batch = firestore.batch();
-          const now = Date.now();
-          for (const [id, u] of Object.entries(updates)) {
-            batch.update(firestore.collection('holdings').doc(id), {
-              currentPrice: u.currentPrice,
-              priceUpdatedAt: now
-            });
-          }
-          await batch.commit();
-        } catch {
-          // Client-side writeBatch in App.tsx handles Firestore updates when server lacks ADC
-        }
-
-        const db = getDB();
-        let changed = false;
-        for (const h of db.holdings) {
-          if (updates[h.id]) {
-            h.currentPrice = updates[h.id].currentPrice;
-            h.provider = updates[h.id].provider;
-            h.priceUpdatedAt = Date.now();
-            changed = true;
-          }
-        }
-        if (changed) saveDB(db);
-      }
-
-      res.json({ success: true, updates, count: Object.keys(updates).length });
-    } catch (e: any) {
-      console.error("Portfolio refresh error:", e);
-      res.status(500).json({ error: e.message || "Failed to refresh portfolio" });
-    }
-  });
-
-  app.delete("/api/portfolio/holding/:holdingId", async (req, res) => {
-    const { holdingId } = req.params;
-    try {
-      await firestore.collection('holdings').doc(holdingId).delete();
-    } catch {
-      // Ignore if server lacks Firestore ADC; client deletes directly
-    }
-    const db = getDB();
-    const initialCount = db.holdings.length;
-    db.holdings = db.holdings.filter((h: any) => h.id !== holdingId);
-    if (db.holdings.length < initialCount) {
-      saveDB(db);
-    }
-    res.json({ success: true });
-  });
-
-  app.patch("/api/portfolio/holding/:holdingId", async (req, res) => {
-    const { holdingId } = req.params;
-    const { quantity, currentPrice } = req.body;
-    const patchData: any = { priceUpdatedAt: Date.now() };
-    if (quantity !== undefined) patchData.quantity = Number(quantity);
-    if (currentPrice !== undefined) patchData.currentPrice = Number(currentPrice);
-
-    try {
-      await firestore.collection('holdings').doc(holdingId).update(patchData);
-    } catch {
-      // Ignore if server lacks Firestore ADC; client updates directly
-    }
-
-    const db = getDB();
-    const holding = db.holdings.find((h: any) => h.id === holdingId);
-    if (holding) {
-      if (quantity !== undefined) holding.quantity = Number(quantity);
-      if (currentPrice !== undefined) holding.currentPrice = Number(currentPrice);
-      holding.priceUpdatedAt = patchData.priceUpdatedAt;
-      saveDB(db);
-      return res.json(holding);
-    }
-    res.json({ id: holdingId, ...patchData });
-  });
-
-  app.get("/api/portfolio/:householdId", async (req, res) => {
-    const db = getDB();
-    const household = db.households[req.params.householdId];
-    if (!household) return res.status(404).json({ error: "Household not found" });
-
-    // Get active members data
-    const membersData = household.members.map((mId: string) => {
-      const u = db.users[mId];
-      if (!u) return null;
-      const userHoldingsCount = db.holdings.filter((h: any) => h.userId === mId && h.householdId === req.params.householdId).length;
-      return { 
-        id: u.id, 
-        name: u.name, 
-        email: u.email,
-        accounts: userHoldingsCount
-      };
-    }).filter(Boolean);
-
-    const holdings = db.holdings.filter((h: any) => h.householdId === req.params.householdId);
-
-    // Refresh prices for MFs and Stocks
-    const mfData = await getAmfiData();
-    
-    // Identify symbols to refresh: 
-    // 1. Not an Indian MF (which we handle separately)
-    // 2. Has a non-placeholder ticker
-    // 3. Or explicitly marked as Yahoo/Live
-    const stockSymbols = holdings
-      .filter((h: any) => h.ticker && h.ticker !== 'MANUAL')
-      .filter((h: any) => {
-        const isIndianMf = mfData.some(m => m.symbol === h.ticker || m.shortname === h.originalName);
-        return !isIndianMf;
-      })
-      .map((h: any) => h.ticker);
-    
-    let refreshedStockPrices: Record<string, number> = {};
-    if (stockSymbols.length > 0) {
-      refreshedStockPrices = await fetchLiveStockPrices(
-        Array.from(new Set(stockSymbols))
-      );
-    }
-
-    let hasPersistedChanges = false;
-    const updatedHoldings = holdings.map((h: any) => {
-      // Priority 1: AMFI for Mutual Funds
-      const mf = mfData.find(m => m.symbol === h.ticker || m.shortname === h.originalName);
-      if (mf) {
-        // Update in DB to prevent loss on next fail
-        const dbH = db.holdings.find((dh: any) => dh.id === h.id);
-        if (dbH) {
-          if (dbH.currentPrice !== mf.currentPrice) {
-            dbH.currentPrice = mf.currentPrice;
-            dbH.provider = 'AMFI';
-            hasPersistedChanges = true;
-          }
-          dbH.priceUpdatedAt = Date.now();
-        }
-        return { ...h, currentPrice: mf.currentPrice, provider: 'AMFI', priceUpdatedAt: Date.now() };
-      }
-      
-      // Priority 2: Finnhub/Yahoo for Stocks & Gold
-      if (refreshedStockPrices[h.ticker]) {
-        const dbH = db.holdings.find((dh: any) => dh.id === h.id);
-        const newPrice = refreshedStockPrices[h.ticker];
-        if (dbH) {
-          if (dbH.currentPrice !== newPrice) {
-            dbH.currentPrice = newPrice;
-            dbH.provider = 'Market-Live';
-            hasPersistedChanges = true;
-          }
-          dbH.priceUpdatedAt = Date.now();
-        }
-        return { ...h, currentPrice: newPrice, provider: 'Market-Live', currency: h.currency || 'USD', priceUpdatedAt: Date.now() };
-      }
-      return h;
-    });
-
-    if (hasPersistedChanges) {
-      saveDB(db);
-    }
-
-    res.json({ 
-      household: { ...household, membersData }, 
-      holdings: updatedHoldings
-    });
   });
 
   // --- Firestore REST Document Parser & Rebalance Email Engine ---
@@ -3050,7 +2178,12 @@ async function startServer() {
 
   function parseFirestoreDoc(doc: any): any {
     if (!doc?.fields) return null;
-    return parseFirestoreValue({ mapValue: { fields: doc.fields } });
+    const parsed = parseFirestoreValue({ mapValue: { fields: doc.fields } });
+    if (parsed && typeof doc.name === "string" && !parsed.id) {
+      const parts = doc.name.split("/");
+      parsed.id = parts[parts.length - 1];
+    }
+    return parsed;
   }
 
   async function firestoreRestQueryHoldings(householdId: string, idToken: string): Promise<any[]> {
@@ -3084,16 +2217,120 @@ async function startServer() {
       .map((row: any) => parseFirestoreDoc(row.document));
   }
 
+  app.post("/api/portfolio/refresh", async (req, res) => {
+    const householdId = (req.query.householdId as string) || req.body?.householdId;
+    const clientHoldings: any[] | undefined = Array.isArray(req.body?.holdings) ? req.body.holdings : undefined;
+
+    try {
+      let holdingsToRefresh: any[] = clientHoldings || [];
+
+      if (holdingsToRefresh.length === 0 && householdId) {
+        const authHeader = req.headers.authorization || "";
+        const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : "";
+        if (bearerToken) {
+          holdingsToRefresh = await firestoreRestQueryHoldings(householdId, bearerToken);
+        } else {
+          const adminDb = getAdminFirestoreOrNull();
+          if (adminDb) {
+            const snap = await adminDb.collection("holdings").where("householdId", "==", householdId).get();
+            holdingsToRefresh = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+          }
+        }
+      }
+
+      const amfiIndex = await getAmfiIndex();
+      const updates: Record<string, { currentPrice: number; provider: string }> = {};
+      const stockHoldings: any[] = [];
+
+      for (const h of holdingsToRefresh) {
+        const mf = findAmfiMatchIndexed(amfiIndex, h);
+        if (mf && mf.currentPrice > 0) {
+          updates[h.id] = { currentPrice: mf.currentPrice, provider: "AMFI" };
+        } else if (h.ticker && h.ticker !== "MANUAL") {
+          stockHoldings.push(h);
+        }
+      }
+
+      if (stockHoldings.length > 0) {
+        const uniqueSymbols = Array.from(new Set(stockHoldings.map((h) => String(h.ticker))));
+        const stockPrices = await fetchLiveStockPrices(uniqueSymbols);
+        for (const h of stockHoldings) {
+          if (stockPrices[h.ticker]) {
+            updates[h.id] = { currentPrice: stockPrices[h.ticker], provider: "Market-Live" };
+          }
+        }
+      }
+
+      const adminDb = getAdminFirestoreOrNull();
+      if (adminDb && Object.keys(updates).length > 0) {
+        try {
+          const entries = Object.entries(updates);
+          const now = Date.now();
+          for (let i = 0; i < entries.length; i += 450) {
+            const batch = adminDb.batch();
+            for (const [id, u] of entries.slice(i, i + 450)) {
+              batch.update(adminDb.collection("holdings").doc(id), {
+                currentPrice: u.currentPrice,
+                priceUpdatedAt: now
+              });
+            }
+            await batch.commit();
+          }
+        } catch {
+          // Client-side chunked writeBatch updates Firestore directly when authenticated
+        }
+      }
+
+      res.json({ success: true, updates, count: Object.keys(updates).length });
+    } catch (e: any) {
+      console.error("Portfolio refresh error:", e);
+      res.status(500).json({ error: e.message || "Failed to refresh portfolio" });
+    }
+  });
+
+  app.delete("/api/portfolio/holding/:holdingId", async (req, res) => {
+    const adminDb = getAdminFirestoreOrNull();
+    if (adminDb) {
+      try {
+        await adminDb.collection("holdings").doc(req.params.holdingId).delete();
+      } catch {
+        // Client deletes directly via Firestore SDK
+      }
+    }
+    res.json({ success: true });
+  });
+
+  app.patch("/api/portfolio/holding/:holdingId", async (req, res) => {
+    const { holdingId } = req.params;
+    const { quantity, currentPrice } = req.body || {};
+    const patchData: any = { priceUpdatedAt: Date.now() };
+    if (quantity !== undefined) patchData.quantity = Number(quantity);
+    if (currentPrice !== undefined) patchData.currentPrice = Number(currentPrice);
+
+    const adminDb = getAdminFirestoreOrNull();
+    if (adminDb) {
+      try {
+        await adminDb.collection("holdings").doc(holdingId).update(patchData);
+      } catch {
+        // Client updates directly via Firestore SDK
+      }
+    }
+    res.json({ id: holdingId, ...patchData });
+  });
+
   async function resolveHouseholdMemberToken(householdId: string, bearerIdToken?: string): Promise<string | null> {
     if (bearerIdToken) return bearerIdToken;
-    const db = getDB();
-    let entry: any = Object.values(db.inviteCodes || {}).find((e: any) => e.householdId === householdId);
+    const hhCode = inviteCodeByHousehold.get(householdId);
+    let entry: any = hhCode ? inviteCodesByCode.get(hhCode) : null;
     if (!entry) {
       entry = await getInviteByHouseholdPg(householdId);
+      if (entry) cacheInviteEntry(entry);
     }
     if (entry?.refreshToken) {
       try {
         const fresh = await refreshFirebaseIdToken(entry.refreshToken);
+        entry.lastIdToken = fresh;
+        entry.lastTokenAt = Date.now();
         return fresh;
       } catch (e: any) {
         console.warn(`[Rebalance] Failed to refresh token for ${householdId}:`, e.message);
@@ -3103,18 +2340,6 @@ async function startServer() {
       return entry.lastIdToken;
     }
     return null;
-  }
-
-  function classifyAssetClassServer(h: any): "Equity" | "Debt" | "Gold" {
-    const label = `${h.name || ""} ${h.originalName || ""} ${h.ticker || ""}`.toLowerCase();
-    if (h.assetClass === "Gold" || /\b(gold|sgb|silver)\b/.test(label)) return "Gold";
-    if (
-      h.assetClass === "Debt" ||
-      /\b(arbitrage|liquid|overnight|money market|gilt|corporate bond|short duration|ultra short|debt|fixed deposit|treasury)\b/.test(label)
-    ) {
-      return "Debt";
-    }
-    return "Equity";
   }
 
   async function checkAndSendRebalanceAlert(
@@ -3137,7 +2362,6 @@ async function startServer() {
 
       const appUrl = (opts?.baseUrl || process.env.APP_URL || "https://unitywealth.up.railway.app").replace(/\/$/, "");
 
-      // Fast path when client passes exact live computed report from RebalanceView
       if (opts?.clientReport && opts.toEmail) {
         const cr = opts.clientReport;
         const content = buildRebalanceEmailContent({
@@ -3205,50 +2429,15 @@ async function startServer() {
         return { sent: false, error: "Add at least one holding to your portfolio before generating a rebalance report." };
       }
 
-      let fxRate = 84.0;
-      try {
-        const fxRes = await axios.get("https://open.er-api.com/v6/latest/USD", { timeout: 6000 });
-        fxRate = fxRes.data?.rates?.INR || 84.0;
-      } catch {}
-
-      let totalValINR = 0;
-      let equityValINR = 0;
-      let debtValINR = 0;
-      let indianEqINR = 0;
-      let foreignEqINR = 0;
-
-      holdings.forEach((h: any) => {
-        const qty = Number(h.quantity) || 0;
-        const price = Number(h.currentPrice) || 0;
-        const val = qty * price;
-        const isUsd = String(h.currency || "INR").toUpperCase() === "USD";
-        const valINR = isUsd ? val * fxRate : val;
-        totalValINR += valINR;
-        const cls = classifyAssetClassServer(h);
-        if (cls === "Debt") {
-          debtValINR += valINR;
-        } else {
-          equityValINR += valINR;
-          if (isUsd) foreignEqINR += valINR;
-          else indianEqINR += valINR;
-        }
-      });
-
-      if (totalValINR <= 0) {
+      const fxRate = await getUsdInrRate();
+      const stats = computePortfolioStats(holdings, fxRate, [], household.targets);
+      if (stats.totalValINR <= 0) {
         return { sent: false, error: "Total portfolio value is zero." };
       }
 
-      const actualEquityPct = equityValINR / totalValINR;
-      const targetEquityPct = Number(household.targets?.assetSplit?.Equity ?? 0.7);
-      const targetDebtPct = Number(household.targets?.assetSplit?.Debt ?? (1 - targetEquityPct));
-      const targetIndianSplit = Number(household.targets?.equitySplit?.Indian ?? 0.6);
-      const targetForeignSplit = Number(household.targets?.equitySplit?.Foreign ?? 0.4);
-      const drift = Math.abs(actualEquityPct - targetEquityPct);
-      const accuracy = Math.max(0, 100 - drift * 100);
       const threshold = Number(household.settings?.accuracyThreshold ?? 95);
-
-      if (accuracy >= threshold && !force) {
-        return { sent: false, skipped: true, accuracy, reason: "Portfolio is already within target threshold" };
+      if (stats.accuracy >= threshold && !force) {
+        return { sent: false, skipped: true, accuracy: stats.accuracy, reason: "Portfolio is already within target threshold" };
       }
 
       const lastSentKey = `rebalance_last_sent:${householdId}`;
@@ -3258,7 +2447,7 @@ async function startServer() {
         return { sent: false, skipped: true, reason: "Alert already sent within the last 24 hours" };
       }
 
-      // Resolve recipient email
+      // Resolve recipient email using cached memberProfiles first, then parallel user lookup
       let recipientEmail = (opts?.toEmail || "").trim();
       let recipientName = (opts?.recipientName || "").trim();
       if (!recipientEmail) {
@@ -3270,14 +2459,20 @@ async function startServer() {
             recipientName = prof.name || "Investor";
             break;
           }
-          try {
-            const uDoc = parseFirestoreDoc(await firestoreRestGet(`users/${mId}`, idToken));
-            if (uDoc?.email && uDoc.email.includes("@")) {
-              recipientEmail = uDoc.email;
-              recipientName = uDoc.name || "Investor";
-              break;
-            }
-          } catch {}
+        }
+        if (!recipientEmail && members.length > 0) {
+          const fetchedUsers = await Promise.all(
+            members.map((mId) =>
+              firestoreRestGet(`users/${mId}`, idToken)
+                .then((raw) => parseFirestoreDoc(raw))
+                .catch(() => null)
+            )
+          );
+          const match = fetchedUsers.find((u) => u?.email && u.email.includes("@"));
+          if (match) {
+            recipientEmail = match.email;
+            recipientName = match.name || "Investor";
+          }
         }
       }
 
@@ -3285,84 +2480,42 @@ async function startServer() {
         return { sent: false, error: "Could not find a recipient email address for this household." };
       }
 
-      const fmtINR = (v: number) => `Rs. ${Math.round(Math.abs(v)).toLocaleString("en-IN")}`;
-      const fmtUSD = (v: number) => `$${Math.round(Math.abs(v / fxRate)).toLocaleString("en-US")}`;
       const mode = opts?.mode === "sip" ? "sip" : "full";
-      const orders: { type: string; title: string; category: string; amount: string; description: string }[] = [];
+      const plan = computeRebalancePlan(stats, household.targets, {
+        mode,
+        freshInflowINR: opts?.freshInflowINR,
+        fxRate
+      });
 
-      if (mode === "sip") {
-        const sipInflow = Math.max(1000, Number(opts?.freshInflowINR) || 100_000);
-        const newTotal = totalValINR + sipInflow;
-        const gapInd = Math.max(0, newTotal * targetEquityPct * targetIndianSplit - indianEqINR);
-        const gapUs = Math.max(0, newTotal * targetEquityPct * targetForeignSplit - foreignEqINR);
-        const gapDebt = Math.max(0, newTotal * targetDebtPct - debtValINR);
-        const gapSum = gapInd + gapUs + gapDebt || 1;
-        if (gapInd > 0) {
-          const alloc = (sipInflow * gapInd) / gapSum;
-          orders.push({ type: "buy", title: "Indian Equity SIP", category: "Zero-Sell Inflow", amount: fmtINR(alloc), description: "Route fresh monthly capital into Indian Equity" });
-        }
-        if (gapUs > 0) {
-          const alloc = (sipInflow * gapUs) / gapSum;
-          orders.push({ type: "buy", title: "US / Foreign Equity SIP", category: "Zero-Sell Inflow", amount: `${fmtUSD(alloc)} (${fmtINR(alloc)})`, description: "Route fresh monthly capital into US Equity" });
-        }
-        if (gapDebt > 0) {
-          const alloc = (sipInflow * gapDebt) / gapSum;
-          orders.push({ type: "buy", title: "Arbitrage / Debt Fund SIP", category: "Zero-Sell Inflow", amount: fmtINR(alloc), description: "Park fresh inflow in tax-efficient Arbitrage/Debt" });
-        }
-      } else {
-        const targetIndINR = totalValINR * targetEquityPct * targetIndianSplit;
-        const targetUsINR = totalValINR * targetEquityPct * targetForeignSplit;
-        const targetDebtINR = totalValINR * targetDebtPct;
-        const diffInd = targetIndINR - indianEqINR;
-        const diffUs = targetUsINR - foreignEqINR;
-        const diffDebt = targetDebtINR - debtValINR;
-        if (Math.abs(diffInd) > 2500) {
-          orders.push({
-            type: diffInd > 0 ? "buy" : "sell",
-            title: "Indian Equity / Mutual Funds",
-            category: "Domestic Equity",
-            amount: fmtINR(diffInd),
-            description: diffInd > 0 ? "Underweight vs target Indian Equity split" : "Trim overweight Indian Equity"
-          });
-        }
-        if (Math.abs(diffUs) > 2500) {
-          orders.push({
-            type: diffUs > 0 ? "buy" : "sell",
-            title: "US / Global Equity Sleeve",
-            category: "Foreign Equity",
-            amount: `${fmtUSD(diffUs)} (${fmtINR(diffUs)})`,
-            description: diffUs > 0 ? "Add to US Equity sleeve" : "Trim overweight US Equity sleeve"
-          });
-        }
-        if (Math.abs(diffDebt) > 2500) {
-          orders.push({
-            type: diffDebt > 0 ? "buy" : "sell",
-            title: "Arbitrage / Fixed Income Reserve",
-            category: "Debt & Arbitrage",
-            amount: fmtINR(diffDebt),
-            description: diffDebt > 0 ? "Add stability via Arbitrage/Liquid funds" : "Redeploy surplus Debt into Equity"
-          });
-        }
-      }
+      const fmtINR = (v: number) => `Rs. ${Math.round(Math.abs(v)).toLocaleString("en-IN")}`;
+      const fmtUSD = (v: number) => `$${Math.round(Math.abs(v)).toLocaleString("en-US")}`;
+      const orders = (mode === "sip" ? plan.sipAllocations : plan.orders).map((o) => ({
+        type: o.type,
+        title: o.title,
+        category: o.category,
+        amount:
+          o.currency === "USD"
+            ? `${fmtUSD(o.amountUSD)} (${fmtINR(o.amountINR)})`
+            : fmtINR(o.amountINR),
+        description: o.description
+      }));
 
-      const indianEqShare = equityValINR > 0 ? indianEqINR / equityValINR : 0;
-      const foreignEqShare = equityValINR > 0 ? foreignEqINR / equityValINR : 0;
       const executiveSummary =
-        accuracy >= threshold
-          ? `${household.name || "Your family portfolio"} is well aligned at ${accuracy.toFixed(1)}% against your ${(targetEquityPct * 100).toFixed(0)}/${(targetDebtPct * 100).toFixed(0)} Equity/Debt target.`
-          : `${household.name || "Your family portfolio"} is currently at ${(actualEquityPct * 100).toFixed(1)}% Equity vs your ${(targetEquityPct * 100).toFixed(0)}% target (${accuracy.toFixed(1)}% alignment vs ${threshold}% threshold). Review the recommended ${mode === "sip" ? "Zero-Sell SIP routing" : "rebalance trades"} below.`;
+        stats.accuracy >= threshold
+          ? `${household.name || "Your family portfolio"} is well aligned at ${stats.accuracy.toFixed(1)}% against your ${(plan.targetEquityPct * 100).toFixed(0)}/${(plan.targetDebtPct * 100).toFixed(0)} Equity/Debt target.`
+          : `${household.name || "Your family portfolio"} is currently at ${(stats.actualEquityPct * 100).toFixed(1)}% Equity vs your ${(plan.targetEquityPct * 100).toFixed(0)}% target (${stats.accuracy.toFixed(1)}% alignment vs ${threshold}% threshold). Review the recommended ${mode === "sip" ? "Zero-Sell SIP routing" : "rebalance trades"} below.`;
 
       const content = buildRebalanceEmailContent({
         householdName: household.name || "Family Portfolio",
         recipientName: recipientName || "Investor",
-        totalValINR,
-        totalValUSD: totalValINR / fxRate,
-        accuracy,
+        totalValINR: stats.totalValINR,
+        totalValUSD: stats.totalValUSD,
+        accuracy: stats.accuracy,
         threshold,
-        actualEquityPct,
-        targetEquityPct,
-        indianEquityPctOfEq: indianEqShare,
-        foreignEquityPctOfEq: foreignEqShare,
+        actualEquityPct: stats.actualEquityPct,
+        targetEquityPct: plan.targetEquityPct,
+        indianEquityPctOfEq: stats.indianEquityShareOfEquity,
+        foreignEquityPctOfEq: stats.foreignEquityShareOfEquity,
         mode,
         executiveSummary,
         orders,
@@ -3382,9 +2535,9 @@ async function startServer() {
         await addNotificationPg({
           householdId,
           category: "drift",
-          severity: accuracy < threshold ? "warning" : "info",
+          severity: stats.accuracy < threshold ? "warning" : "info",
           title: mode === "sip" ? "Zero-Sell SIP Plan Emailed" : "Rebalance Alert Emailed",
-          message: `Delivered ${mode === "sip" ? "Zero-Sell SIP plan" : "rebalance report"} (${accuracy.toFixed(1)}% aligned) to ${recipientEmail}.`,
+          message: `Delivered ${mode === "sip" ? "Zero-Sell SIP plan" : "rebalance report"} (${stats.accuracy.toFixed(1)}% aligned) to ${recipientEmail}.`,
           actionTab: "rebalance",
           createdAt: now
         }).catch(() => {});
@@ -3393,7 +2546,7 @@ async function startServer() {
       return {
         ...delivery,
         recipientEmail,
-        accuracy
+        accuracy: stats.accuracy
       };
     } catch (e: any) {
       console.error("[Rebalance Email Error]", e?.response?.data || e.message);
@@ -3404,27 +2557,11 @@ async function startServer() {
     }
   }
 
-  app.post("/api/settings/notifications", (req, res) => {
-    const { householdId, enabled, threshold } = req.body;
-    const db = getDB();
-    if (!db.households[householdId]) {
-      db.households[householdId] = { id: householdId, settings: {} };
-    }
-    if (!db.households[householdId].settings) db.households[householdId].settings = {};
-    db.households[householdId].settings.emailAlertsEnabled = enabled;
-    db.households[householdId].settings.accuracyThreshold = threshold;
-    
-    saveDB(db);
-    res.json({ success: true });
-  });
-
   app.post("/api/rebalance/check-now", async (req, res) => {
     const authHeader = req.headers.authorization || "";
     const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : String(req.body?.idToken || "");
     const { householdId, toEmail, recipientName, mode, freshInflowINR } = req.body || {};
-    const host = req.get("host");
-    const proto = req.get("x-forwarded-proto") || (host?.includes("localhost") ? "http" : "https");
-    const baseUrl = (process.env.APP_URL || `${proto}://${host}`).replace(/\/$/, "");
+    const baseUrl = resolveRequestBaseUrl(req);
 
     const outcome = await checkAndSendRebalanceAlert(householdId, true, {
       idToken: idToken || undefined,
@@ -3439,7 +2576,7 @@ async function startServer() {
       success: Boolean(outcome?.sent),
       message: outcome?.sent
         ? `Rebalance report emailed to ${outcome.recipientEmail || toEmail} via ${outcome.senderEmail || outcome.provider}.`
-        : (outcome?.error || "Email was not sent automatically."),
+        : outcome?.error || "Email was not sent automatically.",
       ...outcome
     });
   });
@@ -3448,9 +2585,7 @@ async function startServer() {
     const authHeader = req.headers.authorization || "";
     const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : String(req.body?.idToken || "");
     const { householdId, toEmail, recipientName, mode, freshInflowINR, clientReport } = req.body || {};
-    const host = req.get("host");
-    const proto = req.get("x-forwarded-proto") || (host?.includes("localhost") ? "http" : "https");
-    const baseUrl = (process.env.APP_URL || `${proto}://${host}`).replace(/\/$/, "");
+    const baseUrl = resolveRequestBaseUrl(req);
 
     const outcome = await checkAndSendRebalanceAlert(householdId, true, {
       idToken: idToken || undefined,
@@ -3466,145 +2601,14 @@ async function startServer() {
       success: Boolean(outcome?.sent),
       message: outcome?.sent
         ? `Rebalance plan emailed to ${outcome.recipientEmail || toEmail} via ${outcome.senderEmail || outcome.provider}.`
-        : (outcome?.error || "Outgoing email sender not connected yet."),
+        : outcome?.error || "Outgoing email sender not connected yet.",
       ...outcome
     });
   });
 
-  app.post("/api/targets/:householdId", (req, res) => {
-    const db = getDB();
-    if (!db.households[req.params.householdId]) return res.status(404).json({ error: "Household not found" });
-    
-    db.households[req.params.householdId].targets = req.body;
-    saveDB(db);
-    checkAndSendRebalanceAlert(req.params.householdId).catch(() => {}); // Trigger check on target update
-    res.json(db.households[req.params.householdId]);
-  });
-
-  app.post("/api/portfolio/bulk-add", async (req, res) => {
-    const { userId, householdId, holdings, provider: batchProvider } = req.body;
-    
-    try {
-      const incomingProviders = new Set<string>(
-        (holdings || []).map((h: any) => String(h.provider || batchProvider || "CAMS"))
-      );
-      if (incomingProviders.size === 0 && batchProvider) {
-        incomingProviders.add(String(batchProvider));
-      }
-
-      const newHoldings = (holdings || []).map((h: any) => {
-        const id = "h_" + Math.random().toString(36).substr(2, 9);
-        const resolvedProvider = String(h.provider || batchProvider || "CAMS");
-        const resolvedCurrency = h.currency === "USD" ? "USD" : "INR";
-        return {
-          id,
-          userId,
-          householdId,
-          ticker: String(h.ticker || h.schemeName || "MF").slice(0, 50),
-          quantity: parseFloat(h.units) || 0,
-          assetClass: h.assetClass || "Mutual Fund",
-          currency: resolvedCurrency,
-          provider: resolvedProvider,
-          source: "PDF",
-          currentPrice: parseFloat(h.nav) || 0,
-          originalName: h.originalName || h.schemeName || "",
-          syncedAt: Date.now()
-        };
-      });
-
-      // Persist to Firestore if server has ADC, while client handles direct Firestore writes when logged in
-      try {
-        const holdingsRef = firestore.collection('holdings');
-        const snap = await holdingsRef
-          .where('userId', '==', userId)
-          .where('householdId', '==', householdId)
-          .get();
-        
-        const batch = firestore.batch();
-        snap.docs.forEach(doc => {
-          const data = doc.data();
-          const docProvider = String(data.provider || "CAMS");
-          if (data.source === "PDF" && incomingProviders.has(docProvider)) {
-            batch.delete(doc.ref);
-          }
-        });
-        newHoldings.forEach((item: any) => {
-          const { id, ...rest } = item;
-          batch.set(holdingsRef.doc(id), rest);
-        });
-        await batch.commit();
-      } catch {
-        // Fallback to local db.json when server runs without Firestore service account
-      }
-
-      const db = getDB();
-      db.holdings = db.holdings.filter((h: any) => {
-        if (h.userId !== userId || h.householdId !== householdId) return true;
-        const docProvider = String(h.provider || "CAMS");
-        return !(h.source === "PDF" && incomingProviders.has(docProvider));
-      });
-      db.holdings.push(...newHoldings);
-      saveDB(db);
-
-      checkAndSendRebalanceAlert(householdId); 
-      res.json({ success: true, count: newHoldings.length, holdings: newHoldings });
-    } catch (e: any) {
-      console.error("Bulk-add error", e);
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  app.post("/api/portfolio/add-manual", async (req, res) => {
-    const { userId, householdId, ticker, quantity, currentPrice, assetClass, currency, provider, originalName, source } = req.body;
-    
-    try {
-      let resolvedCurrency = currency || "USD";
-      const upperTicker = (ticker || "").toUpperCase();
-      if (upperTicker.endsWith('.NS') || upperTicker.endsWith('.BO')) {
-        resolvedCurrency = "INR";
-      }
-
-      const id = "h_" + Math.random().toString(36).substr(2, 9);
-      const newHolding = {
-        userId,
-        householdId,
-        ticker: upperTicker,
-        originalName: originalName || upperTicker,
-        quantity: parseFloat(quantity),
-        assetClass: assetClass || "Equity",
-        currency: resolvedCurrency,
-        provider: provider || "Manual",
-        source: source || "Manual",
-        currentPrice: parseFloat(currentPrice),
-        syncedAt: Date.now()
-      };
-
-      try {
-        await firestore.collection('holdings').doc(id).set(newHolding);
-      } catch {
-        // Client handles Firestore directly when authenticated
-      }
-      const db = getDB();
-      db.holdings.push({ id, ...newHolding });
-      saveDB(db);
-      checkAndSendRebalanceAlert(householdId);
-      res.json({ id, ...newHolding });
-    } catch (e: any) {
-      res.status(500).json({ error: e.message });
-    }
-  });
-
-  app.get("/api/fx-rates", async (req, res) => {
-    try {
-      // Using a public API for USD to INR
-      const response = await axios.get('https://open.er-api.com/v6/latest/USD');
-      const data = response.data;
-      const inrRate = data.rates?.INR || 83.5;
-      res.json({ INR: inrRate, USD: 1.0 });
-    } catch (error) {
-      console.error("FX Fetch Error:", error);
-      res.json({ INR: 83.5, USD: 1.0 }); // Fallback
-    }
+  app.get("/api/fx-rates", async (_req, res) => {
+    const inrRate = await getUsdInrRate();
+    res.json({ INR: inrRate, USD: 1.0 });
   });
 
   app.get("/api/market/price/:ticker", async (req, res) => {
@@ -3615,7 +2619,7 @@ async function startServer() {
         return res.json({ ticker, price: priceMap[ticker] });
       }
       res.status(404).json({ error: "Price not found" });
-    } catch (e) {
+    } catch {
       res.status(500).json({ error: "Failed to fetch price" });
     }
   });
@@ -3631,7 +2635,6 @@ async function startServer() {
       throw err;
     }
 
-    // Detect password-encrypted Office Open XML (.xlsx) wrapped in an OLE Compound File container
     if (
       buf.length >= 8 &&
       buf[0] === 0xd0 &&
@@ -3686,7 +2689,6 @@ async function startServer() {
       !isPDF &&
       (Boolean(isSpreadsheet) || /\.(xlsx|xls|ods)$/i.test(String(fileName || "")));
 
-    // Pre-check if PDF is password-encrypted
     let looksEncryptedPdf = false;
     if (isPDF && typeof content === "string") {
       try {
@@ -3792,8 +2794,8 @@ BROKER, TICKER & CURRENCY RULES:
       const cleaned = (text || "").replace(/```json/g, "").replace(/```/g, "").trim();
       const parsed = JSON.parse(cleaned);
 
-      const rawList: any[] = Array.isArray(parsed) ? parsed : (Array.isArray(parsed?.holdings) ? parsed.holdings : []);
-      const statementType: string = Array.isArray(parsed) ? "holdings" : (parsed?.statementType || "holdings");
+      const rawList: any[] = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.holdings) ? parsed.holdings : [];
+      const statementType: string = Array.isArray(parsed) ? "holdings" : parsed?.statementType || "holdings";
       const detectedProvider: string = providerHint || (!Array.isArray(parsed) && parsed?.provider) || "CAMS";
       const summaryNote: string = (!Array.isArray(parsed) && parsed?.summaryNote) || "";
 
@@ -3802,16 +2804,15 @@ BROKER, TICKER & CURRENCY RULES:
           statementType: "capital_gains_only",
           provider: detectedProvider,
           summaryNote,
-          warning: "This file is a Capital Gain / Loss (Redemption) tax statement showing sold units rather than active holdings. Please upload a CAMS / MFCentral Consolidated Account Statement (CAS) or Portfolio Holdings statement with current balances.",
+          warning:
+            "This file is a Capital Gain / Loss (Redemption) tax statement showing sold units rather than active holdings. Please upload a CAMS / MFCentral Consolidated Account Statement (CAS) or Portfolio Holdings statement with current balances.",
           holdings: []
         });
       }
 
-      // Normalize, enforce mandatory domain rules, and consolidate duplicate lots within the same statement
-      const debtKeywords = /\b(arbitrage|liquid|liquidbees|liquidcase|overnight|money market|ultra short|low duration|short term debt|short duration|corporate bond|gilt|banking and psu|banking & psu|dynamic bond|floater|swvxx|snvxx|vmfxx|spaxx|sgov|usfr)\b/i;
       const skipTickers = new Set(["CASH", "TOTAL", "ACCOUNT TOTAL", "POSITIONS TOTAL", "CASH & CASH INVESTMENTS", "USD"]);
-
       const consolidatedMap = new Map<string, any>();
+
       for (const item of rawList) {
         const units = Number(String(item.units ?? item.quantity ?? 0).replace(/,/g, ""));
         const nav = Number(String(item.nav ?? item.currentPrice ?? item.price ?? 0).replace(/[$,₹,\s]/g, ""));
@@ -3827,21 +2828,28 @@ BROKER, TICKER & CURRENCY RULES:
         if (["Charles Schwab", "IBKR", "E*TRADE"].includes(rowProvider) && !item.currency) {
           currency = "USD";
         }
+        if (rawTicker.toUpperCase() === "QCOM" || /qualcomm/i.test(origName)) {
+          currency = "USD";
+        }
 
         let assetClass: "Equity" | "Debt" | "Mutual Fund" =
-          item.assetClass === "Debt" ? "Debt" :
-          item.assetClass === "Equity" ? "Equity" : "Mutual Fund";
+          item.assetClass === "Debt" ? "Debt" : item.assetClass === "Equity" ? "Equity" : "Mutual Fund";
 
-        if (debtKeywords.test(origName) || debtKeywords.test(schemeName) || debtKeywords.test(rawTicker)) {
+        if (DEBT_KEYWORDS_REGEX.test(origName) || DEBT_KEYWORDS_REGEX.test(schemeName) || DEBT_KEYWORDS_REGEX.test(rawTicker)) {
           assetClass = "Debt";
         } else if (currency === "USD" && assetClass === "Mutual Fund") {
           assetClass = "Equity";
         }
 
-        // Clean stock tickers
         if (assetClass === "Equity" || (currency === "USD" && /^[A-Z./-]{1,10}$/i.test(rawTicker))) {
           rawTicker = rawTicker.toUpperCase().replace(/\//g, ".");
-          if (currency === "INR" && rowProvider === "Zerodha" && /^[A-Z0-9&-]{1,15}$/.test(rawTicker) && !rawTicker.endsWith(".NS") && !rawTicker.endsWith(".BO")) {
+          if (
+            currency === "INR" &&
+            rowProvider === "Zerodha" &&
+            /^[A-Z0-9&-]{1,15}$/.test(rawTicker) &&
+            !rawTicker.endsWith(".NS") &&
+            !rawTicker.endsWith(".BO")
+          ) {
             rawTicker = `${rawTicker}.NS`;
           }
           if (currency === "USD") {
@@ -3873,14 +2881,15 @@ BROKER, TICKER & CURRENCY RULES:
       }
 
       const enrichedHoldings = Array.from(consolidatedMap.values());
-
-      // Enrich Indian MFs with exact AMFI scheme code & latest live NAV, and stocks with live quotes
-      const mfData = await getAmfiData();
+      const amfiIndex = await getAmfiIndex();
       const stockSymbolsToFetch = new Set<string>();
 
       for (const h of enrichedHoldings) {
-        if (h.currency === "INR" && (h.assetClass === "Mutual Fund" || h.assetClass === "Debt" || /^INF[A-Z0-9]{9}$/.test(h.isin))) {
-          const mf = findAmfiMatch(mfData, h);
+        if (
+          h.currency === "INR" &&
+          (h.assetClass === "Mutual Fund" || h.assetClass === "Debt" || /^INF[A-Z0-9]{9}$/.test(h.isin))
+        ) {
+          const mf = findAmfiMatchIndexed(amfiIndex, h);
           if (mf) {
             h.ticker = mf.symbol;
             if (mf.currentPrice > 0) h.nav = mf.currentPrice;
@@ -3924,7 +2933,8 @@ BROKER, TICKER & CURRENCY RULES:
       console.error("Gemini Extraction Error:", e);
       if (looksEncryptedPdf) {
         return res.status(400).json({
-          error: "This PDF is password-protected (encrypted). Please unlock or 'Print to PDF' first (CAMS/CAS password is usually PAN or DDMMYYYY) and upload again."
+          error:
+            "This PDF is password-protected (encrypted). Please unlock or 'Print to PDF' first (CAMS/CAS password is usually PAN or DDMMYYYY) and upload again."
         });
       }
       const errStatus = Number(e?.statusCode) || 500;
@@ -3932,43 +2942,54 @@ BROKER, TICKER & CURRENCY RULES:
     }
   });
 
-  // Vite middleware for development
+  // Vite middleware for development; static hashed asset caching in production
   if (process.env.NODE_ENV !== "production") {
     const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
-      appType: "spa",
+      appType: "spa"
     });
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
+    app.use(
+      express.static(distPath, {
+        maxAge: "1h",
+        setHeaders: (res, filePath) => {
+          if (filePath.includes(`${path.sep}assets${path.sep}`)) {
+            res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+          } else if (filePath.endsWith("index.html")) {
+            res.setHeader("Cache-Control", "no-cache");
+          }
+        }
+      })
+    );
+    app.get("*", (_req, res) => {
+      res.setHeader("Cache-Control", "no-cache");
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
 
-  // Global error handler
-  app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
     console.error("[Unhandled Error]", err);
     res.status(500).json({ error: "Internal Server Error", details: err.message });
   });
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Server running on http://localhost:${PORT}`);
-    // Pre-warm AMFI NAV cache in background
-    getAmfiData().catch((err) => console.warn("[AMFI] Background warmup failed:", err.message));
-    
-    // Background Monitoring: Check all households every 4 hours
+    // Pre-warm indexed AMFI NAV cache & FX rate in background
+    getAmfiIndex().catch((err) => console.warn("[AMFI] Background warmup failed:", err.message));
+    getUsdInrRate().catch(() => {});
+
+    // Background Monitoring: Check all registered households every 4 hours
     setInterval(() => {
-      console.log("[MONITOR] Running background rebalance check for all households...");
-      const db = getDB();
-      const allHouseholdIds = new Set<string>([
-        ...Object.keys(db.households || {}),
-        ...Object.values(db.inviteCodes || {}).map((e: any) => e?.householdId).filter(Boolean)
-      ]);
-      allHouseholdIds.forEach(householdId => {
-        checkAndSendRebalanceAlert(householdId, false).catch(err => console.error("Monitor failed for", householdId, err));
+      const householdIds = Array.from(inviteCodeByHousehold.keys());
+      if (householdIds.length === 0) return;
+      console.log(`[MONITOR] Running background rebalance check for ${householdIds.length} household(s)...`);
+      householdIds.forEach((householdId) => {
+        checkAndSendRebalanceAlert(householdId, false).catch((err) =>
+          console.error("Monitor failed for", householdId, err)
+        );
       });
     }, 4 * 60 * 60 * 1000);
   });

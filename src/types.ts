@@ -32,7 +32,7 @@ export interface Holding {
   provider: string;
   currentPrice: number;
   originalName?: string;
-  source?: 'PDF' | 'Sync' | 'Manual' | 'Live' | 'PDF Import';
+  source?: 'PDF' | 'Sync' | 'Live' | 'Manual' | 'PDF Import';
   priceUpdatedAt?: number;
   syncedAt?: number;
 }
@@ -145,6 +145,84 @@ export interface RealEstateProperty {
   updatedAt: number;
 }
 
+export interface MemberSnapshotBreakdown {
+  id: string;
+  name: string;
+  valueINR: number;
+  indianEquityINR?: number;
+  foreignEquityINR?: number;
+  debtINR?: number;
+  realEstateEquityINR?: number;
+}
+
+export interface HoldingSnapshotBreakdown {
+  key: string;
+  ticker: string;
+  name: string;
+  ownerId: string;
+  assetClass: string;
+  currency: string;
+  provider: string;
+  units: number;
+  price: number;
+  valueINR: number;
+}
+
+export interface RebalanceSnapshotMeta {
+  actualEquityPct?: number;
+  targetEquityPct?: number;
+  actualIndianOfEqPct?: number;
+  targetIndianOfEqPct?: number;
+  alignmentPct?: number;
+}
+
+export interface WealthSnapshotRecord {
+  householdId: string;
+  snapshotMonth: string; // YYYY-MM
+  recordedAt: number;
+  totalINR: number;
+  totalUSD: number;
+  indianEquityINR: number;
+  foreignEquityINR: number;
+  debtINR: number;
+  realEstateEquityINR?: number;
+  realEstateLoanINR?: number;
+  fxRate: number;
+  holdingsCount: number;
+  memberBreakdown: MemberSnapshotBreakdown[];
+  providerBreakdown: Record<string, number>;
+  holdingsBreakdown?: HoldingSnapshotBreakdown[];
+  rebalanceMeta?: RebalanceSnapshotMeta;
+  source: string;
+  note?: string;
+}
+
+export interface NotificationRecord {
+  id: string;
+  householdId: string;
+  userId?: string;
+  category: 'import' | 'family' | 'milestone' | 'drift' | 'system';
+  severity: 'info' | 'success' | 'warning';
+  title: string;
+  message: string;
+  actionTab?: string;
+  isRead: boolean;
+  createdAt: number;
+}
+
+export interface EmailStatusPublic {
+  configured: boolean;
+  provider: 'gmail_oauth' | 'gmail_smtp' | 'brevo' | 'resend' | 'none';
+  senderEmail?: string;
+  senderName?: string;
+  officialSenderEmail?: string;
+  isOfficialSender?: boolean;
+  hasRefreshToken?: boolean;
+  canSendToAnyone: boolean;
+  googleOAuthAvailable?: boolean;
+  warning?: string;
+}
+
 export interface HouseholdSettings {
   emailAlertsEnabled?: boolean;
   accuracyThreshold?: number;
@@ -159,7 +237,7 @@ export interface Household {
   id: string;
   name: string;
   members: string[];
-  membersData?: { id: string, name: string, email: string, isManual?: boolean }[];
+  membersData?: { id: string; name: string; email: string; isManual?: boolean }[];
   targets: PortfolioTargets;
   settings?: HouseholdSettings;
 }

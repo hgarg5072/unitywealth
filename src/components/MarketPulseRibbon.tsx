@@ -9,26 +9,54 @@ interface BenchmarkItem {
   prefix: string;
 }
 
+// Module-level shared cache across tab mounts so switching views never re-fetches within 90s
+let sharedBenchmarkItems: BenchmarkItem[] = [];
+let sharedBenchmarkTs = 0;
+let inFlightBenchmarkReq: Promise<BenchmarkItem[]> | null = null;
+const BENCHMARK_TTL_MS = 90 * 1000;
+
+async function fetchBenchmarksCached(force = false): Promise<BenchmarkItem[]> {
+  const now = Date.now();
+  if (!force && sharedBenchmarkItems.length > 0 && now - sharedBenchmarkTs < BENCHMARK_TTL_MS) {
+    return sharedBenchmarkItems;
+  }
+  if (inFlightBenchmarkReq) return inFlightBenchmarkReq;
+
+  inFlightBenchmarkReq = (async () => {
+    try {
+      const res = await fetch('/api/market/benchmarks');
+      if (res.ok) {
+        const json = await res.json();
+        if (Array.isArray(json.benchmarks) && json.benchmarks.length > 0) {
+          sharedBenchmarkItems = json.benchmarks;
+          sharedBenchmarkTs = Date.now();
+        }
+      }
+    } catch {
+      // silent fallback to cached items
+    }
+    return sharedBenchmarkItems;
+  })().finally(() => {
+    inFlightBenchmarkReq = null;
+  });
+
+  return inFlightBenchmarkReq;
+}
+
 export function MarketPulseRibbon() {
-  const [items, setItems] = useState<BenchmarkItem[]>([]);
+  const [items, setItems] = useState<BenchmarkItem[]>(() => sharedBenchmarkItems);
 
   useEffect(() => {
     let active = true;
-    const load = async () => {
-      try {
-        const res = await fetch('/api/market/benchmarks');
-        if (res.ok && active) {
-          const json = await res.json();
-          if (Array.isArray(json.benchmarks)) {
-            setItems(json.benchmarks);
-          }
-        }
-      } catch {
-        // silent fallback
+    const load = async (force = false) => {
+      if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+      const list = await fetchBenchmarksCached(force);
+      if (active && list.length > 0) {
+        setItems(list);
       }
     };
-    load();
-    const timer = setInterval(load, 120000);
+    load(false);
+    const timer = setInterval(() => load(true), 120000);
     return () => {
       active = false;
       clearInterval(timer);

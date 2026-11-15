@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { AssetClass, Currency } from '../types';
 import { shortenAssetName } from '../lib/formatAssetName';
+import { DEBT_KEYWORDS_REGEX } from '../shared/portfolioMath';
 
 interface MemberOption {
   id: string;
@@ -25,6 +26,7 @@ interface QuickAddProps {
   householdId?: string;
   fxRate: number;
   initialMode?: 'search' | 'preset' | 'upload';
+  initialQuery?: string;
   onSaveHolding: (payload: {
     ownerId: string;
     ticker: string;
@@ -63,6 +65,7 @@ export function QuickAddModal({
   defaultOwnerId,
   householdId,
   initialMode = 'search',
+  initialQuery = '',
   onSaveHolding,
   onUploadFiles
 }: QuickAddProps) {
@@ -98,6 +101,14 @@ export function QuickAddModal({
   useEffect(() => {
     if (isOpen) {
       setMode(initialMode);
+      if (initialQuery) {
+        setQuery(initialQuery);
+        setSelectedSymbol(initialQuery.toUpperCase());
+        setAssetName(initialQuery.toUpperCase());
+        setCurrency('USD');
+        setAssetClass('Equity');
+        setProvider('Finnhub');
+      }
       if (defaultOwnerId && defaultOwnerId !== 'combined') {
         setOwnerId(defaultOwnerId);
       } else if (members[0]?.id) {
@@ -105,32 +116,44 @@ export function QuickAddModal({
       }
       setAddedToast('');
     }
-  }, [isOpen, initialMode, defaultOwnerId, members]);
+  }, [isOpen, initialMode, initialQuery, defaultOwnerId, members]);
 
   useEffect(() => {
     const q = query.trim();
     if (q.length < 2) {
       setResults([]);
+      setIsSearching(false);
       return;
     }
+    const controller = new AbortController();
     const timer = setTimeout(async () => {
       setIsSearching(true);
       try {
         const hParam = householdId ? `&h=${householdId}` : '';
         const [tRes, mRes] = await Promise.all([
-          fetch(`/api/tickers/search?q=${encodeURIComponent(q)}${hParam}`),
-          fetch(`/api/mf/search?q=${encodeURIComponent(q)}`)
+          fetch(`/api/tickers/search?q=${encodeURIComponent(q)}${hParam}`, { signal: controller.signal }),
+          fetch(`/api/mf/search?q=${encodeURIComponent(q)}`, { signal: controller.signal })
         ]);
+        if (controller.signal.aborted) return;
         const tJson = tRes.ok ? await tRes.json() : [];
         const mJson = mRes.ok ? await mRes.json() : [];
-        setResults([...(Array.isArray(tJson) ? tJson : []), ...(Array.isArray(mJson) ? mJson : [])].slice(0, 12));
-      } catch {
-        setResults([]);
+        if (!controller.signal.aborted) {
+          setResults([...(Array.isArray(tJson) ? tJson : []), ...(Array.isArray(mJson) ? mJson : [])].slice(0, 12));
+        }
+      } catch (err: any) {
+        if (err?.name !== 'AbortError') {
+          setResults([]);
+        }
       } finally {
-        setIsSearching(false);
+        if (!controller.signal.aborted) {
+          setIsSearching(false);
+        }
       }
     }, 260);
-    return () => clearTimeout(timer);
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
   }, [query, householdId]);
 
   if (!isOpen) return null;
@@ -138,10 +161,12 @@ export function QuickAddModal({
   const selectSearchResult = (r: any) => {
     setSelectedSymbol(r.symbol);
     setAssetName(r.shortname || r.symbol);
-    const isInd = !!r.isIndia || String(r.symbol).endsWith('.NS') || String(r.symbol).endsWith('.BO') || r.exchDisp === 'AMFI';
+    const upperSym = String(r.symbol || '').toUpperCase();
+    const isQcom = upperSym === 'QCOM' || /qualcomm/i.test(String(r.shortname || ''));
+    const isInd = !isQcom && (!!r.isIndia || upperSym.endsWith('.NS') || upperSym.endsWith('.BO') || r.exchDisp === 'AMFI');
     setCurrency(isInd ? 'INR' : 'USD');
-    const lowerName = String(r.shortname || '').toLowerCase();
-    if (lowerName.includes('arbitrage') || lowerName.includes('liquid') || lowerName.includes('overnight') || lowerName.includes('gilt')) {
+    const lowerName = `${r.shortname || ''} ${r.symbol || ''}`.toLowerCase();
+    if (DEBT_KEYWORDS_REGEX.test(lowerName)) {
       setAssetClass('Debt');
     } else if (r.typeDisp === 'MUTUAL_FUND') {
       setAssetClass('Mutual Fund');

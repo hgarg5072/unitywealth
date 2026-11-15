@@ -28,6 +28,7 @@ import {
   calcStandardEmi,
   simulateLumpSumPrepayment
 } from '../lib/realEstateMath';
+import { formatCompactINR as fmtCrLakh, formatExactINR as fmtExactINR } from '../shared/formatters';
 
 interface Props {
   householdId: string;
@@ -39,21 +40,88 @@ interface Props {
 
 type SubTab = 'overview' | 'demands' | 'loan' | 'origins';
 
-function fmtCrLakh(val: number): string {
-  const abs = Math.abs(val);
-  const sign = val < 0 ? '-' : '';
-  if (abs >= 1_00_00_000) {
-    return `${sign}₹${(abs / 1_00_00_000).toFixed(2)} Cr`;
-  }
-  if (abs >= 1_00_000) {
-    return `${sign}₹${(abs / 1_00_000).toFixed(2)}L`;
-  }
-  return `${sign}₹${Math.round(abs).toLocaleString('en-IN')}`;
-}
+const PrepaymentSimulatorCard = React.memo(function PrepaymentSimulatorCard({
+  defaultLumpSumINR,
+  loanPrincipalINR,
+  annualRatePct,
+  targetTenureMonths,
+  currentMonthlyEmiINR
+}: {
+  defaultLumpSumINR: number;
+  loanPrincipalINR: number;
+  annualRatePct: number;
+  targetTenureMonths: number;
+  currentMonthlyEmiINR: number;
+}) {
+  const [simLumpSumINR, setSimLumpSumINR] = useState<number>(defaultLumpSumINR || 60_00_000);
 
-function fmtExactINR(val: number): string {
-  return `₹${Math.round(val).toLocaleString('en-IN')}`;
-}
+  const simResult = useMemo(
+    () =>
+      simulateLumpSumPrepayment({
+        loanPrincipalINR,
+        annualRatePct,
+        targetTenureMonths,
+        currentMonthlyEmiINR,
+        lumpSumINR: simLumpSumINR
+      }),
+    [loanPrincipalINR, annualRatePct, targetTenureMonths, currentMonthlyEmiINR, simLumpSumINR]
+  );
+
+  return (
+    <div className="bg-slate-900 text-white p-5 sm:p-6 rounded-2xl space-y-4">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+        <div>
+          <div className="text-[10px] font-black text-indigo-400 uppercase tracking-widest">
+            What-If Prepayment / Plot-Sale Simulator
+          </div>
+          <h4 className="text-base font-bold mt-0.5">
+            Inject {fmtCrLakh(simLumpSumINR)} Lump Sum against {fmtCrLakh(simResult.basePrincipal)} Full Loan
+          </h4>
+        </div>
+        <span className="font-mono text-lg font-black text-emerald-400">{fmtCrLakh(simLumpSumINR)}</span>
+      </div>
+
+      <input
+        type="range"
+        aria-label="Prepayment lump sum amount"
+        min={5_00_000}
+        max={1_50_00_000}
+        step={5_00_000}
+        value={simLumpSumINR}
+        onChange={(e) => setSimLumpSumINR(Number(e.target.value))}
+        className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-indigo-500"
+      />
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 pt-1">
+        <div className="p-4 rounded-xl bg-slate-800/90 border border-slate-700 space-y-1">
+          <div className="text-[10px] font-black text-slate-400 uppercase">
+            Option A: Lower Monthly EMI (Keep 15 Yrs)
+          </div>
+          <div className="text-xl font-black text-white font-mono">
+            {fmtExactINR(simResult.reducedEmi)}
+            <span className="text-xs font-normal text-slate-400">/mo</span>
+          </div>
+          <div className="text-xs text-emerald-400 font-semibold">
+            Saves {fmtExactINR(simResult.emiMonthlySavings)}/mo • {fmtCrLakh(simResult.optionAInterestSaved)} less interest
+          </div>
+        </div>
+
+        <div className="p-4 rounded-xl bg-indigo-950/80 border border-indigo-500/30 space-y-1">
+          <div className="text-[10px] font-black text-indigo-300 uppercase">
+            Option B: Keep {fmtExactINR(simResult.baseEmi)}/mo &amp; Finish Early
+          </div>
+          <div className="text-xl font-black text-white font-mono">
+            {(simResult.acceleratedMonths / 12).toFixed(1)} Years{' '}
+            <span className="text-xs font-bold text-emerald-400">(-{simResult.yearsSaved} yrs!)</span>
+          </div>
+          <div className="text-xs text-emerald-400 font-semibold">
+            Saves {fmtCrLakh(simResult.optionBInterestSaved)} in total bank interest
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+});
 
 const CARD_METHODS = [
   'Magnus',
@@ -125,10 +193,6 @@ export function RealEstateView({
 
   const prop = properties[selectedIdx] || properties[0] || null;
   const summary = useMemo(() => (prop ? computePropertySummary(prop) : null), [prop]);
-
-  const [simLumpSumINR, setSimLumpSumINR] = useState<number>(
-    prop?.loanConfig?.plannedPrepaymentINR || 60_00_000
-  );
 
   const updateCurrentProperty = async (updater: (p: RealEstateProperty) => RealEstateProperty) => {
     if (!prop) return;
@@ -446,15 +510,6 @@ export function RealEstateView({
       </div>
     );
   }
-
-  // Prepayment simulation values
-  const simResult = simulateLumpSumPrepayment({
-    loanPrincipalINR: prop.loanConfig.sanctionedLimitINR || summary.outstandingLoanINR || 1_80_00_000,
-    annualRatePct: prop.loanConfig.interestRatePct || 7.3,
-    targetTenureMonths: (prop.loanConfig.targetTenureYears || 15) * 12,
-    currentMonthlyEmiINR: prop.loanConfig.targetMonthlyEmiINR || 164315,
-    lumpSumINR: simLumpSumINR
-  });
 
   const paidDemands = prop.demands.filter((d) => d.status !== 'planned');
   const plannedDemands = prop.demands.filter((d) => d.status === 'planned');
@@ -1670,59 +1725,14 @@ export function RealEstateView({
             )}
           </div>
 
-          {/* Plot-Sale / Lump-Sum Prepayment Simulator */}
-          <div className="bg-slate-900 text-white p-5 sm:p-6 rounded-2xl space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-              <div>
-                <div className="text-[10px] font-black text-indigo-400 uppercase tracking-widest">
-                  What-If Prepayment / Plot-Sale Simulator
-                </div>
-                <h4 className="text-base font-bold mt-0.5">
-                  Inject {fmtCrLakh(simLumpSumINR)} Lump Sum against {fmtCrLakh(simResult.basePrincipal)} Full Loan
-                </h4>
-              </div>
-              <span className="font-mono text-lg font-black text-emerald-400">{fmtCrLakh(simLumpSumINR)}</span>
-            </div>
-
-            <input
-              type="range"
-              aria-label="Prepayment lump sum amount"
-              min={5_00_000}
-              max={1_50_00_000}
-              step={5_00_000}
-              value={simLumpSumINR}
-              onChange={(e) => setSimLumpSumINR(Number(e.target.value))}
-              className="w-full h-2 bg-slate-700 rounded-lg appearance-none cursor-pointer accent-indigo-500"
-            />
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5 pt-1">
-              <div className="p-4 rounded-xl bg-slate-800/90 border border-slate-700 space-y-1">
-                <div className="text-[10px] font-black text-slate-400 uppercase">
-                  Option A: Lower Monthly EMI (Keep 15 Yrs)
-                </div>
-                <div className="text-xl font-black text-white font-mono">
-                  {fmtExactINR(simResult.reducedEmi)}
-                  <span className="text-xs font-normal text-slate-400">/mo</span>
-                </div>
-                <div className="text-xs text-emerald-400 font-semibold">
-                  Saves {fmtExactINR(simResult.emiMonthlySavings)}/mo • {fmtCrLakh(simResult.optionAInterestSaved)} less interest
-                </div>
-              </div>
-
-              <div className="p-4 rounded-xl bg-indigo-950/80 border border-indigo-500/30 space-y-1">
-                <div className="text-[10px] font-black text-indigo-300 uppercase">
-                  Option B: Keep {fmtExactINR(simResult.baseEmi)}/mo &amp; Finish Early
-                </div>
-                <div className="text-xl font-black text-white font-mono">
-                  {(simResult.acceleratedMonths / 12).toFixed(1)} Years{' '}
-                  <span className="text-xs font-bold text-emerald-400">(-{simResult.yearsSaved} yrs!)</span>
-                </div>
-                <div className="text-xs text-emerald-400 font-semibold">
-                  Saves {fmtCrLakh(simResult.optionBInterestSaved)} in total bank interest
-                </div>
-              </div>
-            </div>
-          </div>
+          {/* Plot-Sale / Lump-Sum Prepayment Simulator (isolated memoized component) */}
+          <PrepaymentSimulatorCard
+            defaultLumpSumINR={prop.loanConfig.plannedPrepaymentINR || 60_00_000}
+            loanPrincipalINR={prop.loanConfig.sanctionedLimitINR || summary.outstandingLoanINR || 1_80_00_000}
+            annualRatePct={prop.loanConfig.interestRatePct || 7.3}
+            targetTenureMonths={(prop.loanConfig.targetTenureYears || 15) * 12}
+            currentMonthlyEmiINR={prop.loanConfig.targetMonthlyEmiINR || 164315}
+          />
         </div>
       )}
 

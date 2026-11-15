@@ -10,19 +10,9 @@ import {
   X,
   ArrowRight
 } from 'lucide-react';
+import type { NotificationRecord } from '../types';
 
-export interface AppNotificationItem {
-  id: string;
-  householdId: string;
-  userId?: string;
-  category: 'import' | 'family' | 'milestone' | 'drift' | 'system';
-  severity: 'info' | 'success' | 'warning';
-  title: string;
-  message: string;
-  actionTab?: string;
-  isRead: boolean;
-  createdAt: number;
-}
+export type AppNotificationItem = NotificationRecord;
 
 export interface SmartInsightAlert {
   id: string;

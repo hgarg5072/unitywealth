@@ -10,7 +10,13 @@ import {
   Check,
   X
 } from 'lucide-react';
-import { formatCompactINR, formatCompactUSD } from './WealthJourneyView';
+import {
+  formatCompactINR,
+  formatCompactUSD,
+  FX_FALLBACK_RATE,
+  getHoldingOwnerId
+} from '../shared/formatters';
+import { normalizeHoldingClassification } from '../shared/portfolioMath';
 
 export type AssetRegionFilter =
   | 'all'
@@ -122,48 +128,59 @@ export function HoldingsExplorer({
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [isBusy, setIsBusy] = useState(false);
 
-  const safeFx = fxRate || 84;
+  const safeFx = fxRate || FX_FALLBACK_RATE;
 
+  const memberNameMap = useMemo(
+    () => new Map(members.map((m) => [m.id, m.name])),
+    [members]
+  );
+
+  // Stage 1: Static holding normalization (only recomputes when holdings array or formatName changes, never on FX tick)
+  const staticNormalized = useMemo(() => {
+    return holdings
+      .filter((h) => !h?.isPlaceholder)
+      .map((h) => {
+        const qty = Number(h.quantity) || 0;
+        const price = Number(h.currentPrice) || 0;
+        const cls = normalizeHoldingClassification(h);
+        const ownerId = getHoldingOwnerId(h);
+        const displayName = formatName(h.originalName || h.ticker || 'Asset', h.ticker);
+        const accountBucket = normalizeAccountBucket(h);
+        const baseHaystack = `${displayName} ${h.originalName || ''} ${h.ticker || ''} ${h.provider || ''} ${accountBucket}`.toLowerCase();
+        return {
+          ...h,
+          assetClass: cls.assetClass,
+          currency: cls.currency,
+          qty,
+          price,
+          ownerId,
+          displayName,
+          accountBucket,
+          baseHaystack
+        };
+      });
+  }, [holdings, formatName]);
+
+  // Stage 2: Lightweight FX valuation & O(1) member name lookup
   const enriched = useMemo(() => {
-    const clean = holdings.filter((h) => !h?.isPlaceholder);
-    const totalAllINR = clean.reduce((sum, h) => {
-      const v =
-        typeof h.valINR === 'number'
-          ? h.valINR
-          : h.currency === 'USD'
-          ? (Number(h.quantity) || 0) * (Number(h.currentPrice) || 0) * safeFx
-          : (Number(h.quantity) || 0) * (Number(h.currentPrice) || 0);
-      return sum + v;
-    }, 0);
-
-    return clean.map((h) => {
-      const qty = Number(h.quantity) || 0;
-      const price = Number(h.currentPrice) || 0;
+    let totalAllINR = 0;
+    const withVal = staticNormalized.map((h) => {
       const valINR =
         typeof h.valINR === 'number'
           ? h.valINR
           : h.currency === 'USD'
-          ? qty * price * safeFx
-          : qty * price;
-      const ownerId = h.ownerId || h.userId || '';
-      const ownerName = members.find((m) => m.id === ownerId)?.name || '';
-      const displayName = formatName(h.originalName || h.ticker || 'Asset', h.ticker);
-      const accountBucket = normalizeAccountBucket(h);
-      const weightPct = totalAllINR > 0 ? (valINR / totalAllINR) * 100 : 0;
-
-      return {
-        ...h,
-        qty,
-        price,
-        valINR,
-        ownerId,
-        ownerName,
-        displayName,
-        accountBucket,
-        weightPct
-      };
+          ? h.qty * h.price * safeFx
+          : h.qty * h.price;
+      totalAllINR += valINR;
+      const ownerName = memberNameMap.get(h.ownerId) || '';
+      return { ...h, valINR, ownerName };
     });
-  }, [holdings, safeFx, members, formatName]);
+
+    return withVal.map((h) => ({
+      ...h,
+      weightPct: totalAllINR > 0 ? (h.valINR / totalAllINR) * 100 : 0
+    }));
+  }, [staticNormalized, safeFx, memberNameMap]);
 
   const totalPortfolioINR = useMemo(
     () => enriched.reduce((s, h) => s + h.valINR, 0),
@@ -220,8 +237,7 @@ export function HoldingsExplorer({
 
       // 4. Text search
       if (q) {
-        const hay = `${h.displayName} ${h.originalName || ''} ${h.ticker || ''} ${h.provider || ''} ${h.accountBucket} ${h.ownerName}`.toLowerCase();
-        if (!hay.includes(q)) return false;
+        if (!h.baseHaystack.includes(q) && !h.ownerName.toLowerCase().includes(q)) return false;
       }
 
       return true;

@@ -1,19 +1,10 @@
-import { 
-  collection, 
-  doc, 
-  getDoc, 
-  getDocs, 
-  setDoc, 
-  updateDoc, 
-  deleteDoc, 
-  query, 
-  where, 
-  onSnapshot,
-  collectionGroup,
+import {
   DocumentData,
-  QueryConstraint
+  DocumentReference,
+  Firestore,
+  writeBatch
 } from 'firebase/firestore';
-import { db, auth } from './firebase';
+import { auth } from './firebase';
 
 export enum OperationType {
   CREATE = 'create',
@@ -33,7 +24,7 @@ interface FirestoreErrorInfo {
     email?: string | null;
     emailVerified?: boolean | null;
     isAnonymous?: boolean | null;
-  }
+  };
 }
 
 export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
@@ -52,53 +43,34 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   throw new Error(JSON.stringify(errInfo));
 }
 
-// Helper generic functions
+export type ChunkedBatchOperation =
+  | { type: 'set'; ref: DocumentReference<DocumentData>; data: DocumentData; merge?: boolean }
+  | { type: 'update'; ref: DocumentReference<DocumentData>; data: DocumentData }
+  | { type: 'delete'; ref: DocumentReference<DocumentData> };
 
-export async function getDocument<T>(collectionPath: string, id: string): Promise<T | null> {
-  try {
-    const docRef = doc(db, collectionPath, id);
-    const snap = await getDoc(docRef);
-    return snap.exists() ? snap.data() as T : null;
-  } catch (error) {
-    handleFirestoreError(error, OperationType.GET, `${collectionPath}/${id}`);
-    return null;
-  }
-}
-
-export async function listDocuments<T>(collectionPath: string, constraints: QueryConstraint[] = []): Promise<T[]> {
-  try {
-    const q = query(collection(db, collectionPath), ...constraints);
-    const snap = await getDocs(q);
-    return snap.docs.map(doc => ({ ...doc.data() as T, id: doc.id }));
-  } catch (error) {
-    handleFirestoreError(error, OperationType.LIST, collectionPath);
-    return [];
-  }
-}
-
-export async function setDocument<T extends DocumentData>(collectionPath: string, id: string, data: T) {
-  try {
-    const docRef = doc(db, collectionPath, id);
-    await setDoc(docRef, data);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.WRITE, `${collectionPath}/${id}`);
-  }
-}
-
-export async function updateDocument<T extends DocumentData>(collectionPath: string, id: string, data: Partial<T>) {
-  try {
-    const docRef = doc(db, collectionPath, id);
-    await updateDoc(docRef, data as any);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.UPDATE, `${collectionPath}/${id}`);
-  }
-}
-
-export async function removeDocument(collectionPath: string, id: string) {
-  try {
-    const docRef = doc(db, collectionPath, id);
-    await deleteDoc(docRef);
-  } catch (error) {
-    handleFirestoreError(error, OperationType.DELETE, `${collectionPath}/${id}`);
+/**
+ * Safely commits any number of Firestore writes by splitting into <= 450-op batches
+ * so large CAS/portfolio imports or member migrations never hit Firestore's 500-op batch ceiling.
+ */
+export async function commitChunkedBatch(
+  firestoreDb: Firestore,
+  operations: ChunkedBatchOperation[],
+  chunkSize = 450
+): Promise<void> {
+  if (operations.length === 0) return;
+  for (let i = 0; i < operations.length; i += chunkSize) {
+    const slice = operations.slice(i, i + chunkSize);
+    const batch = writeBatch(firestoreDb);
+    for (const op of slice) {
+      if (op.type === 'set') {
+        if (op.merge) batch.set(op.ref, op.data, { merge: true });
+        else batch.set(op.ref, op.data);
+      } else if (op.type === 'update') {
+        batch.update(op.ref, op.data);
+      } else if (op.type === 'delete') {
+        batch.delete(op.ref);
+      }
+    }
+    await batch.commit();
   }
 }

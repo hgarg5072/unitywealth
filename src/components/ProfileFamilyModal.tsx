@@ -16,18 +16,9 @@ import {
   ChevronUp,
   ArrowRightLeft
 } from "lucide-react";
+import type { EmailStatusPublic } from "../types";
 
-export interface EmailStatusInfo {
-  configured: boolean;
-  provider: string;
-  senderEmail: string | null;
-  officialSenderEmail?: string;
-  isOfficialSender?: boolean;
-  hasRefreshToken: boolean;
-  canSendToAnyone: boolean;
-  googleOAuthAvailable: boolean;
-  warning?: string;
-}
+export type EmailStatusInfo = EmailStatusPublic;
 
 interface ProfileFamilyModalProps {
   isOpen: boolean;

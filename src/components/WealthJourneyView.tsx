@@ -32,85 +32,159 @@ import {
   BarChart3,
   X
 } from 'lucide-react';
+import {
+  formatCompactINR,
+  formatCompactUSD,
+  FX_FALLBACK_RATE,
+  WEALTH_MILESTONES_INR
+} from '../shared/formatters';
+import type {
+  MemberSnapshotBreakdown,
+  HoldingSnapshotBreakdown,
+  RebalanceSnapshotMeta,
+  WealthSnapshotRecord
+} from '../types';
 
-export interface MemberSnapshotEntry {
-  id: string;
-  name: string;
-  valueINR: number;
-  indianEquityINR?: number;
-  foreignEquityINR?: number;
-  debtINR?: number;
-  realEstateEquityINR?: number;
-}
+export { formatCompactINR, formatCompactUSD };
+export type MemberSnapshotEntry = MemberSnapshotBreakdown;
+export type HoldingSnapshotEntry = HoldingSnapshotBreakdown;
+export type { RebalanceSnapshotMeta };
+export type WealthSnapshotItem = WealthSnapshotRecord;
 
-export interface HoldingSnapshotEntry {
-  key: string;
-  ticker: string;
-  name: string;
-  ownerId: string;
-  assetClass: string;
-  currency: string;
-  provider: string;
-  units: number;
-  price: number;
-  valueINR: number;
-}
+const CompoundingSimulatorCard = React.memo(function CompoundingSimulatorCard({
+  currentINR,
+  scopeLabel
+}: {
+  currentINR: number;
+  scopeLabel: string;
+}) {
+  const [monthlySipINR, setMonthlySipINR] = useState(150000);
+  const [annualReturnPct, setAnnualReturnPct] = useState(12);
+  const [horizonYears, setHorizonYears] = useState(10);
 
-export interface RebalanceSnapshotMeta {
-  actualEquityPct?: number;
-  targetEquityPct?: number;
-  actualIndianOfEqPct?: number;
-  targetIndianOfEqPct?: number;
-  alignmentPct?: number;
-}
+  const projectionData = useMemo(() => {
+    const startPrincipal = currentINR || 0;
+    const monthlyRate = annualReturnPct / 100 / 12;
+    const pts: { yearLabel: string; projected: number; principal: number }[] = [];
+    for (let yr = 0; yr <= horizonYears; yr++) {
+      const months = yr * 12;
+      let fv = startPrincipal * Math.pow(1 + monthlyRate, months);
+      if (monthlyRate > 0 && months > 0) {
+        fv += monthlySipINR * ((Math.pow(1 + monthlyRate, months) - 1) / monthlyRate);
+      } else {
+        fv += monthlySipINR * months;
+      }
+      const invested = startPrincipal + monthlySipINR * months;
+      pts.push({
+        yearLabel: yr === 0 ? 'Now' : `${yr}Y`,
+        projected: Math.round(fv),
+        principal: Math.round(invested)
+      });
+    }
+    return pts;
+  }, [currentINR, monthlySipINR, annualReturnPct, horizonYears]);
 
-export interface WealthSnapshotItem {
-  householdId: string;
-  snapshotMonth: string; // YYYY-MM
-  recordedAt: number;
-  totalINR: number;
-  totalUSD: number;
-  indianEquityINR: number;
-  foreignEquityINR: number;
-  debtINR: number;
-  realEstateEquityINR?: number;
-  realEstateLoanINR?: number;
-  fxRate: number;
-  holdingsCount: number;
-  memberBreakdown: MemberSnapshotEntry[];
-  providerBreakdown?: Record<string, number>;
-  holdingsBreakdown?: HoldingSnapshotEntry[];
-  rebalanceMeta?: RebalanceSnapshotMeta;
-  source: string;
-  note?: string;
-}
+  const finalProjectedINR = projectionData[projectionData.length - 1]?.projected || 0;
 
-export function formatCompactINR(val: number): string {
-  const abs = Math.abs(val);
-  const sign = val < 0 ? '-' : '';
-  if (abs >= 1_00_00_000) {
-    return `${sign}₹${(abs / 1_00_00_000).toFixed(2)} Cr`;
-  }
-  if (abs >= 1_00_000) {
-    return `${sign}₹${(abs / 1_00_000).toFixed(2)} L`;
-  }
-  if (abs >= 1_000) {
-    return `${sign}₹${(abs / 1_000).toFixed(1)}K`;
-  }
-  return `${sign}₹${Math.round(abs).toLocaleString('en-IN')}`;
-}
+  return (
+    <div className="bg-slate-900 text-white p-5 sm:p-7 rounded-2xl shadow-lg">
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6">
+        <div className="space-y-4 lg:w-5/12">
+          <div className="flex items-center gap-2 text-indigo-400 text-xs font-black uppercase tracking-widest">
+            <Sparkles size={15} /> {scopeLabel} Compounding Trajectory
+          </div>
+          <div>
+            <div className="text-2xl sm:text-3xl font-black text-white">
+              {formatCompactINR(finalProjectedINR)}
+            </div>
+            <p className="text-xs text-slate-400 mt-1">
+              Projected wealth in <strong>{horizonYears} years</strong> starting from {formatCompactINR(currentINR)}
+            </p>
+          </div>
 
-export function formatCompactUSD(val: number): string {
-  const abs = Math.abs(val);
-  const sign = val < 0 ? '-' : '';
-  if (abs >= 1_000_000) {
-    return `${sign}$${(abs / 1_000_000).toFixed(2)}M`;
-  }
-  if (abs >= 1_000) {
-    return `${sign}$${(abs / 1_000).toFixed(1)}K`;
-  }
-  return `${sign}$${Math.round(abs).toLocaleString('en-US')}`;
-}
+          <div className="space-y-3 pt-2">
+            <div>
+              <div className="flex justify-between text-xs font-bold mb-1">
+                <span className="text-slate-400">Monthly SIP / Savings</span>
+                <span className="text-emerald-400">₹{monthlySipINR.toLocaleString('en-IN')}/mo</span>
+              </div>
+              <input
+                type="range"
+                aria-label="Monthly Family SIP in INR"
+                min={0}
+                max={1000000}
+                step={25000}
+                value={monthlySipINR}
+                onChange={(e) => setMonthlySipINR(Number(e.target.value))}
+                className="w-full accent-indigo-500 cursor-pointer"
+              />
+            </div>
+
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <div className="flex justify-between text-xs font-bold mb-1">
+                  <span className="text-slate-400">Expected CAGR</span>
+                  <span className="text-indigo-300">{annualReturnPct}%</span>
+                </div>
+                <input
+                  type="range"
+                  aria-label="Expected Annual Return Percentage"
+                  min={6}
+                  max={18}
+                  step={1}
+                  value={annualReturnPct}
+                  onChange={(e) => setAnnualReturnPct(Number(e.target.value))}
+                  className="w-full accent-indigo-500 cursor-pointer"
+                />
+              </div>
+              <div>
+                <div className="flex justify-between text-xs font-bold mb-1">
+                  <span className="text-slate-400">Horizon</span>
+                  <span className="text-indigo-300">{horizonYears} Yrs</span>
+                </div>
+                <input
+                  type="range"
+                  aria-label="Projection Horizon in Years"
+                  min={3}
+                  max={25}
+                  step={1}
+                  value={horizonYears}
+                  onChange={(e) => setHorizonYears(Number(e.target.value))}
+                  className="w-full accent-indigo-500 cursor-pointer"
+                />
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="h-52 sm:h-60 lg:w-7/12">
+          <ResponsiveContainer width="100%" height="100%">
+            <AreaChart data={projectionData} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
+              <defs>
+                <linearGradient id="projGrad" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="5%" stopColor="#818cf8" stopOpacity={0.4} />
+                  <stop offset="95%" stopColor="#818cf8" stopOpacity={0.02} />
+                </linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#1e293b" />
+              <XAxis dataKey="yearLabel" tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
+              <YAxis tickFormatter={(v) => formatCompactINR(Number(v))} tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={72} />
+              <Tooltip
+                formatter={(v: any, key: any) => [
+                  formatCompactINR(Number(v)),
+                  key === 'projected' ? 'Projected Wealth' : 'Invested Capital'
+                ]}
+                contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '12px', color: '#fff', fontSize: '12px' }}
+              />
+              <Area type="monotone" dataKey="projected" stroke="#818cf8" strokeWidth={2.5} fill="url(#projGrad)" />
+              <Area type="monotone" dataKey="principal" stroke="#475569" strokeDasharray="4 4" strokeWidth={1.5} fill="none" />
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      </div>
+    </div>
+  );
+});
 
 function cleanDisplayAssetName(raw: string, ticker?: string): string {
   if (!raw) return 'Asset';
@@ -125,16 +199,7 @@ function formatMonthLabel(ym: string): string {
   return `${names[idx]} '${y.slice(-2)}`;
 }
 
-const MILESTONES_INR = [
-  25_00_000,
-  50_00_000,
-  1_00_00_000,
-  2_50_00_000,
-  5_00_00_000,
-  10_00_00_000,
-  25_00_00_000,
-  50_00_00_000
-];
+const MILESTONES_INR = WEALTH_MILESTONES_INR;
 
 const MEMBER_COLORS = ['#4f46e5', '#10b981', '#f59e0b', '#ec4899', '#06b6d4', '#8b5cf6'];
 
@@ -228,12 +293,15 @@ export function WealthJourneyView({
   const [bfNote, setBfNote] = useState('');
   const [isSavingBf, setIsSavingBf] = useState(false);
 
-  // Wealth Compounding Simulator State
-  const [monthlySipINR, setMonthlySipINR] = useState(150000);
-  const [annualReturnPct, setAnnualReturnPct] = useState(12);
-  const [horizonYears, setHorizonYears] = useState(10);
-
-  const safeFx = fxRate || 84;
+  const safeFx = fxRate || FX_FALLBACK_RATE;
+  const memberNameMap = useMemo(
+    () => new Map(members.map((m) => [m.id, m.name])),
+    [members]
+  );
+  const persistedSnapshotMonths = useMemo(
+    () => new Set(snapshots.map((s) => s.snapshotMonth)),
+    [snapshots]
+  );
   const rawEqTarget =
     targets?.assetSplit?.Equity ??
     targets?.equity ??
@@ -670,35 +738,11 @@ export function WealthJourneyView({
     };
   }, [scopedSeries]);
 
-  // Compounding Projection Series
-  const projectionData = useMemo(() => {
-    const startPrincipal = metrics.currentINR || 0;
-    const monthlyRate = annualReturnPct / 100 / 12;
-    const pts: { yearLabel: string; projected: number; principal: number }[] = [];
-    for (let yr = 0; yr <= horizonYears; yr++) {
-      const months = yr * 12;
-      let fv = startPrincipal * Math.pow(1 + monthlyRate, months);
-      if (monthlyRate > 0 && months > 0) {
-        fv += monthlySipINR * ((Math.pow(1 + monthlyRate, months) - 1) / monthlyRate);
-      } else {
-        fv += monthlySipINR * months;
-      }
-      const invested = startPrincipal + monthlySipINR * months;
-      pts.push({
-        yearLabel: yr === 0 ? 'Now' : `${yr}Y`,
-        projected: Math.round(fv),
-        principal: Math.round(invested)
-      });
-    }
-    return pts;
-  }, [metrics.currentINR, monthlySipINR, annualReturnPct, horizonYears]);
-
-  const finalProjectedINR = projectionData[projectionData.length - 1]?.projected || 0;
   const formatVal = (v: number) => (currency === 'USD' ? formatCompactUSD(v) : formatCompactINR(v));
   const activeScopeName =
     scope === 'family'
       ? 'Family Combined'
-      : members.find((m) => m.id === scope)?.name || 'Member';
+      : memberNameMap.get(scope) || 'Member';
 
   const filteredDropdownAssets = useMemo(() => {
     const q = assetSearch.trim().toLowerCase();
@@ -1396,8 +1440,8 @@ export function WealthJourneyView({
                   />
                   <Tooltip
                     formatter={(val: any, key: any) => {
-                      const mem = members.find((m) => `m_${m.id}` === key);
-                      return [formatVal(Number(val)), mem?.name || key];
+                      const rawId = String(key || '').startsWith('m_') ? String(key).slice(2) : String(key);
+                      return [formatVal(Number(val)), memberNameMap.get(rawId) || key];
                     }}
                     contentStyle={{ borderRadius: '14px', border: '1px solid #e2e8f0', fontSize: '12px', fontWeight: 700 }}
                   />
@@ -1485,103 +1529,11 @@ export function WealthJourneyView({
         )}
       </div>
 
-      {/* Family Wealth Compounding & Financial Freedom Simulator */}
-      <div className="bg-slate-900 text-white p-5 sm:p-7 rounded-2xl shadow-lg">
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-6">
-          <div className="space-y-4 lg:w-5/12">
-            <div className="flex items-center gap-2 text-indigo-400 text-xs font-black uppercase tracking-widest">
-              <Sparkles size={15} /> {scope === 'family' ? 'Family' : activeScopeName} Compounding Trajectory
-            </div>
-            <div>
-              <div className="text-2xl sm:text-3xl font-black text-white">
-                {formatCompactINR(finalProjectedINR)}
-              </div>
-              <p className="text-xs text-slate-400 mt-1">
-                Projected wealth in <strong>{horizonYears} years</strong> starting from {formatCompactINR(metrics.currentINR)}
-              </p>
-            </div>
-
-            <div className="space-y-3 pt-2">
-              <div>
-                <div className="flex justify-between text-xs font-bold mb-1">
-                  <span className="text-slate-400">Monthly SIP / Savings</span>
-                  <span className="text-emerald-400">₹{monthlySipINR.toLocaleString('en-IN')}/mo</span>
-                </div>
-                <input
-                  type="range"
-                  aria-label="Monthly Family SIP in INR"
-                  min={0}
-                  max={1000000}
-                  step={25000}
-                  value={monthlySipINR}
-                  onChange={(e) => setMonthlySipINR(Number(e.target.value))}
-                  className="w-full accent-indigo-500 cursor-pointer"
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <div className="flex justify-between text-xs font-bold mb-1">
-                    <span className="text-slate-400">Expected CAGR</span>
-                    <span className="text-indigo-300">{annualReturnPct}%</span>
-                  </div>
-                  <input
-                    type="range"
-                    aria-label="Expected Annual Return Percentage"
-                    min={6}
-                    max={18}
-                    step={1}
-                    value={annualReturnPct}
-                    onChange={(e) => setAnnualReturnPct(Number(e.target.value))}
-                    className="w-full accent-indigo-500 cursor-pointer"
-                  />
-                </div>
-                <div>
-                  <div className="flex justify-between text-xs font-bold mb-1">
-                    <span className="text-slate-400">Horizon</span>
-                    <span className="text-indigo-300">{horizonYears} Yrs</span>
-                  </div>
-                  <input
-                    type="range"
-                    aria-label="Projection Horizon in Years"
-                    min={3}
-                    max={25}
-                    step={1}
-                    value={horizonYears}
-                    onChange={(e) => setHorizonYears(Number(e.target.value))}
-                    className="w-full accent-indigo-500 cursor-pointer"
-                  />
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <div className="h-52 sm:h-60 lg:w-7/12">
-            <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={projectionData} margin={{ top: 8, right: 8, left: 0, bottom: 0 }}>
-                <defs>
-                  <linearGradient id="projGrad" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#818cf8" stopOpacity={0.4} />
-                    <stop offset="95%" stopColor="#818cf8" stopOpacity={0.02} />
-                  </linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#1e293b" />
-                <XAxis dataKey="yearLabel" tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} />
-                <YAxis tickFormatter={(v) => formatCompactINR(Number(v))} tick={{ fontSize: 11, fill: '#94a3b8' }} axisLine={false} tickLine={false} width={72} />
-                <Tooltip
-                  formatter={(v: any, key: any) => [
-                    formatCompactINR(Number(v)),
-                    key === 'projected' ? 'Projected Wealth' : 'Invested Capital'
-                  ]}
-                  contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: '12px', color: '#fff', fontSize: '12px' }}
-                />
-                <Area type="monotone" dataKey="projected" stroke="#818cf8" strokeWidth={2.5} fill="url(#projGrad)" />
-                <Area type="monotone" dataKey="principal" stroke="#475569" strokeDasharray="4 4" strokeWidth={1.5} fill="none" />
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-      </div>
+      {/* Family Wealth Compounding & Financial Freedom Simulator (isolated memoized component) */}
+      <CompoundingSimulatorCard
+        currentINR={metrics.currentINR}
+        scopeLabel={scope === 'family' ? 'Family' : activeScopeName}
+      />
 
       {/* Monthly Snapshot Ledger */}
       <div className="bg-white p-4 sm:p-6 rounded-2xl border border-slate-200 shadow-sm">
@@ -1618,7 +1570,7 @@ export function WealthJourneyView({
                   <div className="text-sm font-black text-slate-900">{formatCompactINR(pt.totalINR)}</div>
                   <div className="text-[10px] text-slate-400 uppercase font-bold">{pt.raw.source.replace('_', ' ')}</div>
                 </div>
-                {snapshots.some((raw) => raw.snapshotMonth === pt.month) && (
+                {persistedSnapshotMonths.has(pt.month) && (
                   <button
                     type="button"
                     aria-label={`Delete snapshot ${pt.month}`}
@@ -1671,7 +1623,7 @@ export function WealthJourneyView({
                     </span>
                   </td>
                   <td className="py-3 text-right">
-                    {snapshots.some((raw) => raw.snapshotMonth === pt.month) && (
+                    {persistedSnapshotMonths.has(pt.month) && (
                       <button
                         type="button"
                         aria-label={`Delete snapshot ${pt.month}`}

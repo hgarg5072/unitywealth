@@ -686,9 +686,11 @@ export function buildRebalanceEmailContent(params: {
   appUrl: string;
 }) {
   const fmtCrore = (v: number) => {
-    if (v >= 1_00_00_000) return `Rs. ${(v / 1_00_00_000).toFixed(2)} Cr`;
-    if (v >= 1_00_000) return `Rs. ${(v / 1_00_000).toFixed(2)} L`;
-    return `Rs. ${Math.round(v).toLocaleString("en-IN")}`;
+    const abs = Math.abs(v);
+    const sign = v < 0 ? "-" : "";
+    if (abs >= 1_00_00_000) return `${sign}Rs. ${(abs / 1_00_00_000).toFixed(2)} Cr`;
+    if (abs >= 1_00_000) return `${sign}Rs. ${(abs / 1_00_000).toFixed(2)} L`;
+    return `${sign}Rs. ${Math.round(abs).toLocaleString("en-IN")}`;
   };
 
   const subject = `${params.householdName} — ${params.mode === "sip" ? "Monthly SIP Plan" : "Portfolio Rebalance Summary"} (${params.accuracy.toFixed(1)}% aligned)`;

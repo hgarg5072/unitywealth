@@ -1,71 +1,24 @@
 import pg from "pg";
+import {
+  MemberSnapshotBreakdown,
+  HoldingSnapshotBreakdown,
+  RebalanceSnapshotMeta,
+  WealthSnapshotRecord,
+  NotificationRecord,
+  RealEstateProperty
+} from "../types";
+import { LRUCache } from "../shared/lruCache";
+import { FX_FALLBACK_RATE } from "../shared/formatters";
+
+export type {
+  MemberSnapshotBreakdown,
+  HoldingSnapshotBreakdown,
+  RebalanceSnapshotMeta,
+  WealthSnapshotRecord,
+  NotificationRecord
+};
 
 const { Pool } = pg;
-
-export interface MemberSnapshotBreakdown {
-  id: string;
-  name: string;
-  valueINR: number;
-  indianEquityINR?: number;
-  foreignEquityINR?: number;
-  debtINR?: number;
-  realEstateEquityINR?: number;
-}
-
-export interface HoldingSnapshotBreakdown {
-  key: string;
-  ticker: string;
-  name: string;
-  ownerId: string;
-  assetClass: string;
-  currency: string;
-  provider: string;
-  units: number;
-  price: number;
-  valueINR: number;
-}
-
-export interface RebalanceSnapshotMeta {
-  actualEquityPct?: number;
-  targetEquityPct?: number;
-  actualIndianOfEqPct?: number;
-  targetIndianOfEqPct?: number;
-  alignmentPct?: number;
-}
-
-export interface WealthSnapshotRecord {
-  householdId: string;
-  snapshotMonth: string; // YYYY-MM
-  recordedAt: number;
-  totalINR: number;
-  totalUSD: number;
-  indianEquityINR: number;
-  foreignEquityINR: number;
-  debtINR: number;
-  realEstateEquityINR?: number;
-  realEstateLoanINR?: number;
-  fxRate: number;
-  holdingsCount: number;
-  memberBreakdown: MemberSnapshotBreakdown[];
-  providerBreakdown: Record<string, number>;
-  holdingsBreakdown?: HoldingSnapshotBreakdown[];
-  rebalanceMeta?: RebalanceSnapshotMeta;
-  source: string;
-  note?: string;
-}
-
-export interface NotificationRecord {
-  id: string;
-  householdId: string;
-  userId?: string;
-  category: "import" | "family" | "milestone" | "drift" | "system";
-  severity: "info" | "success" | "warning";
-  title: string;
-  message: string;
-  actionTab?: string;
-  isRead: boolean;
-  createdAt: number;
-}
 
 export interface CachedQuoteRecord {
   symbol: string;
@@ -80,19 +33,23 @@ let pool: pg.Pool | null = null;
 let pgReady = false;
 let lastPgError: string | null = null;
 
-// In-memory fallback maps so local dev without DATABASE_URL still works identically
+// In-memory fallback maps ONLY populated when PostgreSQL is unavailable (local dev without DATABASE_URL)
 const fallbackSnapshots = new Map<string, Map<string, WealthSnapshotRecord>>();
 const fallbackNotifications = new Map<string, NotificationRecord[]>();
+const fallbackStateKeys = new Map<string, any>();
+const fallbackRealEstate = new Map<string, RealEstateProperty[]>();
+
+// 60-second read cache for uw_app_state (avoids repeated SELECTs on /api/health & /api/email/status)
+const appStateReadCache = new LRUCache<string, any>(256, 60_000);
 
 export async function initPostgresStore(): Promise<{
   connected: boolean;
-  restoredDbJson: any | null;
   restoredInviteCodes: Record<string, any>;
 }> {
   const dbUrl = (process.env.DATABASE_URL || "").trim();
   if (!dbUrl) {
     lastPgError = "DATABASE_URL not set (running with local fallback)";
-    return { connected: false, restoredDbJson: null, restoredInviteCodes: {} };
+    return { connected: false, restoredInviteCodes: {} };
   }
 
   const createCandidatePool = (useSsl: boolean) =>
@@ -141,6 +98,8 @@ export async function initPostgresStore(): Promise<{
         provider_breakdown JSONB NOT NULL DEFAULT '{}'::jsonb,
         holdings_breakdown JSONB NOT NULL DEFAULT '[]'::jsonb,
         rebalance_meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+        real_estate_equity_inr DOUBLE PRECISION NOT NULL DEFAULT 0,
+        real_estate_loan_inr DOUBLE PRECISION NOT NULL DEFAULT 0,
         source TEXT NOT NULL DEFAULT 'auto',
         note TEXT NOT NULL DEFAULT '',
         UNIQUE (household_id, snapshot_month)
@@ -190,12 +149,21 @@ export async function initPostgresStore(): Promise<{
       CREATE INDEX IF NOT EXISTS idx_uw_notif_hh_created
         ON uw_notifications (household_id, created_at DESC);
 
+      CREATE INDEX IF NOT EXISTS idx_uw_notif_unread
+        ON uw_notifications (household_id) WHERE is_read = FALSE;
+
       CREATE TABLE IF NOT EXISTS uw_market_cache (
         symbol TEXT PRIMARY KEY,
         price DOUBLE PRECISION NOT NULL,
         prev_close DOUBLE PRECISION NOT NULL DEFAULT 0,
         change_pct DOUBLE PRECISION NOT NULL DEFAULT 0,
         currency TEXT NOT NULL DEFAULT 'USD',
+        updated_at BIGINT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS uw_real_estate (
+        household_id TEXT PRIMARY KEY,
+        properties JSONB NOT NULL DEFAULT '[]'::jsonb,
         updated_at BIGINT NOT NULL
       );
 
@@ -206,23 +174,17 @@ export async function initPostgresStore(): Promise<{
       );
     `);
 
+    // Prune stale market quote cache entries (> 7 days old) asynchronously
+    const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    pool
+      .query("DELETE FROM uw_market_cache WHERE updated_at < $1", [sevenDaysAgo])
+      .catch(() => {});
+
     pgReady = true;
     lastPgError = null;
     console.log("[Postgres] Connected & schema verified successfully.");
 
-    // Hydrate persisted app state & invite codes across container redeploys
-    let restoredDbJson: any | null = null;
     const restoredInviteCodes: Record<string, any> = {};
-
-    try {
-      const stateRes = await pool.query("SELECT payload FROM uw_app_state WHERE state_key = $1", ["db_json"]);
-      if (stateRes.rows.length > 0 && stateRes.rows[0].payload) {
-        restoredDbJson = stateRes.rows[0].payload;
-      }
-    } catch (e: any) {
-      console.warn("[Postgres] State hydration warning:", e.message);
-    }
-
     try {
       const invRes = await pool.query("SELECT * FROM uw_invite_codes");
       for (const r of invRes.rows) {
@@ -243,11 +205,11 @@ export async function initPostgresStore(): Promise<{
       console.warn("[Postgres] Invite code hydration warning:", e.message);
     }
 
-    return { connected: true, restoredDbJson, restoredInviteCodes };
+    return { connected: true, restoredInviteCodes };
   } catch (err: any) {
     lastPgError = err?.message || String(err);
     console.error("[Postgres] Initialization failed:", lastPgError);
-    return { connected: false, restoredDbJson: null, restoredInviteCodes: {} };
+    return { connected: false, restoredInviteCodes: {} };
   }
 }
 
@@ -258,25 +220,6 @@ export function getPostgresStatus() {
     idleCount: pool?.idleCount ?? 0,
     error: lastPgError
   };
-}
-
-let stateSyncTimer: ReturnType<typeof setTimeout> | null = null;
-export function persistAppStateAsync(payload: any) {
-  if (!pgReady || !pool) return;
-  if (stateSyncTimer) clearTimeout(stateSyncTimer);
-  stateSyncTimer = setTimeout(async () => {
-    try {
-      await pool!.query(
-        `INSERT INTO uw_app_state (state_key, payload, updated_at)
-         VALUES ($1, $2::jsonb, $3)
-         ON CONFLICT (state_key)
-         DO UPDATE SET payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at`,
-        ["db_json", JSON.stringify(payload), Date.now()]
-      );
-    } catch (err: any) {
-      console.warn("[Postgres] App state backup failed:", err.message);
-    }
-  }, 400);
 }
 
 export async function upsertInviteCodePg(entry: any): Promise<void> {
@@ -364,18 +307,46 @@ export async function getInviteByHouseholdPg(householdId: string): Promise<any |
   }
 }
 
+/**
+ * Fast O(1) aggregate query to find previous peak INR net worth without downloading historical JSONB blobs.
+ */
+export async function getMaxWealthSnapshotInrPg(
+  householdId: string,
+  excludeMonth?: string
+): Promise<number> {
+  if (!pgReady || !pool) {
+    const map = fallbackSnapshots.get(householdId);
+    if (!map) return 0;
+    let maxVal = 0;
+    for (const [m, snap] of map.entries()) {
+      if (excludeMonth && m === excludeMonth) continue;
+      if (snap.totalINR > maxVal) maxVal = snap.totalINR;
+    }
+    return maxVal;
+  }
+
+  const res = excludeMonth
+    ? await pool.query(
+        "SELECT COALESCE(MAX(total_inr), 0) AS max_inr FROM uw_wealth_snapshots WHERE household_id = $1 AND snapshot_month <> $2",
+        [householdId, excludeMonth]
+      )
+    : await pool.query(
+        "SELECT COALESCE(MAX(total_inr), 0) AS max_inr FROM uw_wealth_snapshots WHERE household_id = $1",
+        [householdId]
+      );
+  return Number(res.rows[0]?.max_inr) || 0;
+}
+
 export async function upsertWealthSnapshotPg(snap: WealthSnapshotRecord): Promise<WealthSnapshotRecord> {
   if (!snap.householdId || !snap.snapshotMonth) {
     throw new Error("householdId and snapshotMonth are required");
   }
 
-  // Also update in-memory fallback
-  if (!fallbackSnapshots.has(snap.householdId)) {
-    fallbackSnapshots.set(snap.householdId, new Map());
-  }
-  fallbackSnapshots.get(snap.householdId)!.set(snap.snapshotMonth, snap);
-
   if (!pgReady || !pool) {
+    if (!fallbackSnapshots.has(snap.householdId)) {
+      fallbackSnapshots.set(snap.householdId, new Map());
+    }
+    fallbackSnapshots.get(snap.householdId)!.set(snap.snapshotMonth, snap);
     return snap;
   }
 
@@ -453,7 +424,7 @@ export async function getWealthHistoryPg(householdId: string): Promise<WealthSna
     debtINR: Number(r.debt_inr) || 0,
     realEstateEquityINR: Number(r.real_estate_equity_inr) || 0,
     realEstateLoanINR: Number(r.real_estate_loan_inr) || 0,
-    fxRate: Number(r.fx_rate) || 84,
+    fxRate: Number(r.fx_rate) || FX_FALLBACK_RATE,
     holdingsCount: Number(r.holdings_count) || 0,
     memberBreakdown: Array.isArray(r.member_breakdown) ? r.member_breakdown : [],
     providerBreakdown: r.provider_breakdown && typeof r.provider_breakdown === "object" ? r.provider_breakdown : {},
@@ -465,15 +436,67 @@ export async function getWealthHistoryPg(householdId: string): Promise<WealthSna
 }
 
 export async function deleteWealthSnapshotPg(householdId: string, snapshotMonth: string): Promise<void> {
-  fallbackSnapshots.get(householdId)?.delete(snapshotMonth);
-  if (!pgReady || !pool) return;
+  if (!pgReady || !pool) {
+    fallbackSnapshots.get(householdId)?.delete(snapshotMonth);
+    return;
+  }
   await pool.query(
     "DELETE FROM uw_wealth_snapshots WHERE household_id = $1 AND snapshot_month = $2",
     [householdId, snapshotMonth]
   );
 }
 
-export async function addNotificationPg(notif: Omit<NotificationRecord, "id" | "isRead" | "createdAt"> & { id?: string; createdAt?: number; type?: string }): Promise<NotificationRecord> {
+/**
+ * Dedicated PostgreSQL table persistence for Real Estate properties & payment/loan ledgers.
+ * Auto-migrates any legacy `uw_app_state` key (`real_estate:{householdId}`) transparently.
+ */
+export async function getRealEstatePg(householdId: string): Promise<RealEstateProperty[]> {
+  if (!householdId) return [];
+  if (!pgReady || !pool) {
+    return fallbackRealEstate.get(householdId) || [];
+  }
+
+  const res = await pool.query(
+    "SELECT properties FROM uw_real_estate WHERE household_id = $1 LIMIT 1",
+    [householdId]
+  );
+  if (res.rows.length > 0 && Array.isArray(res.rows[0].properties)) {
+    return res.rows[0].properties as RealEstateProperty[];
+  }
+
+  // Seamless one-time migration from uw_app_state('real_estate:{householdId}') if present
+  const legacy = await getAppStateKeyPg<RealEstateProperty[]>(`real_estate:${householdId}`);
+  if (Array.isArray(legacy) && legacy.length > 0) {
+    await saveRealEstatePg(householdId, legacy);
+    await setAppStateKeyPg(`real_estate:${householdId}`, null);
+    return legacy;
+  }
+
+  return [];
+}
+
+export async function saveRealEstatePg(
+  householdId: string,
+  properties: RealEstateProperty[]
+): Promise<void> {
+  if (!householdId) return;
+  const clean = Array.isArray(properties) ? properties : [];
+  if (!pgReady || !pool) {
+    fallbackRealEstate.set(householdId, clean);
+    return;
+  }
+  await pool.query(
+    `INSERT INTO uw_real_estate (household_id, properties, updated_at)
+     VALUES ($1, $2::jsonb, $3)
+     ON CONFLICT (household_id)
+     DO UPDATE SET properties = EXCLUDED.properties, updated_at = EXCLUDED.updated_at`,
+    [householdId, JSON.stringify(clean), Date.now()]
+  );
+}
+
+export async function addNotificationPg(
+  notif: Omit<NotificationRecord, "id" | "isRead" | "createdAt"> & { id?: string; createdAt?: number; type?: string }
+): Promise<NotificationRecord> {
   const resolvedCategory = (notif.category || (notif as any).type || "system") as NotificationRecord["category"];
   const full: NotificationRecord = {
     id: notif.id || `ntf_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
@@ -488,33 +511,45 @@ export async function addNotificationPg(notif: Omit<NotificationRecord, "id" | "
     createdAt: notif.createdAt || Date.now()
   };
 
-  const arr = fallbackNotifications.get(full.householdId) || [];
-  arr.unshift(full);
-  fallbackNotifications.set(full.householdId, arr.slice(0, 60));
+  if (!pgReady || !pool) {
+    const arr = fallbackNotifications.get(full.householdId) || [];
+    arr.unshift(full);
+    fallbackNotifications.set(full.householdId, arr.slice(0, 60));
+    return full;
+  }
 
-  if (pgReady && pool) {
-    try {
-      await pool.query(
-        `INSERT INTO uw_notifications (
-           id, household_id, user_id, category, severity, title, message, action_tab, is_read, created_at
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-         ON CONFLICT (id) DO NOTHING`,
-        [
-          full.id,
-          full.householdId,
-          full.userId,
-          full.category,
-          full.severity,
-          full.title,
-          full.message,
-          full.actionTab,
-          full.isRead,
-          full.createdAt
-        ]
-      );
-    } catch (err: any) {
-      console.warn("[Postgres] addNotificationPg warning:", err.message);
-    }
+  try {
+    await pool.query(
+      `INSERT INTO uw_notifications (
+         id, household_id, user_id, category, severity, title, message, action_tab, is_read, created_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+       ON CONFLICT (id) DO NOTHING`,
+      [
+        full.id,
+        full.householdId,
+        full.userId,
+        full.category,
+        full.severity,
+        full.title,
+        full.message,
+        full.actionTab,
+        full.isRead,
+        full.createdAt
+      ]
+    );
+    // Keep table bounded to latest 200 notifications per household asynchronously
+    pool
+      .query(
+        `DELETE FROM uw_notifications
+         WHERE household_id = $1
+           AND id NOT IN (
+             SELECT id FROM uw_notifications WHERE household_id = $1 ORDER BY created_at DESC LIMIT 200
+           )`,
+        [full.householdId]
+      )
+      .catch(() => {});
+  } catch (err: any) {
+    console.warn("[Postgres] addNotificationPg warning:", err.message);
   }
   return full;
 }
@@ -549,20 +584,26 @@ export async function getNotificationsPg(householdId: string, limit = 40): Promi
 }
 
 export async function markNotificationsReadPg(householdId: string, ids?: string[]): Promise<void> {
-  const mem = fallbackNotifications.get(householdId);
-  if (mem) {
-    mem.forEach((n) => {
-      if (!ids || ids.length === 0 || ids.includes(n.id)) n.isRead = true;
-    });
+  if (!pgReady || !pool) {
+    const mem = fallbackNotifications.get(householdId);
+    if (mem) {
+      const idSet = ids && ids.length > 0 ? new Set(ids) : null;
+      mem.forEach((n) => {
+        if (!idSet || idSet.has(n.id)) n.isRead = true;
+      });
+    }
+    return;
   }
-  if (!pgReady || !pool) return;
   if (ids && ids.length > 0) {
     await pool.query(
-      "UPDATE uw_notifications SET is_read = TRUE WHERE household_id = $1 AND id = ANY($2::text[])",
+      "UPDATE uw_notifications SET is_read = TRUE WHERE household_id = $1 AND is_read = FALSE AND id = ANY($2::text[])",
       [householdId, ids]
     );
   } else {
-    await pool.query("UPDATE uw_notifications SET is_read = TRUE WHERE household_id = $1", [householdId]);
+    await pool.query(
+      "UPDATE uw_notifications SET is_read = TRUE WHERE household_id = $1 AND is_read = FALSE",
+      [householdId]
+    );
   }
 }
 
@@ -570,7 +611,8 @@ export async function getCachedQuotesPg(symbols: string[], maxAgeMs: number): Pr
   const out: Record<string, CachedQuoteRecord> = {};
   if (!pgReady || !pool || symbols.length === 0) return out;
   try {
-    const upper = symbols.map((s) => s.toUpperCase());
+    const upper = Array.from(new Set(symbols.map((s) => s.toUpperCase()).filter(Boolean)));
+    if (upper.length === 0) return out;
     const minUpdated = Date.now() - maxAgeMs;
     const res = await pool.query(
       `SELECT * FROM uw_market_cache
@@ -593,52 +635,76 @@ export async function getCachedQuotesPg(symbols: string[], maxAgeMs: number): Pr
   return out;
 }
 
+/**
+ * Single bulk UNNEST query instead of N sequential pool.query round-trips!
+ */
 export async function upsertCachedQuotesPg(quotes: CachedQuoteRecord[]): Promise<void> {
   if (!pgReady || !pool || quotes.length === 0) return;
   try {
+    // Deduplicate by uppercase symbol so Postgres ON CONFLICT DO UPDATE never sees duplicate target rows
+    const dedup = new Map<string, CachedQuoteRecord>();
     for (const q of quotes) {
       if (!q.symbol || !(q.price > 0)) continue;
-      await pool.query(
-        `INSERT INTO uw_market_cache (symbol, price, prev_close, change_pct, currency, updated_at)
-         VALUES ($1,$2,$3,$4,$5,$6)
-         ON CONFLICT (symbol) DO UPDATE SET
-           price = EXCLUDED.price,
-           prev_close = CASE WHEN EXCLUDED.prev_close > 0 THEN EXCLUDED.prev_close ELSE uw_market_cache.prev_close END,
-           change_pct = EXCLUDED.change_pct,
-           currency = EXCLUDED.currency,
-           updated_at = EXCLUDED.updated_at`,
-        [
-          q.symbol.toUpperCase(),
-          q.price,
-          q.prevClose || 0,
-          q.changePct || 0,
-          q.currency || "USD",
-          q.updatedAt || Date.now()
-        ]
-      );
+      dedup.set(q.symbol.toUpperCase(), q);
     }
+    if (dedup.size === 0) return;
+
+    const now = Date.now();
+    const syms: string[] = [];
+    const prices: number[] = [];
+    const prevCloses: number[] = [];
+    const changePcts: number[] = [];
+    const currencies: string[] = [];
+    const updatedAts: number[] = [];
+
+    for (const [sym, q] of dedup.entries()) {
+      syms.push(sym);
+      prices.push(q.price);
+      prevCloses.push(q.prevClose || 0);
+      changePcts.push(q.changePct || 0);
+      currencies.push(q.currency || "USD");
+      updatedAts.push(q.updatedAt || now);
+    }
+
+    await pool.query(
+      `INSERT INTO uw_market_cache (symbol, price, prev_close, change_pct, currency, updated_at)
+       SELECT * FROM UNNEST($1::text[], $2::float8[], $3::float8[], $4::float8[], $5::text[], $6::bigint[])
+       ON CONFLICT (symbol) DO UPDATE SET
+         price = EXCLUDED.price,
+         prev_close = CASE WHEN EXCLUDED.prev_close > 0 THEN EXCLUDED.prev_close ELSE uw_market_cache.prev_close END,
+         change_pct = EXCLUDED.change_pct,
+         currency = EXCLUDED.currency,
+         updated_at = EXCLUDED.updated_at`,
+      [syms, prices, prevCloses, changePcts, currencies, updatedAts]
+    );
   } catch {
     // non-fatal
   }
 }
 
-const fallbackStateKeys = new Map<string, any>();
+const NULL_SENTINEL = Symbol("NULL_APP_STATE");
 
 export async function setAppStateKeyPg(key: string, payload: any): Promise<void> {
   if (!key) return;
   if (payload === null || payload === undefined) {
-    fallbackStateKeys.delete(key);
-    if (pgReady && pool) {
-      try {
-        await pool.query("DELETE FROM uw_app_state WHERE state_key = $1", [key]);
-      } catch (err: any) {
-        console.warn("[Postgres] deleteAppStateKeyPg error:", err.message);
-      }
+    appStateReadCache.set(key, NULL_SENTINEL);
+    if (!pgReady || !pool) {
+      fallbackStateKeys.delete(key);
+      return;
+    }
+    try {
+      await pool.query("DELETE FROM uw_app_state WHERE state_key = $1", [key]);
+    } catch (err: any) {
+      console.warn("[Postgres] deleteAppStateKeyPg error:", err.message);
     }
     return;
   }
-  fallbackStateKeys.set(key, payload);
-  if (!pgReady || !pool) return;
+
+  appStateReadCache.set(key, payload);
+  if (!pgReady || !pool) {
+    fallbackStateKeys.set(key, payload);
+    return;
+  }
   try {
     await pool.query(
       `INSERT INTO uw_app_state (state_key, payload, updated_at)
@@ -654,14 +720,21 @@ export async function setAppStateKeyPg(key: string, payload: any): Promise<void>
 
 export async function getAppStateKeyPg<T = any>(key: string): Promise<T | null> {
   if (!key) return null;
+  const cached = appStateReadCache.get(key);
+  if (cached !== undefined) {
+    return cached === NULL_SENTINEL ? null : (cached as T);
+  }
+
   if (pgReady && pool) {
     try {
       const res = await pool.query("SELECT payload FROM uw_app_state WHERE state_key = $1 LIMIT 1", [key]);
       if (res.rows.length > 0 && res.rows[0].payload !== undefined) {
         const val = res.rows[0].payload as T;
-        fallbackStateKeys.set(key, val);
+        appStateReadCache.set(key, val);
         return val;
       }
+      appStateReadCache.set(key, NULL_SENTINEL);
+      return null;
     } catch (err: any) {
       console.warn("[Postgres] getAppStateKeyPg error:", err.message);
     }
