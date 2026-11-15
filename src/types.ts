@@ -34,6 +34,7 @@ export interface Holding {
   originalName?: string;
   source?: 'PDF' | 'Sync' | 'Manual' | 'Live' | 'PDF Import';
   priceUpdatedAt?: number;
+  syncedAt?: number;
 }
 
 export interface TickerWeight {

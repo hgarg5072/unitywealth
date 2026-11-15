@@ -15,6 +15,22 @@ import crypto from "crypto";
 import { initializeApp, getApps, cert } from "firebase-admin/app";
 import { getFirestore, FieldValue } from "firebase-admin/firestore";
 import firebaseConfig from "./firebase-applet-config.json";
+import {
+  initPostgresStore,
+  getPostgresStatus,
+  persistAppStateAsync,
+  upsertInviteCodePg,
+  getInviteCodePg,
+  getInviteByHouseholdPg,
+  upsertWealthSnapshotPg,
+  getWealthHistoryPg,
+  deleteWealthSnapshotPg,
+  addNotificationPg,
+  getNotificationsPg,
+  markNotificationsReadPg,
+  getCachedQuotesPg,
+  upsertCachedQuotesPg
+} from "./src/server/postgresStore";
 
 // Initialize Firebase Admin (Lazy helper)
 function getFirestoreInstance() {
@@ -194,6 +210,7 @@ async function startServer() {
     const tempPath = DB_PATH + ".tmp";
     fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
     fs.renameSync(tempPath, DB_PATH);
+    persistAppStateAsync(data);
 
     // Create a rotating backup
     try {
@@ -258,6 +275,39 @@ async function startServer() {
       console.error("[Firestore] Migration failed or API disabled:", e.message);
       console.log("[Firestore] The app will continue using the local db.json fallback for now.");
     }
+  }
+
+  // Initialize managed PostgreSQL persistence & hydrate any state across container restarts
+  try {
+    const pgInit = await initPostgresStore();
+    if (pgInit.connected) {
+      const currentDb = getDB();
+      let hydrated = false;
+      if (pgInit.restoredDbJson && typeof pgInit.restoredDbJson === "object") {
+        if (pgInit.restoredDbJson.users && Object.keys(pgInit.restoredDbJson.users).length > Object.keys(currentDb.users || {}).length) {
+          currentDb.users = { ...currentDb.users, ...pgInit.restoredDbJson.users };
+          hydrated = true;
+        }
+        if (Array.isArray(pgInit.restoredDbJson.invites) && pgInit.restoredDbJson.invites.length > 0) {
+          currentDb.invites = pgInit.restoredDbJson.invites;
+          hydrated = true;
+        }
+        if (pgInit.restoredDbJson.inviteCodes) {
+          currentDb.inviteCodes = { ...currentDb.inviteCodes, ...pgInit.restoredDbJson.inviteCodes };
+          hydrated = true;
+        }
+      }
+      if (Object.keys(pgInit.restoredInviteCodes).length > 0) {
+        currentDb.inviteCodes = { ...currentDb.inviteCodes, ...pgInit.restoredInviteCodes };
+        hydrated = true;
+      }
+      if (hydrated) {
+        fs.writeFileSync(DB_PATH, JSON.stringify(currentDb, null, 2));
+        console.log(`[Postgres] Hydrated ${Object.keys(currentDb.inviteCodes || {}).length} family invite code(s) into local cache.`);
+      }
+    }
+  } catch (pgBootErr: any) {
+    console.warn("[Postgres] Startup hydration skipped:", pgBootErr.message);
   }
 
   // Run migration in background to not block startup
@@ -406,8 +456,11 @@ async function startServer() {
 
   // API Routes
   app.get("/api/health", (req, res) => {
+    const pgStatus = getPostgresStatus();
     res.json({
       status: "ok",
+      postgres: pgStatus.connected,
+      postgresPool: pgStatus,
       resend: !!process.env.RESEND_API_KEY,
       google: !!process.env.GOOGLE_CLIENT_ID && !!process.env.GOOGLE_CLIENT_SECRET,
       appUrl: process.env.APP_URL
@@ -978,6 +1031,7 @@ async function startServer() {
       }
 
       saveDB(db);
+      await upsertInviteCodePg(db.inviteCodes[code]);
 
       const host = req.get("host");
       const proto = req.get("x-forwarded-proto") || (host?.includes("localhost") ? "http" : "https");
@@ -998,11 +1052,17 @@ async function startServer() {
   });
 
   // Public preview of an invite code (returns household name & inviter display name only)
-  app.get("/api/household/invite-info/:code", (req, res) => {
+  app.get("/api/household/invite-info/:code", async (req, res) => {
     const code = normalizeInviteCode(req.params.code);
     if (!code) return res.status(400).json({ error: "Invite code is required" });
     const db = getDB();
-    const entry = db.inviteCodes?.[code];
+    let entry = db.inviteCodes?.[code];
+    if (!entry) {
+      entry = await getInviteCodePg(code);
+      if (entry) {
+        db.inviteCodes[code] = entry;
+      }
+    }
     if (!entry) {
       return res.status(404).json({ error: "Invalid or expired invite code. Ask your family admin to open Invite and copy the latest code." });
     }
@@ -1033,8 +1093,15 @@ async function startServer() {
       let entry: any = null;
       if (cleanCode && db.inviteCodes?.[cleanCode]) {
         entry = db.inviteCodes[cleanCode];
+      } else if (cleanCode) {
+        entry = await getInviteCodePg(cleanCode);
+        if (entry) db.inviteCodes[cleanCode] = entry;
       } else if (requestedHouseholdId) {
         entry = Object.values(db.inviteCodes || {}).find((e: any) => e.householdId === requestedHouseholdId);
+        if (!entry) {
+          entry = await getInviteByHouseholdPg(requestedHouseholdId);
+          if (entry?.code) db.inviteCodes[entry.code] = entry;
+        }
       }
 
       if (!entry) {
@@ -1091,6 +1158,16 @@ async function startServer() {
       }
 
       const resolvedHouseholdName = hhDoc?.fields?.name?.stringValue || entry.householdName || "Family Portfolio";
+      await upsertInviteCodePg(entry);
+      await addNotificationPg({
+        householdId: entry.householdId,
+        userId: joiner.uid,
+        category: "family",
+        severity: "success",
+        title: "New Family Member Joined",
+        message: `${joiner.name || joiner.email} joined ${resolvedHouseholdName} and linked their portfolio.`,
+        actionTab: "accounts"
+      });
       res.json({
         success: true,
         householdId: entry.householdId,
@@ -1101,6 +1178,275 @@ async function startServer() {
       res.status(500).json({
         error: e?.response?.data?.error?.message || e.message || "Failed to join household"
       });
+    }
+  });
+
+  // Helper to verify caller belongs to a household via Firebase REST
+  async function verifyCallerHouseholdAccess(req: express.Request, householdId: string) {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : String(req.body?.idToken || "");
+    if (!idToken) {
+      throw Object.assign(new Error("Missing authorization token"), { statusCode: 401 });
+    }
+    const caller = await verifyFirebaseIdToken(idToken);
+    const hhDoc = await firestoreRestGet(`households/${householdId}`, idToken);
+    const memberValues: any[] = hhDoc?.fields?.members?.arrayValue?.values || [];
+    const memberIds = memberValues.map((v: any) => v.stringValue).filter(Boolean);
+    if (!memberIds.includes(caller.uid)) {
+      throw Object.assign(new Error("Forbidden: not a member of this household"), { statusCode: 403 });
+    }
+    return { caller, hhDoc };
+  }
+
+  // --- Wealth History & Monthly Net Worth Tracking (PostgreSQL-backed) ---
+  app.get("/api/wealth-history/:householdId", async (req, res) => {
+    try {
+      const { householdId } = req.params;
+      await verifyCallerHouseholdAccess(req, householdId);
+      const history = await getWealthHistoryPg(householdId);
+
+      let momChangeINR = 0;
+      let momChangePct = 0;
+      let totalGrowthINR = 0;
+      let totalGrowthPct = 0;
+      if (history.length >= 2) {
+        const latest = history[history.length - 1];
+        const prev = history[history.length - 2];
+        const first = history[0];
+        momChangeINR = latest.totalINR - prev.totalINR;
+        momChangePct = prev.totalINR > 0 ? ((latest.totalINR - prev.totalINR) / prev.totalINR) * 100 : 0;
+        totalGrowthINR = latest.totalINR - first.totalINR;
+        totalGrowthPct = first.totalINR > 0 ? ((latest.totalINR - first.totalINR) / first.totalINR) * 100 : 0;
+      }
+
+      res.json({
+        householdId,
+        snapshots: history,
+        summary: {
+          monthsTracked: history.length,
+          momChangeINR,
+          momChangePct,
+          totalGrowthINR,
+          totalGrowthPct,
+          peakINR: history.reduce((m, s) => Math.max(m, s.totalINR), 0)
+        }
+      });
+    } catch (e: any) {
+      const code = e.statusCode || (e?.response?.status === 403 ? 403 : 500);
+      res.status(code).json({ error: e.message || "Failed to load wealth history" });
+    }
+  });
+
+  const WEALTH_MILESTONES_INR = [
+    25_00_000,
+    50_00_000,
+    1_00_00_000,
+    1_50_00_000,
+    2_00_00_000,
+    2_50_00_000,
+    5_00_00_000,
+    10_00_00_000,
+    25_00_00_000
+  ];
+
+  function formatMilestoneCroreLakh(val: number): string {
+    if (val >= 1_00_00_000) return `₹${(val / 1_00_00_000).toFixed(val % 1_00_00_000 === 0 ? 0 : 1)} Cr`;
+    return `₹${(val / 1_00_000).toFixed(0)} Lakh`;
+  }
+
+  app.post("/api/wealth-history/record", async (req, res) => {
+    try {
+      const {
+        householdId,
+        snapshotMonth,
+        totalINR,
+        totalUSD,
+        indianEquityINR,
+        foreignEquityINR,
+        debtINR,
+        fxRate,
+        holdingsCount,
+        memberBreakdown,
+        providerBreakdown,
+        source,
+        note
+      } = req.body || {};
+
+      if (!householdId || !(Number(totalINR) > 0)) {
+        return res.status(400).json({ error: "householdId and positive totalINR are required" });
+      }
+
+      const { caller } = await verifyCallerHouseholdAccess(req, householdId);
+
+      const now = new Date();
+      const defaultMonth = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+      const cleanMonth = /^\d{4}-(0[1-9]|1[0-2])$/.test(String(snapshotMonth || ""))
+        ? String(snapshotMonth)
+        : defaultMonth;
+
+      const existingHistory = await getWealthHistoryPg(householdId);
+      const previousMax = existingHistory.reduce((m, s) => Math.max(m, s.totalINR), 0);
+
+      const saved = await upsertWealthSnapshotPg({
+        householdId,
+        snapshotMonth: cleanMonth,
+        recordedAt: Date.now(),
+        totalINR: Number(totalINR) || 0,
+        totalUSD: Number(totalUSD) || (Number(totalINR) / (Number(fxRate) || 84)),
+        indianEquityINR: Number(indianEquityINR) || 0,
+        foreignEquityINR: Number(foreignEquityINR) || 0,
+        debtINR: Number(debtINR) || 0,
+        fxRate: Number(fxRate) || 84,
+        holdingsCount: Number(holdingsCount) || 0,
+        memberBreakdown: Array.isArray(memberBreakdown) ? memberBreakdown : [],
+        providerBreakdown: providerBreakdown && typeof providerBreakdown === "object" ? providerBreakdown : {},
+        source: String(source || "auto"),
+        note: String(note || "")
+      });
+
+      // Check if a new net worth milestone was crossed!
+      if (previousMax > 0 && saved.totalINR > previousMax) {
+        const newlyCrossed = WEALTH_MILESTONES_INR.filter(
+          (ms) => previousMax < ms && saved.totalINR >= ms
+        );
+        if (newlyCrossed.length > 0) {
+          const topMs = newlyCrossed[newlyCrossed.length - 1];
+          await addNotificationPg({
+            householdId,
+            userId: caller.uid,
+            category: "milestone",
+            severity: "success",
+            title: `Milestone Crossed: ${formatMilestoneCroreLakh(topMs)}!`,
+            message: `Your combined family wealth reached ₹${Math.round(saved.totalINR).toLocaleString("en-IN")} (${cleanMonth}).`,
+            actionTab: "wealth"
+          });
+        }
+      }
+
+      const updatedHistory = await getWealthHistoryPg(householdId);
+      res.json({ success: true, snapshot: saved, snapshots: updatedHistory });
+    } catch (e: any) {
+      const code = e.statusCode || 500;
+      res.status(code).json({ error: e.message || "Failed to record wealth snapshot" });
+    }
+  });
+
+  app.post("/api/wealth-history/backfill", async (req, res) => {
+    try {
+      const {
+        householdId,
+        snapshotMonth,
+        totalINR,
+        indianEquityINR,
+        foreignEquityINR,
+        debtINR,
+        fxRate,
+        memberBreakdown,
+        note
+      } = req.body || {};
+
+      if (!householdId || !/^\d{4}-(0[1-9]|1[0-2])$/.test(String(snapshotMonth || ""))) {
+        return res.status(400).json({ error: "Valid householdId and snapshotMonth (YYYY-MM) are required" });
+      }
+      const resolvedTotal =
+        Number(totalINR) > 0
+          ? Number(totalINR)
+          : (Number(indianEquityINR) || 0) + (Number(foreignEquityINR) || 0) + (Number(debtINR) || 0);
+      if (!(resolvedTotal > 0)) {
+        return res.status(400).json({ error: "Total portfolio value must be greater than 0" });
+      }
+
+      const { caller } = await verifyCallerHouseholdAccess(req, householdId);
+      const rate = Number(fxRate) > 0 ? Number(fxRate) : 84;
+      const indEq = Number(indianEquityINR) >= 0 ? Number(indianEquityINR) : Math.round(resolvedTotal * 0.42);
+      const forEq = Number(foreignEquityINR) >= 0 ? Number(foreignEquityINR) : Math.round(resolvedTotal * 0.28);
+      const debtVal = Number(debtINR) >= 0 ? Number(debtINR) : Math.max(0, resolvedTotal - indEq - forEq);
+
+      const saved = await upsertWealthSnapshotPg({
+        householdId,
+        snapshotMonth: String(snapshotMonth),
+        recordedAt: Date.now(),
+        totalINR: resolvedTotal,
+        totalUSD: resolvedTotal / rate,
+        indianEquityINR: indEq,
+        foreignEquityINR: forEq,
+        debtINR: debtVal,
+        fxRate: rate,
+        holdingsCount: 0,
+        memberBreakdown: Array.isArray(memberBreakdown) ? memberBreakdown : [],
+        providerBreakdown: {},
+        source: "manual_backfill",
+        note: String(note || `Logged by ${caller.name || caller.email}`)
+      });
+
+      const updatedHistory = await getWealthHistoryPg(householdId);
+      res.json({ success: true, snapshot: saved, snapshots: updatedHistory });
+    } catch (e: any) {
+      const code = e.statusCode || 500;
+      res.status(code).json({ error: e.message || "Failed to save historical month" });
+    }
+  });
+
+  app.delete("/api/wealth-history/:householdId/:month", async (req, res) => {
+    try {
+      const { householdId, month } = req.params;
+      await verifyCallerHouseholdAccess(req, householdId);
+      await deleteWealthSnapshotPg(householdId, month);
+      const updatedHistory = await getWealthHistoryPg(householdId);
+      res.json({ success: true, snapshots: updatedHistory });
+    } catch (e: any) {
+      const code = e.statusCode || 500;
+      res.status(code).json({ error: e.message || "Failed to delete snapshot" });
+    }
+  });
+
+  // --- Notifications & Household Activity Feed (PostgreSQL-backed) ---
+  app.get("/api/notifications/:householdId", async (req, res) => {
+    try {
+      const { householdId } = req.params;
+      await verifyCallerHouseholdAccess(req, householdId);
+      const items = await getNotificationsPg(householdId, 40);
+      res.json({ notifications: items });
+    } catch (e: any) {
+      const code = e.statusCode || 500;
+      res.status(code).json({ error: e.message || "Failed to fetch notifications" });
+    }
+  });
+
+  app.post("/api/notifications/:householdId/add", async (req, res) => {
+    try {
+      const { householdId } = req.params;
+      const { caller } = await verifyCallerHouseholdAccess(req, householdId);
+      const { category, severity, title, message, actionTab } = req.body || {};
+      if (!title || !message) {
+        return res.status(400).json({ error: "title and message are required" });
+      }
+      const created = await addNotificationPg({
+        householdId,
+        userId: caller.uid,
+        category: category || "system",
+        severity: severity || "info",
+        title: String(title).slice(0, 140),
+        message: String(message).slice(0, 400),
+        actionTab: actionTab || ""
+      });
+      res.json({ success: true, notification: created });
+    } catch (e: any) {
+      const code = e.statusCode || 500;
+      res.status(code).json({ error: e.message || "Failed to create notification" });
+    }
+  });
+
+  app.post("/api/notifications/:householdId/mark-read", async (req, res) => {
+    try {
+      const { householdId } = req.params;
+      await verifyCallerHouseholdAccess(req, householdId);
+      const ids = Array.isArray(req.body?.ids) ? req.body.ids : undefined;
+      await markNotificationsReadPg(householdId, ids);
+      res.json({ success: true });
+    } catch (e: any) {
+      const code = e.statusCode || 500;
+      res.status(code).json({ error: e.message || "Failed to mark notifications read" });
     }
   });
 
@@ -1422,6 +1768,20 @@ async function startServer() {
       }
     }
 
+    if (uncached.length > 0) {
+      // Check shared PostgreSQL quote cache so hundreds of concurrent users reuse fresh quotes
+      const pgQuotes = await getCachedQuotesPg(uncached, 3 * 60 * 1000);
+      for (let i = uncached.length - 1; i >= 0; i--) {
+        const sym = uncached[i];
+        const hit = pgQuotes[sym.toUpperCase()];
+        if (hit && hit.price > 0) {
+          priceMap[sym] = hit.price;
+          stockQuoteCache.set(sym.toUpperCase(), { price: hit.price, ts: hit.updatedAt });
+          uncached.splice(i, 1);
+        }
+      }
+    }
+
     if (uncached.length === 0) return priceMap;
 
     const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
@@ -1509,9 +1869,88 @@ async function startServer() {
 
     await Promise.all([indiaTask, usTask]);
 
+    // Persist newly fetched quotes into shared PostgreSQL cache asynchronously
+    const newlyFetched = uncached
+      .filter((sym) => priceMap[sym] && priceMap[sym] > 0)
+      .map((sym) => ({
+        symbol: sym.toUpperCase(),
+        price: priceMap[sym],
+        currency: isIndiaSymbol(sym) ? "INR" : "USD",
+        updatedAt: Date.now()
+      }));
+    if (newlyFetched.length > 0) {
+      upsertCachedQuotesPg(newlyFetched).catch(() => {});
+    }
+
     console.log(`Live Stock Fetch: Found ${Object.keys(priceMap).length} of ${symbols.length} symbols.`);
     return priceMap;
   }
+
+  // Live Global Market Benchmarks (Nifty 50, S&P 500, NASDAQ 100, Gold, USD/INR) cached for multi-user scale
+  let benchmarkCache: { data: any[]; ts: number } | null = null;
+  app.get("/api/market/benchmarks", async (req, res) => {
+    const now = Date.now();
+    if (benchmarkCache && now - benchmarkCache.ts < 90 * 1000) {
+      return res.json({ benchmarks: benchmarkCache.data, cachedAt: benchmarkCache.ts });
+    }
+
+    try {
+      const [tvIndia, tvGlobal, fxRes] = await Promise.all([
+        axios
+          .post(
+            "https://scanner.tradingview.com/india/scan",
+            {
+              symbols: { tickers: ["NSE:NIFTY", "BSE:SENSEX"] },
+              columns: ["close", "change"]
+            },
+            { timeout: 5000, headers: { "Content-Type": "application/json", "User-Agent": YAHOO_HEADERS["User-Agent"] } }
+          )
+          .catch(() => ({ data: { data: [] } })),
+        axios
+          .post(
+            "https://scanner.tradingview.com/america/scan",
+            {
+              symbols: { tickers: ["AMEX:SPY", "NASDAQ:QQQ", "AMEX:GLD"] },
+              columns: ["close", "change"]
+            },
+            { timeout: 5000, headers: { "Content-Type": "application/json", "User-Agent": YAHOO_HEADERS["User-Agent"] } }
+          )
+          .catch(() => ({ data: { data: [] } })),
+        axios.get("https://open.er-api.com/v6/latest/USD", { timeout: 5000 }).catch(() => ({ data: { rates: { INR: 84.0 } } }))
+      ]);
+
+      const tvMap = new Map<string, { price: number; changePct: number }>();
+      for (const item of [...(tvIndia.data?.data || []), ...(tvGlobal.data?.data || [])]) {
+        if (item?.s && typeof item?.d?.[0] === "number") {
+          tvMap.set(String(item.s).toUpperCase(), {
+            price: Number(item.d[0]),
+            changePct: typeof item.d[1] === "number" ? Number(item.d[1]) : 0
+          });
+        }
+      }
+
+      const nifty = tvMap.get("NSE:NIFTY");
+      const sensex = tvMap.get("BSE:SENSEX");
+      const spy = tvMap.get("AMEX:SPY");
+      const qqq = tvMap.get("NASDAQ:QQQ");
+      const gld = tvMap.get("AMEX:GLD");
+      const usdInr = Number(fxRes.data?.rates?.INR) || 84.0;
+
+      const benchmarks = [
+        nifty ? { id: "nifty50", label: "NIFTY 50", value: nifty.price, changePct: nifty.changePct, prefix: "" } : null,
+        sensex ? { id: "sensex", label: "SENSEX", value: sensex.price, changePct: sensex.changePct, prefix: "" } : null,
+        spy ? { id: "sp500", label: "S&P 500 (SPY)", value: spy.price, changePct: spy.changePct, prefix: "$" } : null,
+        qqq ? { id: "nasdaq", label: "NASDAQ (QQQ)", value: qqq.price, changePct: qqq.changePct, prefix: "$" } : null,
+        gld ? { id: "gold", label: "GOLD ETF", value: gld.price, changePct: gld.changePct, prefix: "$" } : null,
+        { id: "usdinr", label: "USD / INR", value: usdInr, changePct: 0, prefix: "₹" }
+      ].filter(Boolean);
+
+      benchmarkCache = { data: benchmarks, ts: now };
+      res.json({ benchmarks, cachedAt: now });
+    } catch (e: any) {
+      res.json({ benchmarks: benchmarkCache?.data || [], cachedAt: now });
+    }
+  });
 
   app.get("/api/mf/search", async (req, res) => {
     const { q } = req.query;
@@ -2190,6 +2629,7 @@ Return ONLY a valid JSON object matching this exact structure:
 {
   "statementType": "holdings" | "capital_gains_only" | "transactions_only",
   "provider": "CAMS" | "KFintech" | "Zerodha" | "INDmoney" | "Charles Schwab" | "IBKR" | "E*TRADE" | "Statement",
+  "statementMonth": "YYYY-MM valuation month printed on the statement (e.g. 2026-11) or empty string",
   "summaryNote": "1-sentence description of what was detected",
   "holdings": [
     {
@@ -2369,9 +2809,15 @@ BROKER, TICKER & CURRENCY RULES:
         }
       }
 
+      const statementMonth: string =
+        !Array.isArray(parsed) && /^\d{4}-(0[1-9]|1[0-2])$/.test(String(parsed?.statementMonth || ""))
+          ? String(parsed.statementMonth)
+          : "";
+
       res.json({
         statementType,
         provider: detectedProvider,
+        statementMonth,
         summaryNote,
         holdings: enrichedHoldings
       });

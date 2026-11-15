@@ -43,7 +43,15 @@ import {
   Eye,
   EyeOff,
   Share2,
+  Bell,
+  Activity,
+  Landmark,
+  Menu,
 } from 'lucide-react';
+import { WealthJourneyView, WealthSnapshotItem, formatCompactINR } from './components/WealthJourneyView';
+import { MarketPulseRibbon } from './components/MarketPulseRibbon';
+import { NotificationDrawer, AppNotificationItem, SmartInsightAlert } from './components/NotificationDrawer';
+import { QuickAddModal } from './components/QuickAddModal';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   PieChart, 
@@ -169,13 +177,20 @@ export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [data, setData] = useState<DashboardData | null>(null);
   const [fxRates, setFxRates] = useState<Record<string, number>>({ INR: 83.5, USD: 1.0 });
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'targets' | 'accounts' | 'liveMarkets' | 'rebalance'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'wealth' | 'targets' | 'accounts' | 'liveMarkets' | 'rebalance'>('dashboard');
   const [dashboardView, setDashboardView] = useState<'combined' | string>('combined');
   const [isSaving, setIsSaving] = useState(false);
   const [loading, setLoading] = useState(true);
   const [showSyncModal, setShowSyncModal] = useState(false);
   const [showDeviceModal, setShowDeviceModal] = useState(false);
   const [showJoinByCodeModal, setShowJoinByCodeModal] = useState(false);
+  const [wealthSnapshots, setWealthSnapshots] = useState<WealthSnapshotItem[]>([]);
+  const [isRecordingSnapshot, setIsRecordingSnapshot] = useState(false);
+  const [appNotifications, setAppNotifications] = useState<AppNotificationItem[]>([]);
+  const [showNotifications, setShowNotifications] = useState(false);
+  const [showQuickAddModal, setShowQuickAddModal] = useState(false);
+  const [quickAddInitialMode, setQuickAddInitialMode] = useState<'search' | 'preset' | 'upload'>('search');
+  const autoSnapDoneRef = useRef<string>('');
   const [joinCodeInput, setJoinCodeInput] = useState('');
   const [isJoiningFamily, setIsJoiningFamily] = useState(false);
   const [householdInviteCode, setHouseholdInviteCode] = useState<string>('');
@@ -195,7 +210,7 @@ export default function App() {
   });
   const [isMenuOpen, setIsMenuOpen] = useState(false);
   const [invites, setInvites] = useState<Invite[]>([]);
-  const [notification, setNotification] = useState<{message: string, type: 'success' | 'refreshed' | 'error'} | null>(null);
+  const [notification, setNotification] = useState<{message: string, type: 'success' | 'refreshed' | 'error' | 'info'} | null>(null);
   const [detailView, setDetailView] = useState<{ title: string, filter: (h: Holding) => boolean, categoryContext?: any, totalForeignVal?: number } | null>(null);
 
   useEffect(() => {
@@ -458,100 +473,146 @@ export default function App() {
   const [selectedImportProvider, setSelectedImportProvider] = useState<string | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
 
-  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (!file || !user || !targetUserId) return;
+  const readFilePayload = (file: File): Promise<{ content: string; isPDF: boolean }> =>
+    new Promise((resolve, reject) => {
+      const isPDF = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const raw = String(ev.target?.result || '');
+        resolve({
+          content: isPDF ? (raw.split(',')[1] || '') : raw,
+          isPDF
+        });
+      };
+      reader.onerror = () => reject(new Error(`Failed to read ${file.name}`));
+      if (isPDF) reader.readAsDataURL(file);
+      else reader.readAsText(file);
+    });
+
+  const pushHouseholdNotification = async (payload: {
+    category: 'import' | 'family' | 'milestone' | 'drift' | 'system';
+    severity: 'info' | 'success' | 'warning';
+    title: string;
+    message: string;
+    actionTab?: string;
+  }) => {
+    if (!user?.householdId || !auth.currentUser) return;
+    try {
+      const idToken = await auth.currentUser.getIdToken();
+      const res = await fetch(`/api/notifications/${user.householdId}/add`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`
+        },
+        body: JSON.stringify(payload)
+      });
+      if (res.ok) {
+        const json = await res.json();
+        if (json.notification) {
+          setAppNotifications((prev) => [json.notification, ...prev]);
+        }
+      }
+    } catch {
+      // non-fatal
+    }
+  };
+
+  const processFilesBatch = async (
+    rawFiles: FileList | File[],
+    ownerMemberId: string,
+    providerHint?: string | null
+  ) => {
+    const fileArray = Array.from(rawFiles || []);
+    if (fileArray.length === 0 || !user) return;
+    const resolvedOwner = (!ownerMemberId || ownerMemberId === 'combined') ? user.id : ownerMemberId;
 
     setIsParsing(true);
     setShowSyncModal(false);
-    const providerHintUsed = selectedImportProvider;
-    const reader = new FileReader();
-    const isPDF = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
-    
-    reader.onload = async (e) => {
-      let base64 = "";
-      let textContent = "";
 
-      if (isPDF) {
-        base64 = (e.target?.result as string).split(',')[1];
-      } else {
-        textContent = e.target?.result as string;
+    let totalImported = 0;
+    const importedProviders: string[] = [];
+    let lastError = '';
+    let workingExisting = [...(data?.holdings || [])];
+
+    try {
+      if (user.householdId && auth.currentUser) {
+        const uRef = doc(db, 'users', user.id);
+        const uSnap = await getDoc(uRef);
+        if (!uSnap.exists()) {
+          await setDoc(uRef, {
+            email: (user.email || auth.currentUser.email || '').toLowerCase(),
+            name: user.name || auth.currentUser.displayName || 'Investor',
+            householdId: user.householdId,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp()
+          });
+        } else if (uSnap.data()?.householdId !== user.householdId) {
+          await updateDoc(uRef, { householdId: user.householdId });
+        }
       }
-      
-      try {
-        const res = await fetch("/api/gemini/extract", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
+
+      for (const file of fileArray) {
+        const { content, isPDF } = await readFilePayload(file);
+        const res = await fetch('/api/gemini/extract', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            content: isPDF ? base64 : textContent,
+            content,
             isPDF,
             fileName: file.name,
-            providerHint: providerHintUsed
+            providerHint: providerHint || undefined
           })
         });
-        
+
         if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.error || "Failed to extract holdings");
+          const err = await res.json().catch(() => ({}));
+          lastError = err.error || `Failed to extract holdings from ${file.name}`;
+          continue;
         }
-        
+
         const extractedPayload = await res.json();
         const holdings: any[] = Array.isArray(extractedPayload)
           ? extractedPayload
           : (extractedPayload?.holdings || []);
-        const detectedProvider: string = providerHintUsed || (!Array.isArray(extractedPayload) && extractedPayload?.provider) || 'CAMS';
+        const detectedProvider: string =
+          providerHint || (!Array.isArray(extractedPayload) && extractedPayload?.provider) || 'CAMS';
         const warningMsg: string | undefined = !Array.isArray(extractedPayload) ? extractedPayload?.warning : undefined;
 
-        console.log("Extracted holdings:", extractedPayload);
-
         if (holdings.length === 0) {
-          setNotification({
-            message: warningMsg || "No active open holdings (> 0 units) were found in this statement.",
-            type: 'error'
-          });
-          return;
+          lastError = warningMsg || `No active open holdings (> 0 units) were found in ${file.name}.`;
+          continue;
         }
 
         const incomingProviders = new Set<string>(
           holdings.map((h: any) => String(h.provider || detectedProvider || 'CAMS'))
         );
-        
-        if (user.householdId && auth.currentUser) {
-          // Ensure user's Firestore profile doc has householdId synced (required by holdings create rule)
-          const uRef = doc(db, 'users', user.id);
-          const uSnap = await getDoc(uRef);
-          if (!uSnap.exists()) {
-            await setDoc(uRef, {
-              email: (user.email || auth.currentUser.email || '').toLowerCase(),
-              name: user.name || auth.currentUser.displayName || 'Investor',
-              householdId: user.householdId,
-              createdAt: serverTimestamp(),
-              updatedAt: serverTimestamp()
-            });
-          } else if (uSnap.data()?.householdId !== user.householdId) {
-            await updateDoc(uRef, { householdId: user.householdId });
-          }
 
+        if (user.householdId && auth.currentUser) {
           const batch = writeBatch(db);
-          (data?.holdings || []).forEach((existingH) => {
+          const remainingExisting: Holding[] = [];
+          workingExisting.forEach((existingH) => {
             const existingOwner = getHoldingOwnerId(existingH);
             const docProvider = String(existingH.provider || 'CAMS');
             if (
-              existingOwner === targetUserId &&
+              existingOwner === resolvedOwner &&
               existingH.source === 'PDF' &&
               incomingProviders.has(docProvider) &&
               existingH.id &&
               !String(existingH.id).startsWith('placeholder-')
             ) {
               batch.delete(doc(db, 'holdings', existingH.id));
+            } else {
+              remainingExisting.push(existingH);
             }
           });
 
+          const createdDocs: Holding[] = [];
           holdings.forEach((h: any) => {
-            const id = "h_" + Math.random().toString(36).slice(2, 11);
-            batch.set(doc(db, 'holdings', id), {
+            const id = 'h_' + Math.random().toString(36).slice(2, 11);
+            const docObj: any = {
               userId: user.id,
-              ownerId: targetUserId,
+              ownerId: resolvedOwner,
               householdId: user.householdId,
               ticker: String(h.ticker || h.schemeName || 'MF').slice(0, 50),
               quantity: Number(h.units) || 0,
@@ -562,63 +623,100 @@ export default function App() {
               currentPrice: Number(h.nav) || 0,
               originalName: h.originalName || h.schemeName || '',
               syncedAt: Date.now()
-            });
+            };
+            batch.set(doc(db, 'holdings', id), docObj);
+            createdDocs.push({ id, ...docObj });
           });
+
           await batch.commit();
-          const targetMemberName = data?.household?.membersData?.find((m: any) => m.id === targetUserId)?.name;
-          setNotification({
-            message: `Imported ${holdings.length} ${holdings.length === 1 ? 'holding' : 'holdings'} from ${detectedProvider}${targetMemberName ? ` for ${targetMemberName}` : ''} with live prices!`,
-            type: 'refreshed'
-          });
-        } else {
-          const saveRes = await fetch('/api/portfolio/bulk-add', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              userId: targetUserId,
-              householdId: user.householdId,
-              provider: detectedProvider,
-              holdings
-            }),
-          });
-
-          const saveText = await saveRes.text();
-          let saveResult;
-          try {
-            saveResult = JSON.parse(saveText);
-          } catch (err) {
-            console.error("Non-JSON from bulk-add:", saveText);
-            throw new Error("Server returned an invalid response (not JSON) during portfolio update.");
-          }
-
-          if (saveRes.ok) {
-            setNotification({
-              message: `Imported ${holdings.length} holdings from ${detectedProvider}!`,
-              type: 'refreshed'
-            });
-          } else {
-            setNotification({ message: saveResult.error || 'Failed to save imported holdings.', type: 'error' });
+          workingExisting = [...remainingExisting, ...createdDocs];
+          totalImported += holdings.length;
+          if (!importedProviders.includes(detectedProvider)) {
+            importedProviders.push(detectedProvider);
           }
         }
-      } catch (parseError: any) {
-        console.error("Upload process error:", parseError);
-        setNotification({ message: parseError.message || "Error parsing statement", type: 'error' });
-      } finally {
-        setIsParsing(false);
-        setTargetUserId(null);
-        setSelectedImportProvider(null);
-        if (fileInputRef.current) fileInputRef.current.value = '';
       }
-    };
-    reader.onerror = () => {
+
+      if (totalImported > 0) {
+        const targetMemberName = data?.household?.membersData?.find((m: any) => m.id === resolvedOwner)?.name;
+        const providersLabel = importedProviders.join(' + ') || 'Statement';
+        setNotification({
+          message: `Imported ${totalImported} ${totalImported === 1 ? 'holding' : 'holdings'} from ${providersLabel}${targetMemberName ? ` for ${targetMemberName}` : ''} with live prices!`,
+          type: 'refreshed'
+        });
+        // Trigger fresh monthly wealth snapshot once Firestore listener updates
+        autoSnapDoneRef.current = '';
+        pushHouseholdNotification({
+          category: 'import',
+          severity: 'success',
+          title: `Statement Synced: ${providersLabel}`,
+          message: `Imported ${totalImported} active ${totalImported === 1 ? 'holding' : 'holdings'}${targetMemberName ? ` for ${targetMemberName}` : ''} with live market prices.`,
+          actionTab: 'wealth'
+        });
+      } else if (lastError) {
+        setNotification({ message: lastError, type: 'error' });
+      }
+    } catch (parseError: any) {
+      console.error('Upload process error:', parseError);
+      setNotification({ message: parseError.message || 'Error parsing statement', type: 'error' });
+    } finally {
       setIsParsing(false);
-      setNotification({ message: "Failed to read file.", type: 'error' });
-    };
-    if (isPDF) {
-      reader.readAsDataURL(file);
-    } else {
-      reader.readAsText(file);
+      setTargetUserId(null);
+      setSelectedImportProvider(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
     }
+  };
+
+  const handleFileUpload = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const files = event.target.files;
+    if (!files || files.length === 0 || !user || !targetUserId) return;
+    await processFilesBatch(files, targetUserId, selectedImportProvider);
+  };
+
+  const openQuickAdd = (mode: 'search' | 'preset' | 'upload' = 'search') => {
+    setQuickAddInitialMode(mode);
+    setShowQuickAddModal(true);
+  };
+
+  const handleQuickSaveHolding = async (payload: {
+    ownerId: string;
+    ticker: string;
+    originalName: string;
+    quantity: number;
+    currentPrice: number;
+    currency: Currency;
+    assetClass: AssetClass;
+    provider: string;
+    source: 'Manual' | 'Live';
+  }) => {
+    if (!user?.householdId) return;
+    const resolvedOwner = (!payload.ownerId || payload.ownerId === 'combined') ? user.id : payload.ownerId;
+    const upperTicker = (payload.ticker || 'MANUAL').toUpperCase().slice(0, 50);
+    let resolvedCurrency: Currency = payload.currency || 'INR';
+    if (upperTicker.endsWith('.NS') || upperTicker.endsWith('.BO')) {
+      resolvedCurrency = 'INR';
+    }
+    const id = 'h_' + Math.random().toString(36).slice(2, 11);
+    await setDoc(doc(db, 'holdings', id), {
+      userId: user.id,
+      ownerId: resolvedOwner,
+      householdId: user.householdId,
+      ticker: upperTicker,
+      originalName: payload.originalName || upperTicker,
+      quantity: Number(payload.quantity) || 0,
+      assetClass: payload.assetClass || 'Equity',
+      currency: resolvedCurrency,
+      provider: payload.provider || 'Manual',
+      source: payload.source === 'Live' ? 'Manual' : payload.source,
+      currentPrice: Number(payload.currentPrice) || 0,
+      syncedAt: Date.now()
+    });
+    autoSnapDoneRef.current = '';
+    const memberName = data?.household?.membersData?.find((m: any) => m.id === resolvedOwner)?.name;
+    setNotification({
+      message: `Added ${shortenAssetName(payload.originalName || upperTicker)}${memberName ? ` for ${memberName}` : ''}!`,
+      type: 'success'
+    });
   };
 
   const triggerUpload = (memberId: string, providerHint?: string) => {
@@ -1237,6 +1335,7 @@ export default function App() {
           await batch.commit();
         }
         await fetchFxRates();
+        autoSnapDoneRef.current = '';
         setNotification({ message: `Refreshed live prices (${entries.length} updated)!`, type: 'refreshed' });
       } else {
         setNotification({ message: 'Failed to refresh live prices.', type: 'error' });
@@ -1438,6 +1537,337 @@ export default function App() {
     };
   }, [data, fxRates, dashboardView]);
 
+  // Combined household-wide stats (always independent of single-member filter) for Wealth Journey, Health X-Ray & Smart Alerts
+  const householdStats = useMemo(() => {
+    if (!data) return null;
+    const rate = fxRates.INR || 83.5;
+    const realHoldings = data.holdings.map((h) => {
+      let effectiveAssetClass = h.assetClass;
+      let effectiveCurrency = h.currency;
+      const lowerName = (h.originalName || '').toLowerCase();
+      const lowerTicker = (h.ticker || '').toLowerCase();
+      if (lowerName.includes('arbitrage') || lowerTicker.includes('arbitrage')) {
+        effectiveAssetClass = 'Debt';
+      }
+      if (lowerName.includes('qualcomm') || lowerTicker.includes('qcom')) {
+        effectiveCurrency = 'USD';
+        effectiveAssetClass = 'Equity';
+      }
+      const valINR = effectiveCurrency === 'USD' ? h.quantity * h.currentPrice * rate : h.quantity * h.currentPrice;
+      const valUSD = effectiveCurrency === 'USD' ? h.quantity * h.currentPrice : (h.quantity * h.currentPrice) / rate;
+      return { ...h, assetClass: effectiveAssetClass, currency: effectiveCurrency, valINR, valUSD };
+    });
+
+    const totalValINR = realHoldings.reduce((s, h) => s + h.valINR, 0);
+    const totalValUSD = totalValINR / rate;
+    const indianEquityValINR = realHoldings
+      .filter((h) => (h.assetClass === 'Equity' || h.assetClass === 'Mutual Fund') && h.currency === 'INR')
+      .reduce((s, h) => s + h.valINR, 0);
+    const foreignEquityValINR = realHoldings
+      .filter((h) => (h.assetClass === 'Equity' || h.assetClass === 'Mutual Fund') && h.currency === 'USD')
+      .reduce((s, h) => s + h.valINR, 0);
+    const debtValINR = realHoldings.filter((h) => h.assetClass === 'Debt').reduce((s, h) => s + h.valINR, 0);
+    const equityValINR = indianEquityValINR + foreignEquityValINR;
+
+    const targetEquityPct = data.household.targets?.assetSplit?.Equity ?? 0.7;
+    const actualEquityPct = totalValINR > 0 ? equityValINR / totalValINR : 0;
+    const equityDrift = actualEquityPct - targetEquityPct;
+
+    const memberContributions = (data.household.membersData || []).map((m) => {
+      const value = realHoldings.filter((h) => getHoldingOwnerId(h) === m.id).reduce((s, h) => s + h.valINR, 0);
+      return { id: m.id, name: m.name, value, percentage: totalValINR > 0 ? value / totalValINR : 0 };
+    });
+
+    const providerBreakdown: Record<string, number> = {};
+    realHoldings.forEach((h) => {
+      if (h.valINR > 0) {
+        const p = h.provider || 'Manual';
+        providerBreakdown[p] = (providerBreakdown[p] || 0) + h.valINR;
+      }
+    });
+
+    const sortedByVal = [...realHoldings].filter((h) => h.valINR > 0).sort((a, b) => b.valINR - a.valINR);
+    const topHolding = sortedByVal[0] || null;
+    const topHoldingPct = topHolding && totalValINR > 0 ? (topHolding.valINR / totalValINR) * 100 : 0;
+
+    const syncTimestamps = realHoldings
+      .map((h) => Number(h.syncedAt || h.priceUpdatedAt || 0))
+      .filter((ts) => ts > 0);
+    const latestSyncTs = syncTimestamps.length > 0 ? Math.max(...syncTimestamps) : 0;
+    const daysSinceSync = latestSyncTs > 0 ? Math.floor((Date.now() - latestSyncTs) / (1000 * 60 * 60 * 24)) : null;
+
+    const mappedForeignSet = new Set<string>();
+    (data.household.targets?.foreignBreakdown || []).forEach((c: any) =>
+      (c.tickerWeights || []).forEach((tw: any) => mappedForeignSet.add(String(tw.ticker).toUpperCase()))
+    );
+    const unmappedForeignHoldings = realHoldings.filter(
+      (h) => (h.assetClass === 'Equity' || h.assetClass === 'Mutual Fund') && h.currency === 'USD' && h.valINR > 0 && !mappedForeignSet.has(h.ticker.toUpperCase())
+    );
+
+    return {
+      totalValINR,
+      totalValUSD,
+      indianEquityValINR,
+      foreignEquityValINR,
+      debtValINR,
+      equityValINR,
+      equityDrift,
+      memberContributions,
+      providerBreakdown,
+      topHoldingName: topHolding ? shortenAssetName(topHolding.originalName || topHolding.ticker) : '',
+      topHoldingPct,
+      daysSinceSync,
+      unmappedForeignCount: unmappedForeignHoldings.length,
+      holdings: realHoldings
+    };
+  }, [data, fxRates]);
+
+  // Load persisted PostgreSQL wealth history & notifications when household loads
+  useEffect(() => {
+    if (!user?.householdId || !auth.currentUser) {
+      setWealthSnapshots([]);
+      setAppNotifications([]);
+      return;
+    }
+    let active = true;
+    const fetchPersisted = async () => {
+      try {
+        const idToken = await auth.currentUser!.getIdToken();
+        const headers = { Authorization: `Bearer ${idToken}` };
+        const [histRes, notifRes] = await Promise.all([
+          fetch(`/api/wealth-history/${user.householdId}`, { headers }),
+          fetch(`/api/notifications/${user.householdId}`, { headers })
+        ]);
+        if (histRes.ok && active) {
+          const hj = await histRes.json();
+          if (Array.isArray(hj.snapshots)) setWealthSnapshots(hj.snapshots);
+        }
+        if (notifRes.ok && active) {
+          const nj = await notifRes.json();
+          if (Array.isArray(nj.notifications)) setAppNotifications(nj.notifications);
+        }
+      } catch (err) {
+        console.warn('Persisted wealth/notification fetch warning:', err);
+      }
+    };
+    fetchPersisted();
+    return () => {
+      active = false;
+    };
+  }, [user?.householdId]);
+
+  const recordWealthSnapshot = async (sourceLabel = 'manual_snapshot', showFeedback = false) => {
+    if (!user?.householdId || !auth.currentUser || !householdStats || !(householdStats.totalValINR > 0)) return;
+    setIsRecordingSnapshot(true);
+    try {
+      const idToken = await auth.currentUser.getIdToken();
+      const now = new Date();
+      const ym = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+      const res = await fetch('/api/wealth-history/record', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`
+        },
+        body: JSON.stringify({
+          householdId: user.householdId,
+          snapshotMonth: ym,
+          totalINR: householdStats.totalValINR,
+          totalUSD: householdStats.totalValUSD,
+          indianEquityINR: householdStats.indianEquityValINR,
+          foreignEquityINR: householdStats.foreignEquityValINR,
+          debtINR: householdStats.debtValINR,
+          fxRate: fxRates.INR || 83.5,
+          holdingsCount: householdStats.holdings.filter((h) => h.valINR > 0).length,
+          memberBreakdown: householdStats.memberContributions.map((m) => ({
+            id: m.id,
+            name: m.name,
+            valueINR: m.value
+          })),
+          providerBreakdown: householdStats.providerBreakdown,
+          source: sourceLabel,
+          note: `${householdStats.holdings.filter((h) => h.valINR > 0).length} active holdings`
+        })
+      });
+      if (res.ok) {
+        const json = await res.json();
+        if (Array.isArray(json.snapshots)) {
+          setWealthSnapshots(json.snapshots);
+        }
+        if (showFeedback) {
+          setNotification({ message: `Saved ${ym} family wealth snapshot to PostgreSQL!`, type: 'success' });
+        }
+      }
+    } catch (err) {
+      console.warn('Record wealth snapshot error:', err);
+    } finally {
+      setIsRecordingSnapshot(false);
+    }
+  };
+
+  // Auto-record monthly wealth snapshot whenever live holdings are present & unsynced this session
+  useEffect(() => {
+    if (!user?.householdId || !householdStats || !(householdStats.totalValINR > 0) || !auth.currentUser) return;
+    const now = new Date();
+    const ym = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const snapKey = `${user.householdId}:${ym}:${Math.round(householdStats.totalValINR / 1000)}`;
+    if (autoSnapDoneRef.current === snapKey) return;
+    autoSnapDoneRef.current = snapKey;
+
+    const timer = setTimeout(() => {
+      recordWealthSnapshot('auto_sync', false);
+    }, 900);
+    return () => clearTimeout(timer);
+  }, [user?.householdId, householdStats?.totalValINR]);
+
+  const handleBackfillMonth = async (payload: {
+    snapshotMonth: string;
+    totalINR: number;
+    indianEquityINR: number;
+    foreignEquityINR: number;
+    debtINR: number;
+    note: string;
+  }) => {
+    if (!user?.householdId || !auth.currentUser) return;
+    const idToken = await auth.currentUser.getIdToken();
+    const res = await fetch('/api/wealth-history/backfill', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`
+      },
+      body: JSON.stringify({
+        householdId: user.householdId,
+        ...payload,
+        fxRate: fxRates.INR || 83.5,
+        memberBreakdown: (householdStats?.memberContributions || []).map((m) => ({
+          id: m.id,
+          name: m.name,
+          valueINR: Math.round(payload.totalINR * (m.percentage || (1 / Math.max(1, (household?.membersData?.length || 1)))))
+        }))
+      })
+    });
+    if (res.ok) {
+      const json = await res.json();
+      if (Array.isArray(json.snapshots)) setWealthSnapshots(json.snapshots);
+      setNotification({ message: `Logged ${payload.snapshotMonth} wealth snapshot!`, type: 'success' });
+    } else {
+      const err = await res.json().catch(() => ({}));
+      setNotification({ message: err.error || 'Failed to save historical month', type: 'error' });
+    }
+  };
+
+  const handleDeleteSnapshotMonth = async (month: string) => {
+    if (!user?.householdId || !auth.currentUser) return;
+    try {
+      const idToken = await auth.currentUser.getIdToken();
+      const res = await fetch(`/api/wealth-history/${user.householdId}/${encodeURIComponent(month)}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${idToken}` }
+      });
+      if (res.ok) {
+        const json = await res.json();
+        if (Array.isArray(json.snapshots)) setWealthSnapshots(json.snapshots);
+        setNotification({ message: `Removed ${month} snapshot.`, type: 'info' });
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleMarkNotificationsRead = async () => {
+    if (!user?.householdId || !auth.currentUser) return;
+    setAppNotifications((prev) => prev.map((n) => ({ ...n, isRead: true })));
+    try {
+      const idToken = await auth.currentUser.getIdToken();
+      await fetch(`/api/notifications/${user.householdId}/mark-read`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`
+        },
+        body: JSON.stringify({})
+      });
+    } catch {
+      // ignore
+    }
+  };
+
+  const smartAlerts = useMemo<SmartInsightAlert[]>(() => {
+    if (!householdStats) return [];
+    const alerts: SmartInsightAlert[] = [];
+    if (householdStats.totalValINR <= 0) {
+      alerts.push({
+        id: 'empty_portfolio',
+        severity: 'info',
+        title: 'Start Your Family Portfolio',
+        message: 'Upload a CAMS CAS PDF, Zerodha/Schwab/IBKR CSV, or add EPF/FD balances in one tap.',
+        actionLabel: 'Open Quick Add & Import',
+        onAction: () => openQuickAdd('upload')
+      });
+      return alerts;
+    }
+
+    const driftPct = Math.abs(householdStats.equityDrift) * 100;
+    const driftThreshold = 100 - (data?.household?.settings?.accuracyThreshold ?? 95);
+    if (driftPct > Math.max(3, driftThreshold)) {
+      alerts.push({
+        id: 'allocation_drift',
+        severity: 'warning',
+        title: `Allocation Drift: ${driftPct.toFixed(1)}% Off Target`,
+        message: `Use Zero-Sell Monthly SIP Routing or full rebalance orders to realign ${formatCompactINR(Math.abs(householdStats.equityDrift * householdStats.totalValINR))}.`,
+        actionLabel: 'Open Rebalance & SIP Router',
+        onAction: () => setActiveTab('rebalance')
+      });
+    }
+
+    if (householdStats.daysSinceSync !== null && householdStats.daysSinceSync >= 25) {
+      alerts.push({
+        id: 'stale_statement',
+        severity: 'warning',
+        title: `Monthly Statement Refresh Due (${householdStats.daysSinceSync}d ago)`,
+        message: 'Upload your latest CAMS or brokerage statement to append this month to your Wealth Journey curve.',
+        actionLabel: 'Upload Monthly Statement',
+        onAction: () => openQuickAdd('upload')
+      });
+    }
+
+    if (householdStats.unmappedForeignCount > 0) {
+      alerts.push({
+        id: 'unmapped_foreign',
+        severity: 'info',
+        title: `${householdStats.unmappedForeignCount} Foreign Stock${householdStats.unmappedForeignCount > 1 ? 's' : ''} Unassigned to Themes`,
+        message: 'Assign US holdings to sector themes in Target Manager for granular ticker-level drift tracking.',
+        actionLabel: 'Configure Target Themes',
+        onAction: () => setActiveTab('targets')
+      });
+    }
+
+    if (householdStats.topHoldingPct > 35 && householdStats.holdings.length >= 3) {
+      alerts.push({
+        id: 'concentration_risk',
+        severity: 'info',
+        title: `Single-Asset Concentration: ${householdStats.topHoldingPct.toFixed(1)}%`,
+        message: `${householdStats.topHoldingName} represents over a third of combined family net worth.`,
+        actionLabel: 'Inspect Portfolio',
+        onAction: () => setActiveTab('dashboard')
+      });
+    }
+
+    if (wealthSnapshots.length <= 1) {
+      alerts.push({
+        id: 'backfill_wealth_curve',
+        severity: 'success',
+        title: 'Plot Your Multi-Month Wealth Curve',
+        message: 'Current month is saved in PostgreSQL! Backfill 1–2 past months to unlock MoM growth charts.',
+        actionLabel: 'Open Wealth Journey',
+        onAction: () => setActiveTab('wealth')
+      });
+    }
+
+    return alerts;
+  }, [householdStats, data?.household?.settings?.accuracyThreshold, wealthSnapshots.length]);
+
   const renderContent = () => {
     if (loading) {
       return (
@@ -1487,17 +1917,19 @@ export default function App() {
             </div>
             <span className="text-xl font-bold tracking-tight text-slate-800">UnityWealth</span>
           </div>
-          <button onClick={() => setIsMenuOpen(false)} className="lg:hidden p-1 text-slate-400 hover:text-slate-600">
+          <button aria-label="Close navigation menu" onClick={() => setIsMenuOpen(false)} className="lg:hidden p-2 text-slate-400 hover:text-slate-600 rounded-lg">
             <X size={20} />
           </button>
         </div>
 
         <nav className="flex-1 space-y-1">
           <div className="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">Navigation</div>
-          <SidebarBtn active={activeTab === 'dashboard'} onClick={() => { setActiveTab('dashboard'); setIsMenuOpen(false); }} icon={<PieChartIcon size={20} />} label="Dashboard" />
-          <SidebarBtn active={activeTab === 'liveMarkets'} onClick={() => { setActiveTab('liveMarkets'); setIsMenuOpen(false); }} icon={<Zap size={20} />} label="Live Markets" />
-          <SidebarBtn active={activeTab === 'targets'} onClick={() => { setActiveTab('targets'); setIsMenuOpen(false); }} icon={<Settings size={20} />} label="Target Manager" />
-          <SidebarBtn active={activeTab === 'accounts'} onClick={() => { setActiveTab('accounts'); setIsMenuOpen(false); }} icon={<Link size={20} />} label="Connection Manager" />
+          <SidebarBtn active={activeTab === 'dashboard'} onClick={() => { setActiveTab('dashboard'); setIsMenuOpen(false); }} icon={<PieChartIcon size={18} />} label="Dashboard" />
+          <SidebarBtn active={activeTab === 'wealth'} onClick={() => { setActiveTab('wealth'); setIsMenuOpen(false); }} icon={<TrendingUp size={18} />} label="Wealth Journey" badge={wealthSnapshots.length > 0 ? `${wealthSnapshots.length}M` : 'NEW'} />
+          <SidebarBtn active={activeTab === 'rebalance'} onClick={() => { setActiveTab('rebalance'); setIsMenuOpen(false); }} icon={<Activity size={18} />} label="Rebalance & SIP" />
+          <SidebarBtn active={activeTab === 'liveMarkets'} onClick={() => { setActiveTab('liveMarkets'); setIsMenuOpen(false); }} icon={<Zap size={18} />} label="Live Markets" />
+          <SidebarBtn active={activeTab === 'targets'} onClick={() => { setActiveTab('targets'); setIsMenuOpen(false); }} icon={<Settings size={18} />} label="Target Manager" />
+          <SidebarBtn active={activeTab === 'accounts'} onClick={() => { setActiveTab('accounts'); setIsMenuOpen(false); }} icon={<Link size={18} />} label="Family & Accounts" />
         </nav>
 
         <div className="pt-8 border-t border-slate-100 flex flex-col h-full">
@@ -1527,81 +1959,131 @@ export default function App() {
       </aside>
 
       {/* Main Content */}
-      <main className="flex-1 flex flex-col min-w-0">
-        <header className="h-16 lg:h-20 bg-white border-b border-slate-200 flex items-center justify-between px-4 lg:px-8 shrink-0">
-          <div className="flex items-center space-x-2 md:space-x-4">
-            <button 
-              onClick={() => setIsMenuOpen(true)}
-              className="lg:hidden p-2 -ml-2 text-slate-600 hover:bg-slate-50 rounded-lg"
-            >
-              <LayoutDashboard size={20} />
-            </button>
-            <div className="h-6 w-px bg-slate-200 hidden md:block mx-2"></div>
-            <div className="flex bg-slate-100 p-1 rounded-lg text-xs font-medium max-w-[300px] sm:max-w-none overflow-x-auto no-scrollbar">
-              <button 
+      <main className="flex-1 flex flex-col min-w-0 relative">
+        <header className="bg-white border-b border-slate-200 px-3 sm:px-6 lg:px-8 py-2.5 shrink-0 space-y-2">
+          {/* Header Row 1: Brand/Household + Primary Actions + Alerts + Sync */}
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2 min-w-0">
+              <button
+                type="button"
+                aria-label="Open navigation menu"
+                onClick={() => setIsMenuOpen(true)}
+                className="lg:hidden p-2 -ml-1 text-slate-600 hover:bg-slate-100 rounded-xl shrink-0"
+              >
+                <Menu size={20} />
+              </button>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <span className="font-black text-sm sm:text-base text-slate-900 truncate">
+                    {data.household.name || 'Family Portfolio'}
+                  </span>
+                  <span className="hidden md:inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 border border-emerald-100 text-[10px] font-black text-emerald-700 uppercase shrink-0">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+                    Live Sync
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
+              <button
+                type="button"
+                onClick={() => openQuickAdd('upload')}
+                disabled={isParsing}
+                className="hidden sm:inline-flex items-center gap-1.5 px-3 py-2 bg-white border border-slate-200 text-slate-700 rounded-xl text-xs font-bold hover:bg-slate-50 transition-all shadow-2xs disabled:opacity-50"
+              >
+                {isParsing ? <RefreshCcw size={14} className="animate-spin text-indigo-500" /> : <FileUp size={14} className="text-indigo-600" />}
+                <span>{isParsing ? 'Parsing...' : 'Import PDF / CSV'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => openQuickAdd('search')}
+                className="inline-flex items-center gap-1.5 px-3 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl text-xs font-bold transition-all shadow-sm active:scale-95"
+              >
+                <Plus size={15} />
+                <span className="sm:hidden">Add</span>
+                <span className="hidden sm:inline">Quick Add</span>
+              </button>
+
+              <button
+                type="button"
+                aria-label="Open notifications and smart alerts"
+                onClick={() => setShowNotifications(true)}
+                className="relative p-2 text-slate-600 hover:bg-slate-100 rounded-xl transition-colors"
+              >
+                <Bell size={18} />
+                {(appNotifications.filter((n) => !n.isRead).length + smartAlerts.filter((a) => a.severity === 'warning').length) > 0 && (
+                  <span className="absolute top-1 right-1 min-w-[16px] h-4 px-1 rounded-full bg-rose-500 text-white text-[9px] font-black flex items-center justify-center">
+                    {appNotifications.filter((n) => !n.isRead).length + smartAlerts.filter((a) => a.severity === 'warning').length}
+                  </span>
+                )}
+              </button>
+
+              <button
+                type="button"
+                aria-label="Refresh live market prices"
+                onClick={refreshPrices}
+                disabled={isSaving}
+                className={`p-2 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-xl transition-colors ${isSaving ? 'animate-spin text-indigo-600' : ''}`}
+              >
+                <RefreshCcw size={18} />
+              </button>
+            </div>
+          </div>
+
+          {/* Header Row 2: Non-wrapping Member Filter Pills + FX Rate */}
+          <div className="flex items-center justify-between gap-2 pt-1.5 border-t border-slate-100">
+            <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar min-w-0 flex-1 py-0.5">
+              <button
+                type="button"
                 onClick={() => setDashboardView('combined')}
-                className={`px-3 py-1 rounded shadow-sm transition-all ${dashboardView === 'combined' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                className={`px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap shrink-0 transition-all ${
+                  dashboardView === 'combined'
+                    ? 'bg-slate-900 text-white shadow-xs'
+                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200/70'
+                }`}
               >
                 Combined View
               </button>
               {data.household.membersData?.map((m: any) => (
-                <button 
-                  key={m.id} 
+                <button
+                  type="button"
+                  key={m.id}
                   onClick={() => {
                     setDashboardView(m.id);
-                    setActiveTab('dashboard');
+                    if (activeTab !== 'dashboard' && activeTab !== 'rebalance') {
+                      setActiveTab('dashboard');
+                    }
                   }}
-                  className={`px-3 py-1 rounded transition-all ${dashboardView === m.id ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap shrink-0 transition-all ${
+                    dashboardView === m.id
+                      ? 'bg-indigo-600 text-white shadow-xs'
+                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200/70'
+                  }`}
                 >
                   {m.name}
                 </button>
               ))}
-            </div>
-            <div className="flex items-center gap-2">
-              <button 
-                onClick={() => triggerUpload(dashboardView !== 'combined' ? dashboardView : user.id)}
-                disabled={isParsing}
-                className="flex items-center gap-2 px-3 py-1 bg-white border border-slate-200 text-slate-700 rounded-lg text-xs font-bold hover:bg-slate-50 transition-all shadow-sm active:scale-95 disabled:opacity-50"
+              <button
+                type="button"
+                onClick={() => openQuickAdd('upload')}
+                className="sm:hidden px-2.5 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap shrink-0 bg-indigo-50 text-indigo-700 border border-indigo-100 flex items-center gap-1"
               >
-                {isParsing ? <RefreshCcw size={14} className="animate-spin text-indigo-500" /> : <FileUp size={14} />}
-                {isParsing ? "PARSING..." : "IMPORT PDF / CSV"}
+                <FileUp size={12} /> Import PDF/CSV
               </button>
-              {dashboardView !== 'combined' && (
-                <button 
-                  onClick={() => setShowManualEntryModal(true)}
-                  className="flex items-center gap-2 px-3 py-1 bg-indigo-600 text-white rounded-lg text-xs font-bold hover:bg-indigo-700 transition-all shadow-sm active:scale-95"
-                >
-                  <Plus size={14} /> MANUAL ENTRY
-                </button>
-              )}
             </div>
-          </div>
-            <div className="flex items-center space-x-3 md:space-x-6">
-            <div className="hidden sm:flex flex-col items-end gap-0.5">
-              <div className="flex items-center gap-1.5 text-[10px] font-black text-slate-400 uppercase tracking-widest">
-                <span className="w-1 h-1 rounded-full bg-emerald-500"></span>
-                USD / INR
-              </div>
-              <div className="text-sm font-mono font-black text-slate-800">
+
+            <div className="flex items-center gap-1.5 shrink-0 pl-1">
+              <span className="text-[10px] font-black text-slate-400 uppercase hidden sm:inline">USD/INR</span>
+              <span className="text-xs font-mono font-black text-slate-700 bg-slate-100 px-2 py-1 rounded-lg">
                 ₹{fxRates.INR.toFixed(2)}
-              </div>
+              </span>
             </div>
-            <div className="h-8 w-px bg-slate-100 hidden sm:block mx-1"></div>
-            <div className="flex items-center space-x-2 text-xs md:text-sm font-medium text-slate-600">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse hidden xs:block"></span>
-              <span className="whitespace-nowrap">Live Sync</span>
-            </div>
-            <button 
-              onClick={refreshPrices}
-              disabled={isSaving}
-              className={`p-2 text-slate-400 hover:text-slate-600 ${isSaving ? 'animate-spin' : ''}`}
-            >
-              <RefreshCcw size={18} />
-            </button>
           </div>
         </header>
 
-        <div className="flex-1 overflow-x-hidden overflow-y-auto px-2 sm:px-4 md:p-8">
+        <div className="flex-1 overflow-x-hidden overflow-y-auto px-3 sm:px-5 md:p-8 pb-24 lg:pb-8">
           <AnimatePresence mode="wait">
             {activeTab === 'dashboard' && (
               <motion.div 
@@ -1609,12 +2091,17 @@ export default function App() {
                 initial={{ opacity: 0, y: 10 }} 
                 animate={{ opacity: 1, y: 0 }} 
                 exit={{ opacity: 0, y: -10 }} 
-                className="flex flex-col lg:grid lg:grid-cols-12 gap-4 md:gap-6 w-full max-w-full overflow-x-hidden"
+                className="flex flex-col lg:grid lg:grid-cols-12 gap-4 md:gap-6 w-full max-w-full overflow-x-hidden pt-2 sm:pt-0"
               >
-                <div className="lg:col-span-12 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4 md:gap-6">
-                  <StatCardModern label={dashboardView === 'combined' ? "Combined Net Worth" : `${data.household.membersData?.find((m: any) => m.id === dashboardView)?.name}'s Portfolio`} value={`₹${stats.totalValINR.toLocaleString('en-IN', { maximumFractionDigits: 0 })}`} subValue={`$${stats.totalValUSD.toLocaleString('en-IN', { maximumFractionDigits: 0 })}`} />
-                  <StatCardModern label="Indian Portfolio" value={`₹${(stats.holdings.filter(h => h.currency === 'INR').reduce((s, h) => s + h.quantity * h.currentPrice, 0)).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`} subValue="Mutual Funds & Debt" isSecondary />
-                  <StatCardModern label="Foreign Portfolio" value={`$${(stats.holdings.filter(h => h.currency === 'USD').reduce((s, h) => s + h.quantity * h.currentPrice, 0)).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`} subValue="US Equities" isSecondary />
+                {/* Live Global Market Benchmarks Ribbon */}
+                <div className="lg:col-span-12">
+                  <MarketPulseRibbon />
+                </div>
+
+                <div className="lg:col-span-12 grid grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-4 md:gap-6">
+                  <StatCardModern label={dashboardView === 'combined' ? "Combined Net Worth" : `${data.household.membersData?.find((m: any) => m.id === dashboardView)?.name}'s Portfolio`} value={formatCompactINR(stats.totalValINR)} subValue={`₹${stats.totalValINR.toLocaleString('en-IN', { maximumFractionDigits: 0 })} • $${stats.totalValUSD.toLocaleString('en-US', { maximumFractionDigits: 0 })}`} />
+                  <StatCardModern label="Indian Portfolio" value={formatCompactINR(stats.holdings.filter(h => h.currency === 'INR').reduce((s, h) => s + h.quantity * h.currentPrice, 0))} subValue="Mutual Funds, Stocks & Debt" isSecondary />
+                  <StatCardModern label="Foreign Portfolio" value={`$${(stats.holdings.filter(h => h.currency === 'USD').reduce((s, h) => s + h.quantity * h.currentPrice, 0)).toLocaleString('en-US', { maximumFractionDigits: 0 })}`} subValue="US Equities & RSU" isSecondary />
                   <StatCardModern label="Allocation Accuracy" value={`${(100 - Math.abs(stats.equityDrift) * 100).toFixed(1)}%`} subValue={`${(Math.abs(stats.equityDrift) * 100).toFixed(1)}% Drift detected`} isAlert={Math.abs(stats.equityDrift) > 0.05} />
                 </div>
 
@@ -1645,10 +2132,13 @@ export default function App() {
                   </div>
 
                   <div className="bg-white p-4 md:p-6 rounded-xl border border-slate-100 sm:border-slate-200 shadow-sm">
-                    <h3 className="text-sm font-black text-slate-400 uppercase tracking-widest mb-6">Equity Breakdown</h3>
+                    <div className="flex items-center justify-between mb-6">
+                      <h3 className="text-sm font-black text-slate-400 uppercase tracking-widest">Equity Breakdown</h3>
+                      <span className="text-[10px] font-bold text-slate-400 uppercase">% of Total Equity</span>
+                    </div>
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 md:gap-8">
                       <DriftProgressBar 
-                        label="Indian Equity (of Total Equity)" 
+                        label="Indian Equity" 
                         actual={stats.actualIndianEquityPctOfEquity} 
                         target={stats.targetIndianEquityOfEquity} 
                         value={`₹${(stats.indianEquityValINR).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`} 
@@ -1656,7 +2146,7 @@ export default function App() {
                         onClick={() => setDetailView({ title: 'Indian Equities', filter: (h) => (h.assetClass === 'Equity' || h.assetClass === 'Mutual Fund') && h.currency === 'INR' })}
                       />
                       <DriftProgressBar 
-                        label="Foreign Equity (of Total Equity)" 
+                        label="Foreign Equity" 
                         actual={stats.actualForeignEquityPctOfEquity} 
                         target={stats.targetForeignEquityOfEquity} 
                         value={`₹${(stats.foreignEquityValINR).toLocaleString('en-IN', { maximumFractionDigits: 0 })}`} 
@@ -1746,15 +2236,104 @@ export default function App() {
                       </div>
                     </div>
                   </div>
+
+                  {/* Family Portfolio Health & Custody X-Ray */}
+                  <div className="bg-white p-5 md:p-6 rounded-xl border border-slate-200 shadow-sm space-y-4">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-sm font-black text-slate-800 uppercase tracking-widest">Portfolio Health X-Ray</h3>
+                      <button
+                        type="button"
+                        onClick={() => setActiveTab('wealth')}
+                        className="text-xs font-bold text-indigo-600 hover:underline flex items-center gap-1"
+                      >
+                        Wealth Curve →
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <div className="p-3 rounded-xl bg-slate-50 border border-slate-100">
+                        <div className="text-[10px] font-bold text-slate-400 uppercase">Liquidity / Debt</div>
+                        <div className="text-sm font-black text-slate-800 mt-0.5">{formatCompactINR(stats.debtValINR)}</div>
+                        <div className="text-[10px] text-emerald-600 font-bold">{(stats.actualDebtPct * 100).toFixed(1)}% buffer</div>
+                      </div>
+                      <div className="p-3 rounded-xl bg-slate-50 border border-slate-100">
+                        <div className="text-[10px] font-bold text-slate-400 uppercase">Top Holding</div>
+                        <div className="text-sm font-black text-slate-800 mt-0.5">
+                          {householdStats?.topHoldingPct ? `${householdStats.topHoldingPct.toFixed(1)}%` : '0%'}
+                        </div>
+                        <div className="text-[10px] text-slate-500 truncate">{householdStats?.topHoldingName || 'Diversified'}</div>
+                      </div>
+                    </div>
+
+                    {householdStats && Object.keys(householdStats.providerBreakdown).length > 0 && (
+                      <div className="space-y-2 pt-1">
+                        <div className="text-[10px] font-black text-slate-400 uppercase tracking-wider">Custody & Broker Split</div>
+                        {Object.entries(householdStats.providerBreakdown)
+                          .sort((a, b) => (b[1] as number) - (a[1] as number))
+                          .slice(0, 4)
+                          .map(([prov, val]) => (
+                            <div key={prov} className="flex items-center justify-between text-xs">
+                              <span className="font-semibold text-slate-600 truncate mr-2">{prov}</span>
+                              <span className="font-mono font-bold text-slate-900 shrink-0">{formatCompactINR(val as number)}</span>
+                            </div>
+                          ))}
+                      </div>
+                    )}
+
+                    <button
+                      type="button"
+                      onClick={() => openQuickAdd('preset')}
+                      className="w-full py-2.5 px-3 rounded-xl bg-indigo-50/80 hover:bg-indigo-100/80 text-indigo-700 text-xs font-bold flex items-center justify-center gap-1.5 transition-colors"
+                    >
+                      <Landmark size={14} /> + Add EPF / FD / Gold / Cash
+                    </button>
+                  </div>
                 </div>
 
                 {dashboardView !== 'combined' && (
-                  <div className="md:col-span-12 bg-white p-4 md:p-6 rounded-xl border border-slate-200 shadow-sm">
-                    <div className="flex items-center justify-between mb-6">
+                  <div className="lg:col-span-12 bg-white p-4 md:p-6 rounded-xl border border-slate-200 shadow-sm">
+                    <div className="flex items-center justify-between mb-4 sm:mb-6">
                       <h3 className="text-base md:text-lg font-bold text-slate-800">Holdings Details</h3>
-                      <div className="text-xs text-slate-500 font-medium">Real-time market values</div>
+                      <button
+                        type="button"
+                        onClick={() => openQuickAdd('search')}
+                        className="text-xs font-bold text-indigo-600 hover:underline flex items-center gap-1"
+                      >
+                        <Plus size={14} /> Add Holding
+                      </button>
                     </div>
-                    <div className="overflow-x-auto">
+
+                    {/* Mobile Cards (< 640px) */}
+                    <div className="sm:hidden space-y-2.5">
+                      {stats.holdings
+                        .filter((h: any) => !h.isPlaceholder)
+                        .sort((a: any, b: any) => b.valINR - a.valINR)
+                        .map((h: any) => (
+                          <div key={h.id} className="p-3.5 rounded-xl bg-slate-50 border border-slate-100 space-y-2">
+                            <div className="flex items-start justify-between gap-2">
+                              <div className="min-w-0">
+                                <div className="font-bold text-slate-900 text-sm leading-snug">
+                                  {shortenAssetName(h.originalName || h.ticker)}
+                                </div>
+                                <div className="text-[10px] text-slate-500 font-mono mt-0.5">
+                                  {h.ticker} • {h.assetClass} {h.provider ? `• ${h.provider}` : ''}
+                                </div>
+                              </div>
+                              <div className="text-right shrink-0">
+                                <div className="text-sm font-black text-slate-900 tabular-nums">
+                                  ₹{h.valINR.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+                                </div>
+                                <div className="text-[10px] text-slate-500 tabular-nums">
+                                  {h.quantity.toLocaleString('en-IN', { maximumFractionDigits: 3 })} @ {h.currency} {h.currentPrice.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        ))}
+                    </div>
+
+                    {/* Tablet & Desktop Table */}
+                    <div className="hidden sm:block overflow-x-auto">
                       <table className="w-full text-left">
                         <thead>
                           <tr className="border-b border-slate-100 pb-3">
@@ -1765,7 +2344,7 @@ export default function App() {
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-50">
-                          {stats.holdings.sort((a,b) => b.valINR - a.valINR).map((h: any) => (
+                          {stats.holdings.filter((h: any) => !h.isPlaceholder).sort((a,b) => b.valINR - a.valINR).map((h: any) => (
                             <tr key={h.id} className="hover:bg-slate-50/50 transition-colors">
                               <td className="py-4">
                                 <div className="flex items-center gap-2">
@@ -1774,10 +2353,11 @@ export default function App() {
                                     href={`https://www.google.com/search?q=${encodeURIComponent((h.originalName || h.ticker) + ' price')}`} 
                                     target="_blank" 
                                     rel="noreferrer"
-                                    className="text-slate-400 hover:text-indigo-600 transition-colors"
+                                    aria-label={`Look up ${shortenAssetName(h.originalName || h.ticker)} price on Google`}
+                                    className="p-1.5 text-slate-400 hover:text-indigo-600 transition-colors rounded-lg hover:bg-slate-100"
                                     title="Search on Google"
                                   >
-                                    <Globe size={12} />
+                                    <Globe size={14} />
                                   </a>
                                 </div>
                                 <div className="text-[10px] text-slate-400 font-bold uppercase tracking-wider flex items-center gap-2 flex-wrap mt-0.5">
@@ -1814,19 +2394,37 @@ export default function App() {
                   </div>
                 )}
 
-                <div className="col-span-12 bg-slate-900 rounded-xl p-8 text-white flex items-center justify-between">
-                  <div>
+                <div className="lg:col-span-12 bg-slate-900 rounded-2xl p-5 sm:p-8 text-white flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
+                  <div className="min-w-0">
                     <div className="text-indigo-400 text-xs font-bold uppercase tracking-widest mb-1">Unity Intelligence: Smart Suggestions</div>
-                    <div className="text-xl font-medium">To achieve your {stats.targetEquityPct * 100}/{stats.targetDebtPct * 100} target, move ₹{Math.abs(stats.equityDrift * stats.totalValINR).toLocaleString('en-IN', { maximumFractionDigits: 0 })} from {stats.equityDrift > 0 ? 'Equity' : 'Debt'} into {stats.equityDrift > 0 ? 'Debt Funds' : 'Equity'}.</div>
-                    <div className="text-slate-400 text-sm mt-2 font-light">Optimal tax harvesting identified in family accounts. Currency hedging recommended.</div>
+                    <div className="text-base sm:text-xl font-medium leading-snug">
+                      To achieve your {Math.round(stats.targetEquityPct * 100)}/{Math.round(stats.targetDebtPct * 100)} target, align ₹{Math.abs(stats.equityDrift * stats.totalValINR).toLocaleString('en-IN', { maximumFractionDigits: 0 })} toward {stats.equityDrift > 0 ? 'Debt Funds' : 'Equity'} (or route fresh monthly SIPs tax-free).
+                    </div>
+                    <div className="text-slate-400 text-xs sm:text-sm mt-1.5 font-light">Zero-sell monthly SIP routing and full buy/sell execution lists ready.</div>
                   </div>
                   <button 
+                    type="button"
                     onClick={() => setActiveTab('rebalance')}
-                    className="px-6 py-4 bg-indigo-600 hover:bg-indigo-700 rounded-lg font-bold transition-all shadow-lg active:scale-95 whitespace-nowrap ml-8"
+                    className="w-full sm:w-auto px-6 py-3.5 bg-indigo-600 hover:bg-indigo-700 rounded-xl font-bold transition-all shadow-lg active:scale-95 whitespace-nowrap sm:ml-6 shrink-0 text-sm text-center"
                   >
                     Review Rebalance Orders
                   </button>
                 </div>
+              </motion.div>
+            )}
+
+            {activeTab === 'wealth' && (
+              <motion.div key="wealth" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -16 }}>
+                <WealthJourneyView
+                  snapshots={wealthSnapshots}
+                  stats={householdStats}
+                  fxRate={fxRates.INR}
+                  members={(data.household.membersData || []).map((m: any) => ({ id: m.id, name: m.name }))}
+                  isRecording={isRecordingSnapshot}
+                  onRecordCurrentSnapshot={() => recordWealthSnapshot('manual_button', true)}
+                  onBackfillMonth={handleBackfillMonth}
+                  onDeleteMonth={handleDeleteSnapshotMonth}
+                />
               </motion.div>
             )}
 
@@ -2064,10 +2662,62 @@ export default function App() {
 
         <input 
           type="file" 
+          multiple
+          aria-label="Upload portfolio statements"
           ref={fileInputRef} 
           onChange={handleFileUpload} 
           className="hidden" 
           accept="application/pdf,text/csv,text/tab-separated-values,.pdf,.csv,.tsv,.txt" 
+        />
+
+        {/* Mobile Bottom Tab Navigation Bar (< lg) */}
+        <nav
+          aria-label="Mobile Primary Navigation"
+          className="lg:hidden fixed bottom-0 inset-x-0 z-30 bg-white/95 backdrop-blur-md border-t border-slate-200 px-1 py-1 grid grid-cols-5 shadow-[0_-4px_20px_rgba(15,23,42,0.06)]"
+        >
+          {[
+            { id: 'dashboard', label: 'Overview', icon: <PieChartIcon size={18} /> },
+            { id: 'wealth', label: 'Wealth', icon: <TrendingUp size={18} /> },
+            { id: 'rebalance', label: 'Rebalance', icon: <Activity size={18} /> },
+            { id: 'liveMarkets', label: 'Markets', icon: <Zap size={18} /> },
+            { id: 'accounts', label: 'Family', icon: <Users size={18} /> }
+          ].map((item) => {
+            const isActive = activeTab === item.id;
+            return (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setActiveTab(item.id as any)}
+                className={`flex flex-col items-center justify-center py-1.5 rounded-xl transition-colors ${
+                  isActive ? 'text-indigo-600 font-black bg-indigo-50/60' : 'text-slate-500 font-semibold'
+                }`}
+              >
+                {item.icon}
+                <span className="text-[10px] mt-0.5 leading-none">{item.label}</span>
+              </button>
+            );
+          })}
+        </nav>
+
+        <QuickAddModal
+          isOpen={showQuickAddModal}
+          onClose={() => setShowQuickAddModal(false)}
+          members={(data.household.membersData || []).map((m: any) => ({ id: m.id, name: m.name }))}
+          defaultOwnerId={dashboardView !== 'combined' ? dashboardView : user.id}
+          householdId={user.householdId || undefined}
+          fxRate={fxRates.INR}
+          initialMode={quickAddInitialMode}
+          onSaveHolding={handleQuickSaveHolding}
+          onUploadFiles={(files, ownerId, hint) => processFilesBatch(files, ownerId, hint)}
+        />
+
+        <NotificationDrawer
+          isOpen={showNotifications}
+          onClose={() => setShowNotifications(false)}
+          smartAlerts={smartAlerts}
+          notifications={appNotifications}
+          onMarkAllRead={handleMarkNotificationsRead}
+          onNavigateTab={(tab) => setActiveTab(tab)}
         />
 
         <AnimatePresence>
@@ -2174,6 +2824,7 @@ export default function App() {
                     <div>
                       <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Member Email</label>
                       <input 
+                        aria-label="Member Email"
                         value={inviteEmail} 
                         onChange={e => setInviteEmail(e.target.value)} 
                         type="email" 
@@ -2211,6 +2862,7 @@ export default function App() {
                   <div>
                     <label className="block text-xs font-bold text-slate-400 uppercase mb-2">Family Invite Code</label>
                     <input
+                      aria-label="Family Invite Code"
                       value={joinCodeInput}
                       onChange={e => setJoinCodeInput(e.target.value.toUpperCase())}
                       type="text"
@@ -2250,6 +2902,7 @@ export default function App() {
                     <div>
                       <label className="block text-xs font-bold text-slate-400 uppercase mb-2">Full Name</label>
                       <input 
+                        aria-label="Member Full Name"
                         value={newMemberName} 
                         onChange={e => setNewMemberName(e.target.value)} 
                         type="text" 
@@ -2260,6 +2913,7 @@ export default function App() {
                     <div>
                       <label className="block text-xs font-bold text-slate-400 uppercase mb-2">Email Address</label>
                       <input 
+                        aria-label="Member Email Address"
                         value={newMemberEmail} 
                         onChange={e => setNewMemberEmail(e.target.value)} 
                         type="email" 
@@ -2449,11 +3103,18 @@ export default function App() {
 }
 
 
-function SidebarBtn({ active, onClick, icon, label }: { active: boolean, onClick: () => void, icon: React.ReactNode, label: string }) {
+function SidebarBtn({ active, onClick, icon, label, badge }: { active: boolean, onClick: () => void, icon: React.ReactNode, label: string, badge?: string }) {
   return (
-    <button onClick={onClick} className={`w-full flex items-center space-x-2.5 p-2 rounded-lg font-medium transition-all text-[11px] uppercase tracking-wider ${active ? 'bg-indigo-50 text-indigo-700 font-black' : 'text-slate-500 hover:bg-slate-50'}`}>
-      <span className={`shrink-0 ${active ? 'text-indigo-600' : 'text-slate-400'}`}>{icon}</span>
-      <span className="truncate">{label}</span>
+    <button onClick={onClick} className={`w-full flex items-center justify-between p-2.5 rounded-xl font-medium transition-all text-[11px] uppercase tracking-wider ${active ? 'bg-indigo-50 text-indigo-700 font-black' : 'text-slate-500 hover:bg-slate-50'}`}>
+      <span className="flex items-center space-x-2.5 min-w-0">
+        <span className={`shrink-0 ${active ? 'text-indigo-600' : 'text-slate-400'}`}>{icon}</span>
+        <span className="truncate">{label}</span>
+      </span>
+      {badge && (
+        <span className={`px-1.5 py-0.5 rounded-md text-[9px] font-black shrink-0 ${active ? 'bg-indigo-600 text-white' : 'bg-emerald-50 text-emerald-700'}`}>
+          {badge}
+        </span>
+      )}
     </button>
   );
 }
@@ -2471,15 +3132,18 @@ function AccountStatusItem({ label, isActive }: { label: string, isActive?: bool
 
 function StatCardModern({ label, value, subValue, trend, isSecondary, isAlert, trendType }: { label: string, value: string, subValue: string, trend?: string, isSecondary?: boolean, isAlert?: boolean, trendType?: 'good' | 'bad' | 'neutral' }) {
   return (
-    <div className={`bg-white p-4 md:p-5 rounded-xl border shadow-sm ${isAlert ? 'border-l-4 border-l-amber-400 border-slate-200' : 'border-slate-200'}`}>
-      <div className="text-[10px] md:text-xs font-semibold text-slate-500 uppercase tracking-wider">{label}</div>
-      <div className="text-xl md:text-2xl font-bold mt-1 text-slate-800">{value}</div>
-      {trend ? <div className={`text-[10px] md:text-xs font-medium mt-1 ${trendType === 'bad' ? 'text-rose-500' : 'text-emerald-600'}`}>{trend}</div> : <div className={`text-[10px] md:text-xs mt-1 ${isSecondary ? 'text-slate-400 underline cursor-pointer' : 'text-slate-400'}`}>{subValue}</div>}
+    <div className={`bg-white p-3.5 sm:p-5 rounded-xl border shadow-sm min-w-0 ${isAlert ? 'border-l-4 border-l-amber-400 border-slate-200' : 'border-slate-200'}`}>
+      <div className="text-[10px] sm:text-xs font-semibold text-slate-500 uppercase tracking-wider leading-tight">{label}</div>
+      <div className="text-lg sm:text-2xl font-bold mt-1 text-slate-800 leading-tight">{value}</div>
+      {trend ? <div className={`text-[10px] sm:text-xs font-medium mt-1 ${trendType === 'bad' ? 'text-rose-500' : 'text-emerald-600'}`}>{trend}</div> : <div className="text-[10px] sm:text-xs mt-1 text-slate-400 leading-snug">{subValue}</div>}
     </div>
   );
 }
 
 function RebalanceView({ stats, fxRates }: { stats: any, fxRates: Record<string, number> }) {
+  const [rebalanceMode, setRebalanceMode] = useState<'full' | 'sip'>('full');
+  const [freshInflowINR, setFreshInflowINR] = useState<number>(150000);
+
   const accuracy = useMemo(() => {
     if (!stats) return 0;
     const assetDrift = Math.abs(stats.equityDrift);
@@ -2561,7 +3225,6 @@ function RebalanceView({ stats, fxRates }: { stats: any, fxRates: Record<string,
             h.currency === 'USD' && categoryTickers.includes(h.ticker.toUpperCase())
           );
           
-          // Calculate drift for each ticker relative to category
           cat.tickerWeights.forEach((tw: any) => {
             const tickerTargetPctOfCat = tw.weight / 100;
             const catGoalVal = stats.foreignEquityValINR * (cat.percentage / 100);
@@ -2592,13 +3255,75 @@ function RebalanceView({ stats, fxRates }: { stats: any, fxRates: Record<string,
     return lines;
   }, [stats]);
 
+  // Zero-Sell Monthly SIP / Fresh Inflow Routing Engine
+  const sipPlan = useMemo(() => {
+    if (!stats || !(freshInflowINR > 0)) return { orders: [], postAccuracy: accuracy };
+    const newTotal = stats.totalValINR + freshInflowINR;
+    const targetIndEqShare = stats.targetEquityPct * stats.targetIndianEquityOfEquity;
+    const targetForEqShare = stats.targetEquityPct * stats.targetForeignEquityOfEquity;
+    const targetDebtShare = stats.targetDebtPct;
+
+    const buckets = [
+      {
+        id: 'indian_eq',
+        title: 'Invest in Indian Equity Mutual Funds / Index',
+        category: 'Indian Equity',
+        shortfall: Math.max(0, newTotal * targetIndEqShare - stats.indianEquityValINR),
+        targetShare: targetIndEqShare,
+        hint: 'Direct Growth Flexi-Cap / Nifty 50 SIP — zero capital gains tax'
+      },
+      {
+        id: 'foreign_eq',
+        title: 'Invest in US / Global Equities',
+        category: 'Foreign Equity',
+        shortfall: Math.max(0, newTotal * targetForEqShare - stats.foreignEquityValINR),
+        targetShare: targetForEqShare,
+        hint: `Approx. $${Math.round(freshInflowINR / (fxRates.INR || 84)).toLocaleString('en-US')} capacity @ ₹${(fxRates.INR || 84).toFixed(2)}`
+      },
+      {
+        id: 'debt_cash',
+        title: 'Allocate to Arbitrage / Liquid / Debt Funds',
+        category: 'Debt & Cash',
+        shortfall: Math.max(0, newTotal * targetDebtShare - stats.debtValINR),
+        targetShare: targetDebtShare,
+        hint: 'Arbitrage funds offer equity-like tax treatment for fixed-income bucket'
+      }
+    ];
+
+    const sumShortfalls = buckets.reduce((s, b) => s + b.shortfall, 0);
+    const orders: any[] = [];
+
+    buckets.forEach((b) => {
+      const alloc = sumShortfalls > 0
+        ? (b.shortfall / sumShortfalls) * freshInflowINR
+        : b.targetShare * freshInflowINR;
+      if (alloc >= 500) {
+        orders.push({
+          title: b.title,
+          description: b.hint,
+          type: 'buy',
+          amount: `₹${Math.round(alloc).toLocaleString('en-IN')}`,
+          amountRaw: Math.round(alloc),
+          category: b.category
+        });
+      }
+    });
+
+    const addedEq = orders.filter((o) => o.category !== 'Debt & Cash').reduce((s, o) => s + o.amountRaw, 0);
+    const postEqPct = newTotal > 0 ? (stats.equityValINR + addedEq) / newTotal : stats.targetEquityPct;
+    const postAccuracy = Math.max(0, 100 - Math.abs(postEqPct - stats.targetEquityPct) * 100);
+
+    return { orders, postAccuracy };
+  }, [stats, freshInflowINR, fxRates.INR, accuracy]);
+
+  const activeOrders = rebalanceMode === 'sip' ? sipPlan.orders : suggestions;
+
   // Grouped logic for readability
   const narrative = useMemo(() => {
     if (!stats || suggestions.length === 0) return "Your portfolio is perfectly balanced.";
     
     const assetAction = stats.equityDrift > 0.02 ? "Reduce Equity" : (stats.equityDrift < -0.02 ? "Increase Equity" : "Overall Asset Mix is Balanced");
     
-    // Find specific intra-category trade (e.g. AI Compute)
     const categoryTrades: string[] = [];
     stats.foreignBreakdownStats.forEach((cat: any) => {
       const sells = suggestions.filter(s => s.category === cat.name && s.type === 'sell' && s.isTickerLevel);
@@ -2614,129 +3339,219 @@ function RebalanceView({ stats, fxRates }: { stats: any, fxRates: Record<string,
     };
   }, [stats, suggestions, accuracy]);
 
+  const exportOrdersCsv = () => {
+    const rows = [
+      ['Mode', 'Action', 'Category', 'Order', 'Amount_INR', 'Approx_USD', 'Notes'],
+      ...activeOrders.map((o: any) => [
+        rebalanceMode === 'sip' ? 'Zero-Sell SIP' : 'Full Rebalance',
+        String(o.type).toUpperCase(),
+        `"${String(o.category || '').replace(/"/g, '""')}"`,
+        `"${String(o.title || '').replace(/"/g, '""')}"`,
+        Math.round(o.amountRaw || 0),
+        Math.round((o.amountRaw || 0) / (fxRates.INR || 84)),
+        `"${String(o.description || '').replace(/"/g, '""')}"`
+      ])
+    ];
+    const csvContent = rows.map((r) => r.join(',')).join('\n');
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `unitywealth-${rebalanceMode}-orders-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const totalSellRaw = activeOrders.filter((s: any) => s.type === 'sell').reduce((sum: number, s: any) => sum + s.amountRaw, 0);
+  const totalBuyRaw = activeOrders.filter((s: any) => s.type === 'buy').reduce((sum: number, s: any) => sum + s.amountRaw, 0);
+
   return (
-    <div className="max-w-4xl mx-auto space-y-8">
-      <div className="flex items-center justify-between">
+    <div className="max-w-4xl mx-auto space-y-5 sm:space-y-8">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div>
-          <h2 className="text-3xl font-black text-slate-800 uppercase tracking-tight">Strategy & Orders</h2>
-          <p className="text-slate-500 font-medium tracking-tight">Step-by-step plan to achieve your {stats.targetEquityPct * 100}/{stats.targetDebtPct * 100} goal</p>
+          <h2 className="text-xl sm:text-3xl font-black text-slate-800 uppercase tracking-tight">Strategy & Orders</h2>
+          <p className="text-xs sm:text-sm text-slate-500 font-medium tracking-tight">
+            Step-by-step plan to achieve your {Math.round(stats.targetEquityPct * 100)}/{Math.round(stats.targetDebtPct * 100)} goal
+          </p>
         </div>
-        <div className="flex items-center gap-3">
-           <div className="px-4 py-2 bg-indigo-50 text-indigo-700 rounded-xl border border-indigo-100 flex items-center gap-2">
-              <ShieldCheck size={18} />
-              <span className="text-xs font-black uppercase">Goal-Aligned</span>
-           </div>
+        <div className="flex bg-slate-200/70 p-1 rounded-xl w-full sm:w-auto">
+          <button
+            type="button"
+            onClick={() => setRebalanceMode('full')}
+            className={`flex-1 sm:flex-none px-3 py-2 rounded-lg text-xs font-bold transition-all ${
+              rebalanceMode === 'full' ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600'
+            }`}
+          >
+            Full Rebalance
+          </button>
+          <button
+            type="button"
+            onClick={() => setRebalanceMode('sip')}
+            className={`flex-1 sm:flex-none px-3 py-2 rounded-lg text-xs font-bold transition-all ${
+              rebalanceMode === 'sip' ? 'bg-indigo-600 text-white shadow-xs' : 'text-slate-600'
+            }`}
+          >
+            Zero-Sell SIP Router
+          </button>
         </div>
       </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm flex flex-col items-center text-center relative overflow-hidden group">
+      {rebalanceMode === 'sip' && (
+        <div className="bg-white p-4 sm:p-6 rounded-2xl border border-indigo-200 shadow-sm space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div>
+              <div className="text-xs font-black text-indigo-600 uppercase tracking-wider">Tax-Free Monthly Inflow Router</div>
+              <p className="text-xs text-slate-500">Route your monthly salary savings / SIP into underweight buckets without selling a single unit.</p>
+            </div>
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {[50000, 150000, 300000, 500000].map((preset) => (
+                <button
+                  key={preset}
+                  type="button"
+                  onClick={() => setFreshInflowINR(preset)}
+                  className={`px-2.5 py-1.5 rounded-lg text-xs font-bold border ${
+                    freshInflowINR === preset ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-slate-50 text-slate-600 border-slate-200'
+                  }`}
+                >
+                  {formatCompactINR(preset)}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="text-sm font-black text-slate-500">₹</span>
+            <input
+              type="number"
+              aria-label="Fresh Monthly SIP Inflow in INR"
+              value={freshInflowINR}
+              onChange={(e) => setFreshInflowINR(Math.max(0, Number(e.target.value)))}
+              className="w-full sm:w-64 px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm font-black text-slate-900"
+            />
+            <span className="text-xs font-bold text-emerald-700 bg-emerald-50 px-2.5 py-1.5 rounded-lg border border-emerald-200 shrink-0">
+              Post-SIP: {sipPlan.postAccuracy.toFixed(1)}% aligned
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Compact 3-Column KPI Strip (fits side-by-side on mobile & desktop!) */}
+      <div className="grid grid-cols-3 gap-2.5 sm:gap-6">
+        <div className="bg-white p-3.5 sm:p-7 rounded-2xl sm:rounded-3xl border border-slate-200 shadow-sm flex flex-col items-center text-center relative overflow-hidden">
           <div className="absolute top-0 left-0 w-full h-1 bg-rose-500"></div>
-          <div className="w-12 h-12 bg-rose-50 text-rose-600 rounded-full flex items-center justify-center mb-4 group-hover:scale-110 transition-transform">
-            <ArrowUpRight size={24} />
+          <div className="w-8 h-8 sm:w-12 sm:h-12 bg-rose-50 text-rose-600 rounded-full flex items-center justify-center mb-2 sm:mb-4">
+            <ArrowUpRight size={18} />
           </div>
-          <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Sell Value</div>
-          <div className="text-3xl font-black text-slate-800">
-            ₹{suggestions.filter(s => s.type === 'sell').reduce((sum, s) => sum + s.amountRaw, 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })}
-          </div>
+          <div className="text-[9px] sm:text-[10px] font-black text-slate-400 uppercase tracking-wider mb-0.5">Sell Value</div>
+          <div className="text-sm sm:text-2xl font-black text-slate-800">{formatCompactINR(totalSellRaw)}</div>
         </div>
 
-        <div className="bg-slate-900 p-8 rounded-3xl shadow-xl flex flex-col items-center text-center text-white relative overflow-hidden group">
+        <div className="bg-slate-900 p-3.5 sm:p-7 rounded-2xl sm:rounded-3xl shadow-xl flex flex-col items-center text-center text-white relative overflow-hidden">
           <div className="absolute top-0 left-0 w-full h-1 bg-indigo-500"></div>
-          <div className="w-12 h-12 bg-white/10 text-white rounded-full flex items-center justify-center mb-4 group-hover:rotate-12 transition-transform">
-            <RefreshCcw size={24} />
+          <div className="w-8 h-8 sm:w-12 sm:h-12 bg-white/10 text-white rounded-full flex items-center justify-center mb-2 sm:mb-4">
+            <RefreshCcw size={18} />
           </div>
-          <div className="text-[10px] font-black text-white/50 uppercase tracking-widest mb-1">Accuracy</div>
-          <div className="text-3xl font-black">{accuracy.toFixed(1)}%</div>
-          <div className="mt-2 text-[10px] font-bold text-indigo-400 uppercase">Target: 100%</div>
+          <div className="text-[9px] sm:text-[10px] font-black text-white/60 uppercase tracking-wider mb-0.5">Accuracy</div>
+          <div className="text-sm sm:text-2xl font-black">
+            {(rebalanceMode === 'sip' ? sipPlan.postAccuracy : accuracy).toFixed(1)}%
+          </div>
         </div>
 
-        <div className="bg-white p-8 rounded-3xl border border-slate-200 shadow-sm flex flex-col items-center text-center relative overflow-hidden group">
+        <div className="bg-white p-3.5 sm:p-7 rounded-2xl sm:rounded-3xl border border-slate-200 shadow-sm flex flex-col items-center text-center relative overflow-hidden">
           <div className="absolute top-0 left-0 w-full h-1 bg-emerald-500"></div>
-          <div className="w-12 h-12 bg-emerald-50 text-emerald-600 rounded-full flex items-center justify-center mb-4 group-hover:scale-110 transition-transform">
-            <ArrowDownRight size={24} />
+          <div className="w-8 h-8 sm:w-12 sm:h-12 bg-emerald-50 text-emerald-600 rounded-full flex items-center justify-center mb-2 sm:mb-4">
+            <ArrowDownRight size={18} />
           </div>
-          <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1">Buy Value</div>
-          <div className="text-3xl font-black text-slate-800">
-            ₹{suggestions.filter(s => s.type === 'buy').reduce((sum, s) => sum + s.amountRaw, 0).toLocaleString('en-IN', { maximumFractionDigits: 0 })}
-          </div>
+          <div className="text-[9px] sm:text-[10px] font-black text-slate-400 uppercase tracking-wider mb-0.5">Buy Value</div>
+          <div className="text-sm sm:text-2xl font-black text-slate-800">{formatCompactINR(totalBuyRaw)}</div>
         </div>
       </div>
 
-      <div className="bg-indigo-600 rounded-3xl p-8 text-white shadow-xl shadow-indigo-100 relative overflow-hidden">
-        <div className="absolute top-0 right-0 p-8 opacity-10">
-          <Sparkles size={120} />
-        </div>
+      <div className="bg-indigo-600 rounded-2xl sm:rounded-3xl p-5 sm:p-8 text-white shadow-xl shadow-indigo-100 relative overflow-hidden">
         <div className="relative z-10">
-          <div className="flex items-center gap-2 mb-4">
-            <div className="px-3 py-1 bg-white/20 rounded-full text-[10px] font-black uppercase tracking-widest">Executive Summary</div>
+          <div className="flex items-center gap-2 mb-3">
+            <div className="px-3 py-1 bg-white/20 rounded-full text-[10px] font-black uppercase tracking-widest">
+              {rebalanceMode === 'sip' ? 'Zero-Sell SIP Summary' : 'Executive Summary'}
+            </div>
           </div>
-          <h3 className="text-2xl font-black mb-2 italic">"{typeof narrative === 'string' ? narrative : narrative.main}"</h3>
-          {typeof narrative !== 'string' && (
-            <p className="text-indigo-100 font-medium leading-relaxed max-w-2xl">
-              {narrative.secondary} By adjusting these specific positions, you maintain your sector conviction while reducing overall drift risk.
+          <h3 className="text-lg sm:text-2xl font-black mb-2 italic">
+            "{rebalanceMode === 'sip'
+              ? `Routing ${formatCompactINR(freshInflowINR)} lifts alignment from ${accuracy.toFixed(1)}% to ${sipPlan.postAccuracy.toFixed(1)}% with ₹0 tax drag.`
+              : (typeof narrative === 'string' ? narrative : narrative.main)}"
+          </h3>
+          {rebalanceMode === 'full' && typeof narrative !== 'string' && (
+            <p className="text-xs sm:text-sm text-indigo-100 font-medium leading-relaxed max-w-2xl">
+              {narrative.secondary} Switch to Zero-Sell SIP Router above anytime to rebalance purely via monthly inflows.
             </p>
           )}
         </div>
       </div>
 
-      <div className="bg-white rounded-3xl border border-slate-200 shadow-sm overflow-hidden">
-        <div className="px-8 py-6 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
-          <h3 className="font-black text-slate-800 uppercase tracking-tight flex items-center gap-2">
-             Detailed Order List
+      <div className="bg-white rounded-2xl sm:rounded-3xl border border-slate-200 shadow-sm overflow-hidden">
+        <div className="px-4 sm:px-8 py-4 sm:py-6 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
+          <h3 className="text-sm sm:text-base font-black text-slate-800 uppercase tracking-tight flex items-center gap-2">
+            Detailed Order List ({activeOrders.length})
           </h3>
           <span className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Impact Sorted</span>
         </div>
         
         <div className="divide-y divide-slate-50">
-          {suggestions.length === 0 ? (
-            <div className="p-20 text-center flex flex-col items-center">
-              <div className="w-16 h-16 bg-emerald-50 text-emerald-500 rounded-full flex items-center justify-center mb-4">
-                <Check size={32} />
+          {activeOrders.length === 0 ? (
+            <div className="p-12 sm:p-20 text-center flex flex-col items-center">
+              <div className="w-14 h-14 bg-emerald-50 text-emerald-500 rounded-full flex items-center justify-center mb-4">
+                <Check size={28} />
               </div>
               <p className="text-slate-800 font-bold">Portfolio Perfectly Balanced</p>
               <p className="text-slate-400 text-sm">No adjustments needed at this time.</p>
             </div>
           ) : (
-            suggestions.sort((a,b) => b.amountRaw - a.amountRaw).map((s, idx) => (
-              <div key={idx} className="px-8 py-6 hover:bg-slate-50/50 transition-colors flex items-center justify-between group">
-                <div className="flex items-center gap-4">
-                  <div className={`w-10 h-10 rounded-full flex items-center justify-center border ${
+            [...activeOrders].sort((a: any, b: any) => b.amountRaw - a.amountRaw).map((s: any, idx: number) => (
+              <div key={idx} className="px-4 sm:px-8 py-4 sm:py-6 hover:bg-slate-50/50 transition-colors flex flex-col sm:flex-row sm:items-center justify-between gap-3 group">
+                <div className="flex items-start sm:items-center gap-3 sm:gap-4 min-w-0">
+                  <div className={`w-9 h-9 sm:w-10 sm:h-10 rounded-full flex items-center justify-center border shrink-0 ${
                     s.type === 'sell' ? 'bg-rose-50 text-rose-600 border-rose-100' : 'bg-emerald-50 text-emerald-600 border-emerald-100'
                   }`}>
-                    {s.type === 'sell' ? <ArrowUpRight size={20} /> : <ArrowDownRight size={20} />}
+                    {s.type === 'sell' ? <ArrowUpRight size={18} /> : <ArrowDownRight size={18} />}
                   </div>
-                  <div>
-                    <div className="text-sm font-black text-slate-800 flex items-center gap-2">
-                      {s.title}
-                      <span className="text-[9px] bg-slate-100 text-slate-400 px-1.5 py-0.5 rounded uppercase font-black">{s.category}</span>
+                  <div className="min-w-0">
+                    <div className="text-sm font-black text-slate-800 flex items-center gap-2 flex-wrap">
+                      <span>{s.title}</span>
+                      <span className="text-[9px] bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded uppercase font-black">{s.category}</span>
                     </div>
-                    <div className="text-xs text-slate-500 mt-1 font-medium">{s.description}</div>
+                    <div className="text-xs text-slate-500 mt-1 font-medium leading-snug">{s.description}</div>
                   </div>
                 </div>
-                <div className="text-right">
-                  <div className={`text-lg font-black tabular-nums ${s.type === 'sell' ? 'text-rose-600' : 'text-emerald-600'}`}>
+                <div className="text-left sm:text-right pl-12 sm:pl-0 shrink-0">
+                  <div className={`text-base sm:text-lg font-black tabular-nums ${s.type === 'sell' ? 'text-rose-600' : 'text-emerald-600'}`}>
                     {s.type === 'sell' ? '-' : '+'}{s.amount}
                   </div>
-                  <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mt-1">Market Execution</div>
+                  <div className="text-[10px] font-black text-slate-400 uppercase tracking-widest mt-0.5">
+                    {rebalanceMode === 'sip' ? 'Zero-Tax Buy' : 'Market Execution'}
+                  </div>
                 </div>
               </div>
             ))
           )}
         </div>
         
-        <div className="px-8 py-6 bg-slate-50 flex items-center justify-between border-t border-slate-100">
+        <div className="px-4 sm:px-8 py-5 bg-slate-50 flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-t border-slate-100">
           <div className="flex items-center gap-3">
-             <div className="p-2 bg-slate-200 rounded-lg">
-                <ShieldCheck size={20} className="text-slate-600" />
+             <div className="p-2 bg-slate-200 rounded-lg shrink-0">
+                <ShieldCheck size={18} className="text-slate-600" />
              </div>
              <div>
-                <div className="text-sm font-bold text-slate-700">Tax-Efficient Routing</div>
-                <div className="text-[10px] text-slate-400 uppercase font-bold tracking-widest mt-0.5">FIFO logic applied to all family accounts</div>
+                <div className="text-xs sm:text-sm font-bold text-slate-700">Tax-Efficient Family Execution</div>
+                <div className="text-[10px] text-slate-400 uppercase font-bold tracking-widest mt-0.5">Download CSV order sheet for CAMS / Zerodha / Schwab</div>
              </div>
           </div>
-          <button className="px-6 py-3 bg-slate-900 hover:bg-black text-white rounded-xl font-bold transition-all shadow-lg active:scale-95 text-sm uppercase tracking-tighter">
-            Export Execution List
+          <button
+            type="button"
+            onClick={exportOrdersCsv}
+            disabled={activeOrders.length === 0}
+            className="w-full sm:w-auto px-5 py-3 bg-slate-900 hover:bg-black disabled:opacity-40 text-white rounded-xl font-bold transition-all shadow-lg active:scale-95 text-xs uppercase tracking-wider flex items-center justify-center gap-2"
+          >
+            <Download size={15} /> Export CSV Orders
           </button>
         </div>
       </div>
@@ -2988,6 +3803,7 @@ function DetailViewModal({
                <div className="relative">
                  <input 
                    type="checkbox" 
+                   aria-label="Show Target Gaps"
                    className="sr-only peer" 
                    checked={showTargetPlaceholders}
                    onChange={e => setShowTargetPlaceholders(e.target.checked)}
@@ -2995,7 +3811,7 @@ function DetailViewModal({
                  <div className="w-8 h-4 bg-slate-200 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:bg-indigo-500"></div>
                </div>
              </label>
-             <button onClick={onClose} className="p-2 bg-white border border-slate-200 rounded-xl hover:bg-slate-50 transition-colors">
+             <button onClick={onClose} aria-label="Close modal" className="p-2 bg-white border border-slate-200 rounded-xl hover:bg-slate-50 transition-colors">
                <Plus className="rotate-45" size={20} />
              </button>
           </div>
@@ -3444,6 +4260,7 @@ function LandingPage({ onLogin, onSignup, onForgot, onReset, onGoogleLogin, pend
                 <label className="block text-xs font-bold text-slate-400 uppercase mb-2">Full Name</label>
                 <input 
                   name="name"
+                  aria-label="Full Name"
                   value={name} 
                   onChange={e => setName(e.target.value)} 
                   type="text" 
@@ -3459,6 +4276,7 @@ function LandingPage({ onLogin, onSignup, onForgot, onReset, onGoogleLogin, pend
               <label className="block text-xs font-bold text-slate-400 uppercase mb-2">Email Address</label>
               <input 
                 name="email"
+                aria-label="Email Address"
                 value={email} 
                 onChange={e => setEmail(e.target.value)} 
                 type="email" 
@@ -3488,6 +4306,7 @@ function LandingPage({ onLogin, onSignup, onForgot, onReset, onGoogleLogin, pend
                 </div>
                 <input 
                   name="password"
+                  aria-label="Password"
                   value={password} 
                   onChange={e => setPassword(e.target.value)} 
                   type="password" 
@@ -3620,7 +4439,7 @@ function HouseholdSetup({
             <p className="text-sm text-slate-500 mb-8 leading-relaxed">Start a new combined portfolio for your family. You'll receive a shareable 6-character code to invite family members.</p>
           </div>
           <div className="space-y-4">
-            <input value={name} onChange={e => setName(e.target.value)} className="w-full px-4 py-3 bg-slate-50 border border-slate-100 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-600/20" placeholder="The Garg Family" />
+            <input aria-label="Household Name" value={name} onChange={e => setName(e.target.value)} className="w-full px-4 py-3 bg-slate-50 border border-slate-100 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-600/20" placeholder="The Garg Family" />
             <button onClick={() => onCreate(name)} className="w-full bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl py-4 font-bold shadow-lg shadow-indigo-100 transition-all">Initialize Family Plan</button>
           </div>
         </div>
@@ -3632,6 +4451,7 @@ function HouseholdSetup({
             <p className="text-sm text-slate-500 mb-6 leading-relaxed">Enter the 6-character Family Invite Code from your spouse or family member to merge into a shared dashboard.</p>
             <div className="space-y-3">
               <input
+                aria-label="Family Invite Code"
                 value={inviteCode}
                 onChange={e => setInviteCode(e.target.value.toUpperCase())}
                 maxLength={12}
@@ -3803,7 +4623,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
                 <span className="text-sm font-bold text-slate-600">Equities vs Debt</span>
                 <span className="text-sm font-black text-indigo-600">{assetEq}% Equity / {100-assetEq}% Debt</span>
               </div>
-              <input type="range" min="0" max="100" value={assetEq} onChange={(e) => setAssetEq(Number(e.target.value))} className="w-full h-3 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-indigo-600" />
+              <input type="range" aria-label="Equity vs Debt Target Percentage" min="0" max="100" value={assetEq} onChange={(e) => setAssetEq(Number(e.target.value))} className="w-full h-3 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-indigo-600" />
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                <div className="p-4 bg-indigo-50 border border-indigo-100 rounded-2xl">
@@ -3832,7 +4652,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
                 <span className="text-sm font-bold text-slate-600">Indian vs Foreign (US)</span>
                 <span className="text-sm font-black text-orange-600">{eqIndian}% Indian / {100-eqIndian}% Foreign</span>
               </div>
-              <input type="range" min="0" max="100" value={eqIndian} onChange={(e) => setEqIndian(Number(e.target.value))} className="w-full h-3 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-orange-500" />
+              <input type="range" aria-label="Indian vs Foreign Equity Target Percentage" min="0" max="100" value={eqIndian} onChange={(e) => setEqIndian(Number(e.target.value))} className="w-full h-3 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-orange-500" />
             </div>
             <div className="p-4 bg-slate-50 border border-slate-100 rounded-2xl flex flex-col sm:flex-row sm:items-center justify-between gap-3">
               <div className="flex items-center gap-2">
@@ -3863,6 +4683,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
 
           <div className="flex flex-col sm:flex-row items-center gap-2 mb-6 p-3 bg-slate-50 rounded-xl border border-slate-100">
             <input 
+              aria-label="New Sector or Theme Name"
               value={newCatName} 
               onChange={e => setNewCatName(e.target.value)}
               placeholder="Add theme (e.g. AI & SaaS)"
@@ -3890,6 +4711,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
                         <div className="flex items-center gap-2">
                           <input 
                             autoFocus
+                            aria-label={`Edit theme name ${cat.name}`}
                             value={themeEditName}
                             onChange={(e) => setThemeEditName(e.target.value)}
                             onKeyDown={(e) => {
@@ -3903,6 +4725,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
                           />
                           <button 
                             type="button"
+                            aria-label="Save theme name"
                             onClick={() => {
                               updateCatName(idx, themeEditName);
                               setEditingThemeIdx(null);
@@ -3913,6 +4736,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
                           </button>
                           <button 
                             type="button"
+                            aria-label="Cancel editing theme name"
                             onClick={() => setEditingThemeIdx(null)}
                             className="text-slate-400 hover:text-rose-500"
                           >
@@ -3931,6 +4755,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
                               }}
                               className="p-1 text-slate-400 hover:text-slate-600 transition-colors"
                               title="Edit theme name"
+                              aria-label={`Edit ${cat.name}`}
                             >
                               <Pencil size={12} />
                             </button>
@@ -3939,6 +4764,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
                               onClick={() => removeCat(idx)} 
                               className="p-1 text-slate-400 hover:text-rose-500 transition-colors"
                               title="Remove theme"
+                              aria-label={`Remove ${cat.name}`}
                             >
                               <Trash size={12} />
                             </button>
@@ -3958,6 +4784,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
                                  </span>
                                  <button 
                                    type="button"
+                                   aria-label={`Remove ${tw.ticker}`}
                                    onClick={() => removeTickerFromCat(idx, tIdx)} 
                                    className="text-slate-300 hover:text-rose-500 transition-colors"
                                  >
@@ -3969,6 +4796,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
                              <div className="flex-1 flex items-center gap-3">
                                <input 
                                   type="range" 
+                                  aria-label={`${tw.ticker} weight slider`}
                                   min="0" 
                                   max="100" 
                                   value={tw.weight} 
@@ -3978,6 +4806,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
                                <div className="flex items-center gap-2 shrink-0">
                                  <input 
                                     type="number"
+                                    aria-label={`${tw.ticker} weight percentage`}
                                     value={tw.weight}
                                     onChange={(e) => updateTickerWeight(idx, tIdx, Number(e.target.value))}
                                     className="w-12 text-center text-[10px] font-black text-slate-800 bg-white border border-slate-200 rounded px-1 py-0.5"
@@ -3990,6 +4819,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
                                </div>
                                <button 
                                  type="button"
+                                 aria-label={`Remove ${tw.ticker}`}
                                  onClick={() => removeTickerFromCat(idx, tIdx)} 
                                  className="hidden sm:block text-slate-300 hover:text-rose-500 transition-colors"
                                >
@@ -4009,7 +4839,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
                         </div>
                       </div>
                     </div>
-                    <button type="button" onClick={() => removeCat(idx)} className="text-slate-400 hover:text-rose-500 transition-colors ml-4 hidden md:block">
+                    <button type="button" aria-label={`Delete theme ${cat.name}`} onClick={() => removeCat(idx)} className="text-slate-400 hover:text-rose-500 transition-colors ml-4 hidden md:block">
                       <Trash size={16} />
                     </button>
                   </div>
@@ -4022,6 +4852,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
                     <div className="flex flex-col sm:flex-row sm:items-center gap-4 sm:gap-6">
                       <input 
                         type="range" 
+                        aria-label={`${cat.name} theme weight slider`}
                         min="0" 
                         max="100" 
                         value={cat.percentage} 
@@ -4032,6 +4863,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
                         <div className="flex items-center bg-white border border-slate-200 rounded-lg px-2 py-1 shrink-0">
                           <input 
                             type="number"
+                            aria-label={`${cat.name} theme weight percentage`}
                             value={cat.percentage}
                             onChange={(e) => updateCatPct(idx, Number(e.target.value))}
                             className="w-12 text-sm font-black text-slate-800 focus:outline-none text-right"
@@ -4054,6 +4886,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
               <h5 className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-4">Add Sector / Theme</h5>
               <div className="flex flex-col md:flex-row gap-4">
                 <input 
+                  aria-label="Sector or Theme Name"
                   value={newCatName} 
                   onChange={e => setNewCatName(e.target.value)}
                   placeholder="e.g. AI Winners or Semiconductors" 
@@ -4073,15 +4906,15 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
 
         {/* Tier 4: Notifications & Keys */}
         <section className="relative">
-          <div className="absolute -left-6 top-0 bottom-0 w-1 bg-rose-100 rounded-full"></div>
+          <div className="absolute -left-4 md:-left-6 top-0 bottom-0 w-1 bg-rose-100 rounded-full"></div>
           <div className="flex items-center gap-3 mb-6">
-            <div className="w-8 h-8 rounded-full bg-rose-500 text-white flex items-center justify-center font-bold text-xs">4</div>
-            <h4 className="text-lg font-bold text-slate-800 uppercase tracking-tight">Intelligence & External APIs</h4>
+            <div className="w-8 h-8 rounded-full bg-rose-500 text-white flex items-center justify-center font-bold text-xs shrink-0">4</div>
+            <h4 className="text-base md:text-lg font-bold text-slate-800 uppercase tracking-tight">Intelligence & External APIs</h4>
           </div>
 
           <div className="grid grid-cols-1 gap-6">
             <div className="bg-rose-50 border border-rose-100 p-6 rounded-3xl space-y-4">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-3">
                 <div>
                   <h5 className="font-bold text-slate-800 flex items-center gap-2">
                     <Mail size={16} className="text-rose-500" />
@@ -4091,8 +4924,9 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
                 </div>
                 <button 
                    type="button"
+                   aria-label="Toggle Email Rebalance Alerts"
                    onClick={() => setEmailAlerts(!emailAlerts)}
-                   className={`w-12 h-6 rounded-full transition-all relative ${emailAlerts ? 'bg-rose-500' : 'bg-slate-300'}`}
+                   className={`w-12 h-6 rounded-full transition-all relative shrink-0 ${emailAlerts ? 'bg-rose-500' : 'bg-slate-300'}`}
                 >
                   <div className={`absolute top-1 w-4 h-4 rounded-full bg-white transition-all ${emailAlerts ? 'left-7' : 'left-1'}`}></div>
                 </button>
@@ -4104,7 +4938,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
                     <span>Accuracy Threshold </span>
                     <span className="text-rose-600">Lower than {threshold}%</span>
                   </div>
-                  <input type="range" min="80" max="99" value={threshold} onChange={(e) => setThreshold(Number(e.target.value))} className="w-full h-2 bg-white rounded-lg appearance-none cursor-pointer accent-rose-500 mb-2" />
+                  <input type="range" aria-label="Accuracy Alert Threshold" min="80" max="99" value={threshold} onChange={(e) => setThreshold(Number(e.target.value))} className="w-full h-2 bg-white rounded-lg appearance-none cursor-pointer accent-rose-500 mb-2" />
                   <p className="text-[10px] text-slate-400">UnityWealth will email you once every 24h if your Portfolio Alignment score falls below this number.</p>
                 </motion.div>
               )}
@@ -4114,10 +4948,10 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
 
         {/* Tier 5: Data Resilience */}
         <section className="relative">
-          <div className="absolute -left-6 top-0 bottom-0 w-1 bg-indigo-100 rounded-full"></div>
+          <div className="absolute -left-4 md:-left-6 top-0 bottom-0 w-1 bg-indigo-100 rounded-full"></div>
           <div className="flex items-center gap-3 mb-6">
-            <div className="w-8 h-8 rounded-full bg-indigo-500 text-white flex items-center justify-center font-bold text-xs">5</div>
-            <h4 className="text-lg font-bold text-slate-800 uppercase tracking-tight">Data Persistence & Backups</h4>
+            <div className="w-8 h-8 rounded-full bg-indigo-500 text-white flex items-center justify-center font-bold text-xs shrink-0">5</div>
+            <h4 className="text-base md:text-lg font-bold text-slate-800 uppercase tracking-tight">Data Persistence & Backups</h4>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -4262,6 +5096,7 @@ function AddTickerRow({ onAdd, householdId }: { onAdd: (res: any) => void, house
       <div className="flex items-center gap-2">
         <div className="relative flex-1">
           <input 
+            aria-label="Search Ticker or Mutual Fund"
             value={query} 
             onChange={e => setQuery(e.target.value)}
             onFocus={() => query.length > 1 && setIsOpen(true)}
@@ -4337,19 +5172,22 @@ function LiveMarketsView({ holdings, members, householdId }: { holdings: Holding
 
   return (
     <div className="space-y-6">
-      <div className="flex justify-between items-end">
+      <div className="flex flex-col sm:flex-row sm:justify-between sm:items-end gap-3">
         <div>
-          <h2 className="text-2xl font-black text-slate-800 uppercase italic">Live Markets</h2>
+          <h2 className="text-xl sm:text-2xl font-black text-slate-800 uppercase italic">Live Markets</h2>
           <p className="text-xs text-slate-400 font-bold uppercase tracking-widest mt-1">Real-time asset tracking & current valuations</p>
         </div>
-        <div className="flex items-center gap-2 bg-emerald-50 px-3 py-1.5 rounded-full border border-emerald-100">
+        <div className="inline-flex self-start sm:self-auto items-center gap-2 bg-emerald-50 px-3 py-1.5 rounded-full border border-emerald-100">
           <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
           <span className="text-[10px] font-black text-emerald-700 uppercase tracking-tighter">Market Systems Active</span>
         </div>
       </div>
 
+      {/* Live Global Benchmark Indices */}
+      <MarketPulseRibbon />
+
       {/* Global Search Bar */}
-      <div className="bg-white p-6 rounded-3xl shadow-sm border border-slate-100">
+      <div className="bg-white p-5 sm:p-6 rounded-3xl shadow-sm border border-slate-100">
         <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-3 px-1">Check Live Price for Any Asset</label>
         <div className="max-w-xl">
           <AddTickerRow onAdd={handleAssetSelect} householdId={householdId} />
@@ -4419,6 +5257,7 @@ function LiveMarketsView({ holdings, members, householdId }: { holdings: Holding
                 href={`https://www.google.com/search?q=${encodeURIComponent((h.originalName || h.ticker) + ' price')}`} 
                 target="_blank" 
                 rel="noreferrer"
+                aria-label={`Search ${h.originalName || h.ticker} price on Google`}
                 className="p-2 bg-slate-50 text-slate-400 hover:text-emerald-500 hover:bg-emerald-50 rounded-xl transition-all"
               >
                 <Globe size={14} />
@@ -4454,14 +5293,14 @@ function LiveMarketsView({ holdings, members, householdId }: { holdings: Holding
       </div>
     </div>
 
-      <div className="bg-slate-900 text-white p-8 rounded-3xl relative overflow-hidden flex items-center gap-8">
+      <div className="bg-slate-900 text-white p-5 sm:p-8 rounded-3xl relative overflow-hidden flex flex-col sm:flex-row sm:items-center gap-4 sm:gap-8">
         <div className="absolute right-0 top-0 bottom-0 w-1/3 bg-gradient-to-l from-indigo-500/20 to-transparent pointer-events-none"></div>
-        <div className="bg-indigo-600 p-4 rounded-2xl shadow-xl shadow-indigo-900/50 relative z-10 shrink-0">
-          <Zap size={32} />
+        <div className="bg-indigo-600 p-3.5 sm:p-4 rounded-2xl shadow-xl shadow-indigo-900/50 relative z-10 shrink-0 self-start sm:self-auto">
+          <Zap size={28} />
         </div>
         <div className="relative z-10">
-          <h4 className="text-xl font-black italic uppercase italic">Dashboard Intelligence: Live Core</h4>
-          <p className="text-slate-400 text-sm mt-1 max-w-2xl leading-relaxed">UnityWealth's live engine connects directly to global markets. Every holding marked as <span className="text-emerald-400 font-bold">LIVE</span> is automatically revalued on every refresh using our high-frequency cloud adapters for AMFI and US Market feeds.</p>
+          <h4 className="text-lg sm:text-xl font-black italic uppercase">Dashboard Intelligence: Live Core</h4>
+          <p className="text-slate-400 text-xs sm:text-sm mt-1 max-w-2xl leading-relaxed">UnityWealth's live engine connects directly to global markets. Every holding marked as <span className="text-emerald-400 font-bold">LIVE</span> is automatically revalued on every refresh using shared cloud quote caches for AMFI, NSE, and US Market feeds.</p>
         </div>
       </div>
     </div>
@@ -4479,7 +5318,7 @@ function LiveMarketsView({ holdings, members, householdId }: { holdings: Holding
             initial={{ opacity: 0, y: 50, scale: 0.9 }} 
             animate={{ opacity: 1, y: 0, scale: 1 }} 
             exit={{ opacity: 0, y: 20, scale: 0.9 }} 
-            className="fixed bottom-8 left-1/2 -translate-x-1/2 z-[100] w-full max-w-sm px-4"
+            className="fixed bottom-20 lg:bottom-8 left-1/2 -translate-x-1/2 z-[100] w-full max-w-sm px-4"
           >
             <div className={`p-4 rounded-2xl shadow-2xl border flex items-center gap-4 ${
               notification.type === 'error' ? 'bg-rose-50 border-rose-100 text-rose-800' : 
@@ -4493,6 +5332,7 @@ function LiveMarketsView({ holdings, members, householdId }: { holdings: Holding
               </div>
               <button 
                 onClick={() => setNotification(null)} 
+                aria-label="Dismiss notification"
                 className={`p-1 rounded-full transition-all ${notification.type === 'error' ? 'hover:bg-rose-200/50' : 'hover:bg-white/10'}`}
               >
                 <X size={14} />
