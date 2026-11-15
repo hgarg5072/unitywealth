@@ -155,6 +155,8 @@ interface Props {
   };
   fxRate: number;
   members: { id: string; name: string }[];
+  activeScope?: 'family' | string;
+  onScopeChange?: (scope: 'family' | string) => void;
   isRecording: boolean;
   onRecordCurrentSnapshot: () => Promise<void>;
   onBackfillMonth: (payload: {
@@ -175,13 +177,20 @@ export function WealthJourneyView({
   targets,
   fxRate,
   members,
+  activeScope,
+  onScopeChange,
   isRecording,
   onRecordCurrentSnapshot,
   onBackfillMonth,
   onDeleteMonth
 }: Props) {
-  // Scope: 'family' (combined) or a specific member.id
-  const [scope, setScope] = useState<'family' | string>('family');
+  // Scope: 'family' (combined) or a specific member.id — synced with global header member pills
+  const [internalScope, setInternalScope] = useState<'family' | string>('family');
+  const scope = activeScope !== undefined ? activeScope : internalScope;
+  const setScope = (next: 'family' | string) => {
+    setInternalScope(next);
+    if (onScopeChange) onScopeChange(next);
+  };
   const [lens, setLens] = useState<ChartLens>('netWorth');
   const [unitMode, setUnitMode] = useState<'value' | 'pct'>('value');
   const [currency, setCurrency] = useState<'INR' | 'USD'>('INR');
@@ -729,6 +738,15 @@ export function WealthJourneyView({
             <span className="px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-emerald-50 text-emerald-700 border border-emerald-200 flex items-center gap-1">
               <ShieldCheck size={12} /> PostgreSQL Vault
             </span>
+            {scope !== 'family' && (
+              <button
+                type="button"
+                onClick={() => setScope('family')}
+                className="px-2.5 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider bg-indigo-50 text-indigo-700 border border-indigo-200 flex items-center gap-1 hover:bg-indigo-100 transition-colors"
+              >
+                <Users size={11} /> {activeScopeName} ×
+              </button>
+            )}
           </div>
           <p className="text-xs sm:text-sm text-slate-500 mt-0.5">
             Track net worth, equity/debt balance, India vs foreign exposure, rebalancing alignment & individual holdings.
@@ -754,64 +772,6 @@ export function WealthJourneyView({
           </button>
         </div>
       </div>
-
-      {/* Scope Bar: Family Combined vs Individual Member vs Compare Members */}
-      {members.length > 0 && (
-        <div className="flex items-center justify-between gap-2 bg-white px-3 py-2 rounded-2xl border border-slate-200 shadow-xs">
-          <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar min-w-0 py-0.5">
-            <span className="text-[10px] font-black text-slate-400 uppercase tracking-wider px-1.5 shrink-0 flex items-center gap-1">
-              <Users size={12} /> View:
-            </span>
-            <button
-              type="button"
-              onClick={() => {
-                setScope('family');
-                if (lens === 'members') setLens('netWorth');
-              }}
-              className={`px-3 py-1.5 rounded-xl text-xs font-bold whitespace-nowrap shrink-0 transition-all ${
-                scope === 'family' && lens !== 'members'
-                  ? 'bg-slate-900 text-white shadow-xs'
-                  : 'bg-slate-100 text-slate-600 hover:bg-slate-200/70'
-              }`}
-            >
-              Family Combined
-            </button>
-            {members.map((m) => (
-              <button
-                key={m.id}
-                type="button"
-                onClick={() => {
-                  setScope(m.id);
-                  if (lens === 'members') setLens('netWorth');
-                }}
-                className={`px-3 py-1.5 rounded-xl text-xs font-bold whitespace-nowrap shrink-0 transition-all ${
-                  scope === m.id && lens !== 'members'
-                    ? 'bg-indigo-600 text-white shadow-xs'
-                    : 'bg-slate-100 text-slate-600 hover:bg-slate-200/70'
-                }`}
-              >
-                {m.name}
-              </button>
-            ))}
-            {members.length > 1 && (
-              <button
-                type="button"
-                onClick={() => {
-                  setScope('family');
-                  setLens('members');
-                }}
-                className={`px-3 py-1.5 rounded-xl text-xs font-bold whitespace-nowrap shrink-0 transition-all ${
-                  lens === 'members'
-                    ? 'bg-emerald-600 text-white shadow-xs'
-                    : 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100/70'
-                }`}
-              >
-                Compare Members
-              </button>
-            )}
-          </div>
-        </div>
-      )}
 
       {/* Scoped Rich 4-Card Summary Strip */}
       <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">

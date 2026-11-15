@@ -454,9 +454,15 @@ export default function App() {
     }
   };
 
+  const mainScrollRef = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     fetchFxRates();
   }, []);
+
+  useEffect(() => {
+    mainScrollRef.current?.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
+  }, [activeTab]);
 
   useEffect(() => {
     fetchEmailStatus(user?.householdId);
@@ -2694,7 +2700,7 @@ export default function App() {
                   key={m.id}
                   onClick={() => {
                     setDashboardView(m.id);
-                    if (activeTab !== 'dashboard' && activeTab !== 'rebalance') {
+                    if (activeTab !== 'dashboard' && activeTab !== 'rebalance' && activeTab !== 'wealth') {
                       setActiveTab('dashboard');
                     }
                   }}
@@ -2725,7 +2731,7 @@ export default function App() {
           </div>
         </header>
 
-        <div className="flex-1 overflow-x-hidden overflow-y-auto px-3 sm:px-5 md:p-8 pb-24 lg:pb-8">
+        <div ref={mainScrollRef} className="flex-1 overflow-x-hidden overflow-y-auto px-3 sm:px-5 md:p-8 pb-24 lg:pb-8">
           <AnimatePresence mode="wait">
             {activeTab === 'dashboard' && (
               <motion.div 
@@ -2978,6 +2984,8 @@ export default function App() {
                   targets={data.household.targets}
                   fxRate={fxRates.INR}
                   members={(data.household.membersData || []).map((m: any) => ({ id: m.id, name: m.name }))}
+                  activeScope={dashboardView === 'combined' ? 'family' : dashboardView}
+                  onScopeChange={(s) => setDashboardView(s === 'family' ? 'combined' : s)}
                   isRecording={isRecordingSnapshot}
                   onRecordCurrentSnapshot={() => recordWealthSnapshot('manual_button', true)}
                   onBackfillMonth={handleBackfillMonth}
