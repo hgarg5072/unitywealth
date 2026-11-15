@@ -3766,6 +3766,44 @@ export default function App() {
         </AnimatePresence>
       </main>
     </div>
+    );
+  };
+
+  return (
+    <>
+      {renderContent()}
+
+      {/* Global Notification Toast (Shared across all views) */}
+      <AnimatePresence>
+        {notification && (
+          <motion.div 
+            initial={{ opacity: 0, y: 50, scale: 0.9 }} 
+            animate={{ opacity: 1, y: 0, scale: 1 }} 
+            exit={{ opacity: 0, y: 20, scale: 0.9 }} 
+            className="fixed bottom-20 lg:bottom-8 left-1/2 -translate-x-1/2 z-[100] w-full max-w-sm px-4"
+          >
+            <div className={`p-4 rounded-2xl shadow-2xl border flex items-center gap-4 ${
+              notification.type === 'error' ? 'bg-rose-50 border-rose-100 text-rose-800' : 
+              'bg-slate-900 border-slate-800 text-white'
+            }`}>
+              <div className={`p-2 rounded-lg ${notification.type === 'error' ? 'bg-rose-100' : 'bg-indigo-600'}`}>
+                {notification.type === 'error' ? <Plus className="rotate-45" size={20} /> : <Check size={20} />}
+              </div>
+              <div className="flex-1 pr-2">
+                <p className="text-sm font-bold leading-tight">{notification.message}</p>
+              </div>
+              <button 
+                onClick={() => setNotification(null)} 
+                aria-label="Dismiss notification"
+                className={`p-1 rounded-full transition-all ${notification.type === 'error' ? 'hover:bg-rose-200/50' : 'hover:bg-white/10'}`}
+              >
+                <X size={14} />
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </>
   );
 }
 
@@ -5197,11 +5235,6 @@ function LandingPage({ onLogin, onSignup, onForgot, onReset, onGoogleLogin, pend
                   placeholder="••••••••" 
                   required 
                 />
-                {activeView === 'signup' && (
-                  <p className="mt-2 text-[10px] text-slate-400 leading-relaxed italic">
-                    Note: If you use a non-verified email in dev mode, you might see a Resend validation error. Your account will still be created, but you won't receive a welcome email.
-                  </p>
-                )}
               </div>
             )}
 
@@ -6183,44 +6216,6 @@ function LiveMarketsView({ holdings, members, householdId }: { holdings: Holding
         </div>
       </div>
     </div>
-    );
-  };
-
-  return (
-    <>
-      {renderContent()}
-
-      {/* Global Notification Toast (Shared across all views) */}
-      <AnimatePresence>
-        {notification && (
-          <motion.div 
-            initial={{ opacity: 0, y: 50, scale: 0.9 }} 
-            animate={{ opacity: 1, y: 0, scale: 1 }} 
-            exit={{ opacity: 0, y: 20, scale: 0.9 }} 
-            className="fixed bottom-20 lg:bottom-8 left-1/2 -translate-x-1/2 z-[100] w-full max-w-sm px-4"
-          >
-            <div className={`p-4 rounded-2xl shadow-2xl border flex items-center gap-4 ${
-              notification.type === 'error' ? 'bg-rose-50 border-rose-100 text-rose-800' : 
-              'bg-slate-900 border-slate-800 text-white'
-            }`}>
-              <div className={`p-2 rounded-lg ${notification.type === 'error' ? 'bg-rose-100' : 'bg-indigo-600'}`}>
-                {notification.type === 'error' ? <Plus className="rotate-45" size={20} /> : <Check size={20} />}
-              </div>
-              <div className="flex-1 pr-2">
-                <p className="text-sm font-bold leading-tight">{notification.message}</p>
-              </div>
-              <button 
-                onClick={() => setNotification(null)} 
-                aria-label="Dismiss notification"
-                className={`p-1 rounded-full transition-all ${notification.type === 'error' ? 'hover:bg-rose-200/50' : 'hover:bg-white/10'}`}
-              >
-                <X size={14} />
-              </button>
-            </div>
-          </motion.div>
-        )}
-      </AnimatePresence>
-    </>
   );
 }
 
