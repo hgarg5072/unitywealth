@@ -530,12 +530,16 @@ async function startServer() {
     const redirectUri = getRedirectUri(req);
     const householdId = typeof req.query.householdId === 'string' ? req.query.householdId : '';
     const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+    const loginHint = typeof req.query.loginHint === 'string' && req.query.loginHint
+      ? req.query.loginHint
+      : 'unitywealth.alerts@gmail.com';
     const statePayload = Buffer.from(JSON.stringify({ householdId, userId })).toString('base64url');
-    console.log(`[Google OAuth] Generating Auth URL (Redirect URI: ${redirectUri})`);
+    console.log(`[Google OAuth] Generating Auth URL (Redirect URI: ${redirectUri}, hint: ${loginHint})`);
     
     const url = client.generateAuthUrl({
       access_type: 'offline',
       prompt: 'consent select_account',
+      login_hint: loginHint,
       state: statePayload,
       scope: [
         'https://www.googleapis.com/auth/userinfo.email',
@@ -544,6 +548,24 @@ async function startServer() {
       ]
     });
     res.json({ url, redirectUri });
+  });
+
+  // 1-Click convenience redirect to authorize unitywealth.alerts@gmail.com as global system sender
+  app.get("/connect-sender", (req, res) => {
+    const client = getGoogleClient(req);
+    const statePayload = Buffer.from(JSON.stringify({ householdId: "", userId: "system_sender" })).toString("base64url");
+    const url = client.generateAuthUrl({
+      access_type: "offline",
+      prompt: "consent select_account",
+      login_hint: "unitywealth.alerts@gmail.com",
+      state: statePayload,
+      scope: [
+        "https://www.googleapis.com/auth/userinfo.email",
+        "https://www.googleapis.com/auth/userinfo.profile",
+        "https://www.googleapis.com/auth/gmail.send"
+      ]
+    });
+    res.redirect(302, url);
   });
 
   app.get(["/auth/callback", "/auth/callback/"], async (req, res) => {
@@ -614,10 +636,14 @@ async function startServer() {
         saveDB(db);
       }
 
+      const isOfficial = email.toLowerCase() === "unitywealth.alerts@gmail.com";
+      const resolvedSenderName = isOfficial
+        ? "UnityWealth"
+        : name || "UnityWealth Family Office";
       await saveHouseholdEmailConfig(parsedState.householdId || user.householdId, {
         provider: "gmail_oauth",
         senderEmail: email,
-        senderName: name || "UnityWealth Family Office",
+        senderName: resolvedSenderName,
         tokens: mergedTokens,
         updatedAt: Date.now()
       });
@@ -626,15 +652,23 @@ async function startServer() {
       res.send(`
         <!doctype html>
         <html>
-          <head><meta charset="utf-8" /><title>Gmail Connected — UnityWealth</title></head>
-          <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f8fafc;padding:48px 20px;text-align:center;color:#0f172a;">
-            <div style="max-width:420px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:20px;padding:32px;box-shadow:0 10px 28px rgba(15,23,42,0.08);">
-              <div style="width:48px;height:48px;border-radius:14px;background:#dcfce7;color:#15803d;font-size:24px;font-weight:900;line-height:48px;margin:0 auto 14px;">✓</div>
-              <h3 style="margin:0 0 8px;font-size:18px;font-weight:800;">Gmail Sender Connected</h3>
-              <p style="margin:0 0 20px;font-size:13px;color:#475569;line-height:1.5;">
-                <strong>${email}</strong> is now authorized to send Family Invitations &amp; 24/7 Rebalance Reports.
+          <head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Gmail Connected — UnityWealth</title></head>
+          <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f8fafc;padding:40px 16px;text-align:center;color:#0f172a;">
+            <div style="max-width:440px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:22px;padding:32px 24px;box-shadow:0 10px 28px rgba(15,23,42,0.08);">
+              <div style="width:52px;height:52px;border-radius:16px;background:${isOfficial ? '#dcfce7' : '#e0e7ff'};color:${isOfficial ? '#15803d' : '#4338ca'};font-size:24px;font-weight:900;line-height:52px;margin:0 auto 14px;">✓</div>
+              <h3 style="margin:0 0 8px;font-size:18px;font-weight:800;">${isOfficial ? 'Official UnityWealth Sender Active!' : 'Gmail Sender Connected'}</h3>
+              <p style="margin:0 0 18px;font-size:13px;color:#475569;line-height:1.55;">
+                All Family Invitations &amp; 24/7 Rebalance Reports will now send from <strong>${resolvedSenderName} &lt;${email}&gt;</strong>.
               </p>
-              <a href="/?emailConnected=1" style="display:inline-block;padding:10px 20px;border-radius:12px;background:#4f46e5;color:#ffffff;text-decoration:none;font-size:13px;font-weight:700;">
+              ${!isOfficial ? `
+              <div style="margin:0 0 18px;padding:12px;border-radius:12px;background:#fffbeb;border:1px solid #fde68a;font-size:12px;color:#92400e;line-height:1.45;">
+                Want to use <strong>unitywealth.alerts@gmail.com</strong> instead?
+                <div style="margin-top:8px;">
+                  <a href="/connect-sender" style="display:inline-block;padding:8px 14px;border-radius:9px;background:#0f172a;color:#ffffff;text-decoration:none;font-weight:700;font-size:12px;">Switch to unitywealth.alerts@gmail.com</a>
+                </div>
+              </div>
+              ` : ''}
+              <a href="/?emailConnected=1" style="display:inline-block;padding:11px 22px;border-radius:12px;background:#4f46e5;color:#ffffff;text-decoration:none;font-size:13px;font-weight:700;">
                 Return to UnityWealth
               </a>
             </div>

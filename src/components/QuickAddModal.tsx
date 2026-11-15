@@ -227,24 +227,24 @@ export function QuickAddModal({
 
   return (
     <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-slate-900/50 backdrop-blur-xs">
-      <div className="bg-white rounded-t-3xl sm:rounded-3xl w-full max-w-lg max-h-[92vh] flex flex-col overflow-hidden shadow-2xl">
+      <div className="bg-white rounded-t-3xl sm:rounded-3xl w-full max-w-lg max-h-[88dvh] sm:max-h-[90dvh] flex flex-col overflow-hidden shadow-2xl">
         {/* Header */}
-        <div className="p-5 border-b border-slate-100 flex items-center justify-between">
-          <div>
+        <div className="px-4 sm:px-5 py-4 border-b border-slate-100 flex items-center justify-between shrink-0">
+          <div className="min-w-0 pr-2">
             <h3 className="font-bold text-base sm:text-lg text-slate-900">Add or Import Investments</h3>
-            <p className="text-xs text-slate-500">Live stocks, mutual funds, EPF/FD presets, or PDF / XLSX / CSV statements</p>
+            <p className="text-xs text-slate-500 leading-snug">Live stocks, mutual funds, EPF/FD presets, or PDF / XLSX / CSV statements</p>
           </div>
           <button
             type="button"
             aria-label="Close add modal"
             onClick={onClose}
-            className="p-2 text-slate-400 hover:text-slate-700 rounded-xl hover:bg-slate-100"
+            className="p-2.5 text-slate-400 hover:text-slate-700 rounded-xl hover:bg-slate-100 shrink-0"
           >
             <X size={18} />
           </button>
         </div>
 
-        <div className="p-5 overflow-y-auto space-y-5">
+        <div className="p-4 sm:p-5 pb-7 sm:pb-5 overflow-y-auto space-y-4 sm:space-y-5">
           {/* Owner / Family Member Selector */}
           <div>
             <label className="block text-[10px] font-black text-slate-400 uppercase tracking-widest mb-2">
@@ -269,33 +269,37 @@ export function QuickAddModal({
           </div>
 
           {/* 3-Mode Switcher */}
-          <div className="grid grid-cols-3 gap-1.5 bg-slate-100 p-1 rounded-xl">
+          <div className="grid grid-cols-3 gap-1 bg-slate-100 p-1 rounded-xl">
             <button
               type="button"
               onClick={() => setMode('search')}
-              className={`py-2 px-2 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 transition-all ${
+              className={`py-2 px-1.5 sm:px-2 rounded-lg text-[11px] sm:text-xs font-bold whitespace-nowrap flex items-center justify-center gap-1 sm:gap-1.5 transition-all ${
                 mode === 'search' ? 'bg-white text-indigo-600 shadow-xs' : 'text-slate-600'
               }`}
             >
-              <Search size={13} /> Stock / MF
+              <Search size={13} className="shrink-0" />
+              <span>Stock / MF</span>
             </button>
             <button
               type="button"
               onClick={() => setMode('preset')}
-              className={`py-2 px-2 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 transition-all ${
+              className={`py-2 px-1.5 sm:px-2 rounded-lg text-[11px] sm:text-xs font-bold whitespace-nowrap flex items-center justify-center gap-1 sm:gap-1.5 transition-all ${
                 mode === 'preset' ? 'bg-white text-indigo-600 shadow-xs' : 'text-slate-600'
               }`}
             >
-              <Landmark size={13} /> EPF / FD / Gold
+              <Landmark size={13} className="shrink-0" />
+              <span>EPF / FD / Gold</span>
             </button>
             <button
               type="button"
               onClick={() => setMode('upload')}
-              className={`py-2 px-2 rounded-lg text-[11px] sm:text-xs font-bold flex items-center justify-center gap-1 transition-all ${
+              className={`py-2 px-1.5 sm:px-2 rounded-lg text-[11px] sm:text-xs font-bold whitespace-nowrap flex items-center justify-center gap-1 sm:gap-1.5 transition-all ${
                 mode === 'upload' ? 'bg-white text-indigo-600 shadow-xs' : 'text-slate-600'
               }`}
             >
-              <Upload size={13} /> PDF / XLSX / CSV
+              <Upload size={13} className="shrink-0" />
+              <span className="sm:hidden">PDF / Excel</span>
+              <span className="hidden sm:inline">PDF / XLSX / CSV</span>
             </button>
           </div>
 

@@ -21,6 +21,8 @@ export interface EmailStatusInfo {
   configured: boolean;
   provider: string;
   senderEmail: string | null;
+  officialSenderEmail?: string;
+  isOfficialSender?: boolean;
   hasRefreshToken: boolean;
   canSendToAnyone: boolean;
   googleOAuthAvailable: boolean;
@@ -259,7 +261,7 @@ export const ProfileFamilyModal: React.FC<ProfileFamilyModalProps> = ({
       aria-modal="true"
       aria-label="Profile, Family & Email Settings"
     >
-      <div className="bg-white w-full max-w-2xl max-h-[90vh] rounded-3xl shadow-2xl border border-slate-200 flex flex-col overflow-hidden">
+      <div className="bg-white w-full max-w-2xl max-h-[88dvh] rounded-3xl shadow-2xl border border-slate-200 flex flex-col overflow-hidden">
         {/* Header */}
         <div className="px-5 sm:px-7 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/70 shrink-0">
           <div className="flex items-center gap-3 min-w-0">
@@ -370,14 +372,14 @@ export const ProfileFamilyModal: React.FC<ProfileFamilyModalProps> = ({
                     type="text"
                     value={switchCode}
                     onChange={(e) => setSwitchCode(e.target.value.toUpperCase())}
-                    placeholder="Have another family's 6-digit Invite Code?"
+                    placeholder="Enter 6-char family invite code"
                     aria-label="Invite Code to Switch Family"
-                    className="flex-1 px-4 py-2 rounded-xl bg-slate-50 border border-slate-200 text-xs font-mono font-bold uppercase tracking-wider text-slate-900 focus:outline-none focus:border-indigo-500"
+                    className="flex-1 px-4 py-2.5 rounded-xl bg-slate-50 border border-slate-200 text-xs font-mono font-bold uppercase tracking-wider text-slate-900 placeholder:font-sans placeholder:font-medium placeholder:tracking-normal placeholder:normal-case focus:outline-none focus:border-indigo-500"
                   />
                   <button
                     type="submit"
                     disabled={switchingFamily || switchCode.trim().length < 4}
-                    className="px-4 py-2 rounded-xl bg-indigo-50 text-indigo-700 hover:bg-indigo-100 text-xs font-bold disabled:opacity-50 transition-all flex items-center justify-center gap-1.5 shrink-0"
+                    className="px-4 py-2.5 rounded-xl bg-indigo-50 text-indigo-700 hover:bg-indigo-100 text-xs font-bold disabled:opacity-50 transition-all flex items-center justify-center gap-1.5 shrink-0"
                   >
                     <ArrowRightLeft className="w-3.5 h-3.5" />
                     {switchingFamily ? "Joining..." : "Join Family"}
@@ -466,15 +468,20 @@ export const ProfileFamilyModal: React.FC<ProfileFamilyModalProps> = ({
           <section className="p-4 sm:p-5 rounded-2xl border border-slate-200 bg-slate-50/60 space-y-4">
             <div className="flex items-center justify-between gap-2 flex-wrap">
               <div className="flex items-center gap-2">
-                <Mail className="w-4 h-4 text-indigo-600" />
+                <Mail className="w-4 h-4 text-indigo-600 shrink-0" />
                 <h3 className="text-sm font-black text-slate-900 uppercase tracking-wider">
                   Outgoing Email Sender (Invites &amp; Rebalance)
                 </h3>
               </div>
 
-              {emailStatus?.configured ? (
+              {emailStatus?.configured && emailStatus.senderEmail?.toLowerCase() === "unitywealth.alerts@gmail.com" ? (
                 <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-800 text-[11px] font-black">
-                  <ShieldCheck className="w-3.5 h-3.5" />
+                  <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                  Official: UnityWealth &lt;unitywealth.alerts@gmail.com&gt;
+                </span>
+              ) : emailStatus?.configured ? (
+                <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-100 text-emerald-800 text-[11px] font-black">
+                  <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
                   Connected: {emailStatus.senderEmail}
                 </span>
               ) : (
@@ -490,17 +497,13 @@ export const ProfileFamilyModal: React.FC<ProfileFamilyModalProps> = ({
               </p>
             )}
 
-            {!emailStatus?.configured && (
+            {emailStatus?.senderEmail?.toLowerCase() !== "unitywealth.alerts@gmail.com" && (
               <div className="p-3 rounded-xl bg-indigo-50/70 border border-indigo-100 text-[11px] text-slate-700 space-y-1.5 leading-relaxed">
-                <div className="font-black text-indigo-950">One-Time Gmail OAuth Setup (Free, 24/7 Background Delivery):</div>
-                <div>
-                  1. In Google Cloud Console → <strong>Credentials</strong> → your Web OAuth Client, ensure this Redirect URI is added:{' '}
-                  <code className="px-1.5 py-0.5 rounded bg-white border border-indigo-200 font-mono text-[10px] text-indigo-800 select-all">
-                    {typeof window !== 'undefined' ? `${window.location.origin}/auth/callback` : 'https://unitywealth.up.railway.app/auth/callback'}
-                  </code>
+                <div className="font-black text-indigo-950">
+                  Switch Official Global Sender to <span className="font-mono">unitywealth.alerts@gmail.com</span>:
                 </div>
                 <div>
-                  2. Click <strong>Connect Gmail Sender (24/7 OAuth)</strong> below and approve <em>Send email on your behalf</em>.
+                  Click the button below, sign in as <strong>unitywealth.alerts@gmail.com</strong>, and tap <strong>Allow</strong> once. All Family Invitations and 24/7 Rebalance Reports will automatically send from <strong>UnityWealth &lt;unitywealth.alerts@gmail.com&gt;</strong>.
                 </div>
               </div>
             )}
@@ -513,7 +516,9 @@ export const ProfileFamilyModal: React.FC<ProfileFamilyModalProps> = ({
                 className="px-4 py-2.5 rounded-xl bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-50 text-xs font-bold transition-all flex items-center gap-2 shadow-sm"
               >
                 {authGmailBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Mail className="w-4 h-4" />}
-                {emailStatus?.configured ? "Reconnect Gmail Sender (24/7 OAuth)" : "Connect Gmail Sender (24/7 OAuth)"}
+                {emailStatus?.senderEmail?.toLowerCase() === "unitywealth.alerts@gmail.com"
+                  ? "Re-authorize unitywealth.alerts@gmail.com"
+                  : "Authorize unitywealth.alerts@gmail.com (1-Click)"}
               </button>
 
               <button
@@ -526,7 +531,7 @@ export const ProfileFamilyModal: React.FC<ProfileFamilyModalProps> = ({
                 {showApiConfig ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
               </button>
 
-              {emailStatus?.configured && (
+              {emailStatus?.configured && emailStatus.senderEmail?.toLowerCase() !== "unitywealth.alerts@gmail.com" && (
                 <button
                   type="button"
                   onClick={() => onSaveProviderConfig({ provider: "disconnect" })}

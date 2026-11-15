@@ -26,6 +26,8 @@ export interface EmailStatusPublic {
   configured: boolean;
   provider: EmailProviderType;
   senderEmail: string | null;
+  officialSenderEmail: string;
+  isOfficialSender: boolean;
   hasRefreshToken: boolean;
   canSendToAnyone: boolean;
   googleOAuthAvailable: boolean;
@@ -104,17 +106,53 @@ export function buildComposeFallbackUrls(opts: { to: string; subject: string; te
   };
 }
 
+export const OFFICIAL_SYSTEM_SENDER_EMAIL = "unitywealth.alerts@gmail.com";
+
 export async function saveHouseholdEmailConfig(
   householdId: string | null | undefined,
   cfg: StoredEmailConfig | null
 ): Promise<void> {
+  const isOfficial = cfg?.senderEmail?.toLowerCase() === OFFICIAL_SYSTEM_SENDER_EMAIL;
+  if (cfg && isOfficial) {
+    cfg = {
+      ...cfg,
+      senderEmail: OFFICIAL_SYSTEM_SENDER_EMAIL,
+      senderName: "UnityWealth"
+    };
+  }
   if (householdId) {
     await setAppStateKeyPg(`email_cfg:${householdId}`, cfg);
   }
-  await setAppStateKeyPg("email_cfg:global", cfg);
+  if (isOfficial) {
+    await setAppStateKeyPg("email_cfg:global", cfg);
+    return;
+  }
+  const existingGlobal = await getAppStateKeyPg<StoredEmailConfig>("email_cfg:global");
+  const globalIsOfficial =
+    existingGlobal &&
+    existingGlobal.provider &&
+    existingGlobal.provider !== "none" &&
+    existingGlobal.senderEmail?.toLowerCase() === OFFICIAL_SYSTEM_SENDER_EMAIL;
+  if (!globalIsOfficial) {
+    await setAppStateKeyPg("email_cfg:global", cfg);
+  }
 }
 
 export async function resolveEmailConfig(householdId?: string | null): Promise<StoredEmailConfig | null> {
+  const globalCfg = await getAppStateKeyPg<StoredEmailConfig>("email_cfg:global");
+  // When the dedicated system sender (unitywealth.alerts@gmail.com) is authorized, always prefer it across all households
+  if (
+    globalCfg &&
+    globalCfg.provider &&
+    globalCfg.provider !== "none" &&
+    globalCfg.senderEmail?.toLowerCase() === OFFICIAL_SYSTEM_SENDER_EMAIL
+  ) {
+    return {
+      ...globalCfg,
+      senderName: "UnityWealth"
+    };
+  }
+
   if (householdId) {
     const hhCfg = await getAppStateKeyPg<StoredEmailConfig>(`email_cfg:${householdId}`);
     if (hhCfg && hhCfg.provider && hhCfg.provider !== "none") {
@@ -122,7 +160,6 @@ export async function resolveEmailConfig(householdId?: string | null): Promise<S
     }
   }
 
-  const globalCfg = await getAppStateKeyPg<StoredEmailConfig>("email_cfg:global");
   if (globalCfg && globalCfg.provider && globalCfg.provider !== "none") {
     return globalCfg;
   }
@@ -163,12 +200,16 @@ export async function getEmailDeliveryStatus(householdId?: string | null): Promi
       configured: false,
       provider: "none",
       senderEmail: null,
+      officialSenderEmail: OFFICIAL_SYSTEM_SENDER_EMAIL,
+      isOfficialSender: false,
       hasRefreshToken: false,
       canSendToAnyone: false,
       googleOAuthAvailable,
-      warning: "No outgoing email sender connected yet. Connect Gmail in 1 click (free, sends to any email) or add an API key."
+      warning: `Authorize ${OFFICIAL_SYSTEM_SENDER_EMAIL} once in 1 click so all Family Invitations and Rebalance Reports send from UnityWealth <${OFFICIAL_SYSTEM_SENDER_EMAIL}>.`
     };
   }
+
+  const isOfficialSender = cfg.senderEmail?.toLowerCase() === OFFICIAL_SYSTEM_SENDER_EMAIL;
 
   if (cfg.provider === "gmail_token") {
     const exp = Number(cfg.tokens?.expiry_date) || 0;
@@ -178,10 +219,12 @@ export async function getEmailDeliveryStatus(householdId?: string | null): Promi
         configured: false,
         provider: "none",
         senderEmail: cfg.senderEmail || null,
+        officialSenderEmail: OFFICIAL_SYSTEM_SENDER_EMAIL,
+        isOfficialSender,
         hasRefreshToken: false,
         canSendToAnyone: false,
         googleOAuthAvailable,
-        warning: `Gmail session for ${cfg.senderEmail} expired. Click 'Connect Gmail' once to re-authorize.`
+        warning: `Gmail session for ${cfg.senderEmail} expired. Click 'Authorize ${OFFICIAL_SYSTEM_SENDER_EMAIL}' once to re-connect.`
       };
     }
   }
@@ -192,11 +235,15 @@ export async function getEmailDeliveryStatus(householdId?: string | null): Promi
     configured: true,
     provider: cfg.provider,
     senderEmail: cfg.senderEmail,
+    officialSenderEmail: OFFICIAL_SYSTEM_SENDER_EMAIL,
+    isOfficialSender,
     hasRefreshToken: Boolean(cfg.tokens?.refresh_token),
     canSendToAnyone: !isResendSandbox,
     googleOAuthAvailable,
     warning: isResendSandbox
       ? "Resend's onboarding@resend.dev sandbox only delivers to your own Resend signup email. Connect Gmail instead to send invitations to any family member."
+      : !isOfficialSender
+      ? `Currently sending from ${cfg.senderEmail}. Authorize ${OFFICIAL_SYSTEM_SENDER_EMAIL} below once to switch all outgoing alerts to UnityWealth <${OFFICIAL_SYSTEM_SENDER_EMAIL}>.`
       : undefined
   };
 }

@@ -2521,7 +2521,7 @@ export default function App() {
   const renderContent = () => {
     if (loading) {
       return (
-        <div className="flex items-center justify-center h-screen bg-slate-50">
+        <div className="flex items-center justify-center h-dvh bg-slate-50">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600"></div>
         </div>
       );
@@ -2530,7 +2530,7 @@ export default function App() {
     if (!user.householdId) return <HouseholdSetup onCreate={createHousehold} onJoin={joinHousehold} onJoinByCode={redeemInviteCode} isJoining={isJoiningFamily} initialCode={pendingInviteCode} invites={invites} />;
     if (!data || !data.household || !stats) {
       return (
-        <div className="p-8 text-center bg-slate-50 min-h-screen flex flex-col items-center justify-center">
+        <div className="p-8 text-center bg-slate-50 min-h-dvh flex flex-col items-center justify-center">
           <div className="bg-white p-8 rounded-3xl shadow-xl max-w-md w-full">
             <h3 className="text-xl font-bold text-slate-800 mb-2">Syncing Data...</h3>
             <p className="text-sm text-slate-500 mb-6">We're securely fetching your latest portfolio valuations.</p>
@@ -2541,7 +2541,7 @@ export default function App() {
     }
 
     return (
-      <div className="flex h-screen bg-[#F8FAFC] text-slate-900 font-sans overflow-hidden relative">
+      <div className="flex h-dvh bg-[#F8FAFC] text-slate-900 font-sans overflow-hidden relative">
         {/* Sidebar - Mobile Backdrop */}
         <AnimatePresence>
           {isMenuOpen && (
@@ -2702,7 +2702,7 @@ export default function App() {
                 type="button"
                 aria-label="Open profile and family settings"
                 onClick={() => openProfileSettings('profile')}
-                className="w-8 h-8 rounded-full bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-700 font-black text-xs flex items-center justify-center transition-colors shrink-0"
+                className="w-9 h-9 rounded-full bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-700 font-black text-xs flex items-center justify-center transition-colors shrink-0"
                 title={`${user.name} — Profile & Family Settings`}
               >
                 {(user.name || 'U').charAt(0).toUpperCase()}
@@ -2716,7 +2716,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setDashboardView('combined')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap shrink-0 transition-all ${
+                className={`px-3 py-2 rounded-lg text-xs font-bold whitespace-nowrap shrink-0 transition-all ${
                   dashboardView === 'combined'
                     ? 'bg-slate-900 text-white shadow-xs'
                     : 'bg-slate-100 text-slate-600 hover:bg-slate-200/70'
@@ -2734,7 +2734,7 @@ export default function App() {
                       setActiveTab('dashboard');
                     }
                   }}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap shrink-0 transition-all ${
+                  className={`px-3 py-2 rounded-lg text-xs font-bold whitespace-nowrap shrink-0 transition-all ${
                     dashboardView === m.id
                       ? 'bg-indigo-600 text-white shadow-xs'
                       : 'bg-slate-100 text-slate-600 hover:bg-slate-200/70'
@@ -2746,9 +2746,9 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => openQuickAdd('upload')}
-                className="sm:hidden px-2.5 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap shrink-0 bg-indigo-50 text-indigo-700 border border-indigo-100 flex items-center gap-1"
+                className="sm:hidden px-2.5 py-2 rounded-lg text-xs font-bold whitespace-nowrap shrink-0 bg-indigo-50 text-indigo-700 border border-indigo-100 flex items-center gap-1"
               >
-                <FileUp size={12} /> Import PDF/XLSX/CSV
+                <FileUp size={12} /> Import PDF/Excel
               </button>
             </div>
 
@@ -3268,32 +3268,34 @@ export default function App() {
                           <button
                             type="button"
                             onClick={() => openProfileSettings('email')}
-                            className="text-[10px] font-bold text-white bg-indigo-600 hover:bg-indigo-700 px-2.5 py-1.5 rounded-lg transition-colors"
+                            className="text-[10px] font-bold text-white bg-indigo-600 hover:bg-indigo-700 px-3 py-2 rounded-lg transition-colors"
                           >
-                            {emailStatus?.configured ? 'EMAIL SETTINGS' : 'CONNECT GMAIL / API KEY'}
+                            {emailStatus?.senderEmail?.toLowerCase() === 'unitywealth.alerts@gmail.com'
+                              ? 'EMAIL SETTINGS'
+                              : 'AUTHORIZE UNITYWEALTH.ALERTS@GMAIL.COM'}
                           </button>
                           <button 
                             type="button"
                             onClick={handleSendTestEmail}
-                            className="text-[10px] font-bold text-indigo-600 hover:text-indigo-700 bg-indigo-50 px-2.5 py-1.5 rounded-lg transition-colors"
+                            className="text-[10px] font-bold text-indigo-600 hover:text-indigo-700 bg-indigo-50 px-3 py-2 rounded-lg transition-colors"
                           >
                             SEND TEST EMAIL
                           </button>
                           <button 
                             type="button"
                             onClick={handleTriggerRebalanceCheck}
-                            className="text-[10px] font-bold text-rose-600 hover:text-rose-700 bg-rose-50 px-2.5 py-1.5 rounded-lg transition-colors"
+                            className="text-[10px] font-bold text-rose-600 hover:text-rose-700 bg-rose-50 px-3 py-2 rounded-lg transition-colors"
                           >
                             EMAIL REBALANCE NOW
                           </button>
                         </div>
                       </div>
                       <div className="bg-slate-50 rounded-xl p-4 space-y-2.5 border border-slate-100">
-                        <div className="flex items-center justify-between text-xs gap-2">
+                        <div className="flex items-center justify-between text-xs gap-2 flex-wrap">
                           <span className="text-slate-600 font-semibold">Outgoing Email Gateway</span>
                           {emailStatus?.configured ? (
                             <span className="font-bold text-emerald-600 truncate">
-                              ● Connected ({emailStatus.senderEmail} via {emailStatus.provider.toUpperCase()})
+                              ● Connected ({emailStatus.senderEmail?.toLowerCase() === 'unitywealth.alerts@gmail.com' ? 'UnityWealth <unitywealth.alerts@gmail.com>' : emailStatus.senderEmail})
                             </span>
                           ) : (
                             <span className="font-bold text-amber-600">
@@ -3302,9 +3304,11 @@ export default function App() {
                           )}
                         </div>
                         <p className="text-[11px] text-slate-500 leading-relaxed">
-                          {emailStatus?.configured
-                            ? `Automatic Family Invitations and Rebalance / Zero-Sell SIP Reports are active and delivered directly from ${emailStatus.senderEmail}.`
-                            : 'Click "Connect Gmail / API Key" above once to authorize your Gmail (free, sends to any email address with no custom domain required) or add a Brevo/Resend API key.'}
+                          {emailStatus?.senderEmail?.toLowerCase() === 'unitywealth.alerts@gmail.com'
+                            ? 'Official system sender active! Automatic Family Invitations and Rebalance / Zero-Sell SIP Reports are delivered directly from UnityWealth <unitywealth.alerts@gmail.com>.'
+                            : emailStatus?.configured
+                            ? `Currently sending via ${emailStatus.senderEmail}. Click "Authorize unitywealth.alerts@gmail.com" above once to switch all outgoing alerts to UnityWealth <unitywealth.alerts@gmail.com>.`
+                            : 'Click "Authorize unitywealth.alerts@gmail.com" above once to connect the official UnityWealth Gmail sender (free, sends to any email address).'}
                         </p>
                       </div>
                     </section>
@@ -3328,7 +3332,7 @@ export default function App() {
         {/* Mobile Bottom Tab Navigation Bar (< lg) */}
         <nav
           aria-label="Mobile Primary Navigation"
-          className="lg:hidden fixed bottom-0 inset-x-0 z-30 bg-white/95 backdrop-blur-md border-t border-slate-200 px-1 py-1 grid grid-cols-5 shadow-[0_-4px_20px_rgba(15,23,42,0.06)]"
+          className="lg:hidden fixed bottom-0 inset-x-0 z-30 bg-white/95 backdrop-blur-md border-t border-slate-200 px-1 pt-1 pb-[max(0.35rem,env(safe-area-inset-bottom))] grid grid-cols-5 shadow-[0_-4px_20px_rgba(15,23,42,0.06)]"
         >
           {[
             { id: 'dashboard', label: 'Overview', icon: <PieChartIcon size={18} /> },
@@ -3343,7 +3347,7 @@ export default function App() {
                 key={item.id}
                 type="button"
                 onClick={() => setActiveTab(item.id as any)}
-                className={`flex flex-col items-center justify-center py-1.5 rounded-xl transition-colors ${
+                className={`flex flex-col items-center justify-center py-2 min-h-[44px] rounded-xl transition-colors ${
                   isActive ? 'text-indigo-600 font-black bg-indigo-50/60' : 'text-slate-500 font-semibold'
                 }`}
               >
@@ -3839,27 +3843,27 @@ export default function App() {
       <AnimatePresence>
         {notification && (
           <motion.div 
-            initial={{ opacity: 0, y: 50, scale: 0.9 }} 
+            initial={{ opacity: 0, y: !user || !user.householdId ? -24 : 50, scale: 0.94 }} 
             animate={{ opacity: 1, y: 0, scale: 1 }} 
-            exit={{ opacity: 0, y: 20, scale: 0.9 }} 
-            className="fixed bottom-20 lg:bottom-8 left-1/2 -translate-x-1/2 z-[100] w-full max-w-sm px-4"
+            exit={{ opacity: 0, y: !user || !user.householdId ? -16 : 20, scale: 0.94 }} 
+            className={`fixed ${!user || !user.householdId ? 'top-4' : 'bottom-20 lg:bottom-8'} left-1/2 -translate-x-1/2 z-[100] w-full max-w-sm px-4`}
           >
-            <div className={`p-4 rounded-2xl shadow-2xl border flex items-center gap-4 ${
+            <div className={`p-3.5 sm:p-4 rounded-2xl shadow-2xl border flex items-center gap-3.5 ${
               notification.type === 'error' ? 'bg-rose-50 border-rose-100 text-rose-800' : 
               'bg-slate-900 border-slate-800 text-white'
             }`}>
-              <div className={`p-2 rounded-lg ${notification.type === 'error' ? 'bg-rose-100' : 'bg-indigo-600'}`}>
-                {notification.type === 'error' ? <Plus className="rotate-45" size={20} /> : <Check size={20} />}
+              <div className={`p-2 rounded-lg shrink-0 ${notification.type === 'error' ? 'bg-rose-100' : 'bg-indigo-600'}`}>
+                {notification.type === 'error' ? <Plus className="rotate-45" size={18} /> : <Check size={18} />}
               </div>
-              <div className="flex-1 pr-2">
-                <p className="text-sm font-bold leading-tight">{notification.message}</p>
+              <div className="flex-1 min-w-0">
+                <p className="text-xs sm:text-sm font-bold leading-snug">{notification.message}</p>
               </div>
               <button 
                 onClick={() => setNotification(null)} 
                 aria-label="Dismiss notification"
-                className={`p-1 rounded-full transition-all ${notification.type === 'error' ? 'hover:bg-rose-200/50' : 'hover:bg-white/10'}`}
+                className={`p-2 rounded-full transition-all shrink-0 ${notification.type === 'error' ? 'hover:bg-rose-200/50' : 'hover:bg-white/10'}`}
               >
-                <X size={14} />
+                <X size={16} />
               </button>
             </div>
           </motion.div>
@@ -4968,16 +4972,16 @@ function LandingPage({ onLogin, onSignup, onForgot, onReset, onGoogleLogin, pend
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
+    <div className="min-h-dvh bg-slate-50 flex items-center justify-center p-4 sm:p-6">
       <div className="w-full max-w-md bg-white rounded-3xl shadow-xl shadow-slate-200 overflow-hidden">
-        <div className="bg-indigo-600 p-8 text-white">
-          <div className="flex items-center gap-3.5 mb-4">
+        <div className="bg-indigo-600 p-6 sm:p-8 text-white">
+          <div className="flex items-center gap-3.5 mb-3 sm:mb-4">
             <BrandLogo size={44} variant="onDark" className="shadow-md rounded-xl" />
             <h1 className="text-2xl font-bold tracking-tight">UnityWealth</h1>
           </div>
-          <p className="text-indigo-100 font-medium">Global Family Wealth Engine</p>
+          <p className="text-indigo-100 font-medium text-sm sm:text-base">Global Family Wealth Engine</p>
         </div>
-        <div className="p-8">
+        <div className="p-6 sm:p-8">
           {pendingInviteCode && (
             <div className="mb-6 p-3.5 rounded-2xl bg-emerald-50 border border-emerald-200 flex items-start gap-3">
               <div className="p-1.5 bg-emerald-600 text-white rounded-lg shrink-0 mt-0.5"><Users size={14} /></div>
@@ -5065,10 +5069,10 @@ function LandingPage({ onLogin, onSignup, onForgot, onReset, onGoogleLogin, pend
 
             {(activeView === 'login' || activeView === 'signup' || activeView === 'reset') && (
               <div>
-                <div className="flex justify-between items-end mb-2">
+                <div className="flex justify-between items-center mb-2">
                   <label className="block text-xs font-bold text-slate-400 uppercase">{activeView === 'reset' ? 'Set New Password' : 'Password'}</label>
                   {activeView === 'login' && (
-                    <button type="button" onClick={() => setActiveView('forgot')} className="text-[10px] font-bold text-indigo-600 hover:underline">Forgot password?</button>
+                    <button type="button" onClick={() => setActiveView('forgot')} className="text-xs font-bold text-indigo-600 hover:underline py-1 px-1.5 -my-1 -mr-1.5">Forgot password?</button>
                   )}
                 </div>
                 <input 
@@ -5113,14 +5117,14 @@ function LandingPage({ onLogin, onSignup, onForgot, onReset, onGoogleLogin, pend
             </button>
           </form>
 
-          <div className="mt-8 text-center space-y-4">
+          <div className="mt-6 sm:mt-8 text-center space-y-3">
             <button 
               type="button"
               onClick={() => {
                 if (activeView === 'login') setActiveView('signup');
                 else setActiveView('login');
               }} 
-              className="text-sm font-bold text-slate-500 hover:text-indigo-600 underline block mx-auto"
+              className="text-sm font-bold text-slate-500 hover:text-indigo-600 underline block mx-auto py-2 px-3"
             >
               {activeView === 'login' ? "Don't have an account? Sign up" : "Already have an account? Log in"}
             </button>
@@ -5192,17 +5196,17 @@ function HouseholdSetup({
   }, [inviteCode]);
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-6 gap-8">
-      <div className="flex items-center gap-3">
+    <div className="min-h-dvh bg-slate-50 flex flex-col items-center justify-center p-4 sm:p-6 gap-6 sm:gap-8">
+      <div className="flex items-center gap-3 pt-2 sm:pt-0">
         <BrandLogo size={38} className="shadow-sm rounded-xl" />
         <span className="text-2xl font-extrabold tracking-tight text-slate-900">UnityWealth</span>
       </div>
-      <div className="w-full max-w-3xl grid grid-cols-1 md:grid-cols-2 gap-8">
-        <div className="bg-white p-8 rounded-3xl shadow-xl shadow-slate-200 border border-slate-100 flex flex-col justify-between">
+      <div className="w-full max-w-3xl grid grid-cols-1 md:grid-cols-2 gap-5 sm:gap-8">
+        <div className="bg-white p-6 sm:p-8 rounded-3xl shadow-xl shadow-slate-200 border border-slate-100 flex flex-col justify-between">
           <div>
-            <div className="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center mb-6"><Users /></div>
+            <div className="w-12 h-12 bg-indigo-50 text-indigo-600 rounded-2xl flex items-center justify-center mb-5 sm:mb-6"><Users /></div>
             <h2 className="text-xl font-bold mb-2 text-slate-800">Create a Household</h2>
-            <p className="text-sm text-slate-500 mb-8 leading-relaxed">Start a new combined portfolio for your family. You'll receive a shareable 6-character code to invite family members.</p>
+            <p className="text-sm text-slate-500 mb-6 sm:mb-8 leading-relaxed">Start a new combined portfolio for your family. You'll receive a shareable 6-character code to invite family members.</p>
           </div>
           <div className="space-y-4">
             <input aria-label="Household Name" value={name} onChange={e => setName(e.target.value)} className="w-full px-4 py-3 bg-slate-50 border border-slate-100 rounded-xl focus:outline-none focus:ring-2 focus:ring-indigo-600/20" placeholder="The Garg Family" />
@@ -5210,9 +5214,9 @@ function HouseholdSetup({
           </div>
         </div>
         
-        <div className="bg-white p-8 rounded-3xl shadow-xl shadow-slate-200 border border-emerald-100 flex flex-col justify-between">
+        <div className="bg-white p-6 sm:p-8 rounded-3xl shadow-xl shadow-slate-200 border border-emerald-100 flex flex-col justify-between">
           <div>
-            <div className="w-12 h-12 bg-emerald-50 text-emerald-600 rounded-2xl flex items-center justify-center mb-6"><Share2 /></div>
+            <div className="w-12 h-12 bg-emerald-50 text-emerald-600 rounded-2xl flex items-center justify-center mb-5 sm:mb-6"><Share2 /></div>
             <h2 className="text-xl font-bold mb-2 text-slate-800">Join Existing Family</h2>
             <p className="text-sm text-slate-500 mb-6 leading-relaxed">Enter the 6-character Family Invite Code from your spouse or family member to merge into a shared dashboard.</p>
             <div className="space-y-3">
@@ -5221,8 +5225,8 @@ function HouseholdSetup({
                 value={inviteCode}
                 onChange={e => setInviteCode(e.target.value.toUpperCase())}
                 maxLength={12}
-                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-mono text-lg font-black tracking-[0.2em] uppercase text-center focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
-                placeholder="ENTER CODE (E.G. K7M4P9)"
+                className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl font-mono text-lg font-black tracking-[0.2em] uppercase text-center placeholder:font-sans placeholder:text-sm placeholder:font-semibold placeholder:tracking-normal placeholder:normal-case focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
+                placeholder="Enter 6-char code (e.g. K7M4P9)"
               />
               {previewInfo && (
                 <div className="p-3 rounded-xl bg-emerald-50 border border-emerald-100 text-xs text-emerald-800 font-semibold flex items-center gap-2">
