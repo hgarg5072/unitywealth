@@ -490,7 +490,7 @@ async function startServer() {
     if (host && !host.includes("localhost") && !host.startsWith("127.")) {
       return `${proto}://${host}`.replace(/\/$/, "");
     }
-    return (process.env.APP_URL || `${proto}://${host}` || "https://uw.up.railway.app").replace(/\/$/, "");
+    return (process.env.APP_URL || `${proto}://${host}` || "https://unitywealth.up.railway.app").replace(/\/$/, "");
   }
 
   function getRedirectUri(req: express.Request) {
