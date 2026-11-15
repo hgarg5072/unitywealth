@@ -96,6 +96,7 @@ import { auth, db } from './lib/firebase';
 import { handleFirestoreError, OperationType } from './lib/firebase-utils';
 import axios from 'axios';
 import { DashboardData, Holding, AssetClass, Currency, PortfolioTargets, User, Invite, TargetCategory, TickerWeight, HouseholdSettings } from './types';
+import { BrandLogo } from './components/BrandLogo';
 
 
 function shortenAssetName(name: string): string {
@@ -497,27 +498,9 @@ export default function App() {
     setNotification(null);
     try {
       const provider = new GoogleAuthProvider();
-      provider.addScope('https://www.googleapis.com/auth/gmail.send');
       provider.setCustomParameters({ prompt: 'select_account' });
       const result = await signInWithPopup(auth, provider);
       const fbUser = result.user;
-      const credential = GoogleAuthProvider.credentialFromResult(result);
-      if (credential?.accessToken) {
-        try {
-          const idToken = await fbUser.getIdToken();
-          await fetch('/api/email/save-google-token', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
-            body: JSON.stringify({
-              householdId: user?.householdId || null,
-              accessToken: credential.accessToken,
-              senderEmail: fbUser.email,
-              senderName: fbUser.displayName || fbUser.email
-            })
-          });
-          fetchEmailStatus(user?.householdId);
-        } catch {}
-      }
 
       setNotification({ message: `Welcome, ${fbUser.displayName || fbUser.email || 'User'}!`, type: 'success' });
       setShowSyncModal(false);
@@ -2531,10 +2514,8 @@ export default function App() {
       `}>
         <div className="flex items-center justify-between mb-10">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 bg-indigo-600 rounded-lg flex items-center justify-center">
-              <TrendingUp className="text-white w-5 h-5" />
-            </div>
-            <span className="text-xl font-bold tracking-tight text-slate-800">UnityWealth</span>
+            <BrandLogo size={36} className="shadow-xs rounded-xl" />
+            <span className="text-xl font-bold tracking-tight text-slate-900">UnityWealth</span>
           </div>
           <button aria-label="Close navigation menu" onClick={() => setIsMenuOpen(false)} className="lg:hidden p-2 text-slate-400 hover:text-slate-600 rounded-lg">
             <X size={20} />
@@ -2610,6 +2591,7 @@ export default function App() {
               >
                 <Menu size={20} />
               </button>
+              <BrandLogo size={28} className="lg:hidden rounded-lg shadow-2xs" />
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
                   <span className="font-black text-sm sm:text-base text-slate-900 truncate">
@@ -4941,10 +4923,8 @@ function LandingPage({ onLogin, onSignup, onForgot, onReset, onGoogleLogin, pend
     <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
       <div className="w-full max-w-md bg-white rounded-3xl shadow-xl shadow-slate-200 overflow-hidden">
         <div className="bg-indigo-600 p-8 text-white">
-          <div className="flex items-center gap-3 mb-4">
-            <div className="w-10 h-10 bg-white/20 rounded-xl flex items-center justify-center backdrop-blur-sm">
-              <TrendingUp className="text-white" />
-            </div>
+          <div className="flex items-center gap-3.5 mb-4">
+            <BrandLogo size={44} variant="onDark" className="shadow-md rounded-xl" />
             <h1 className="text-2xl font-bold tracking-tight">UnityWealth</h1>
           </div>
           <p className="text-indigo-100 font-medium">Global Family Wealth Engine</p>
@@ -5164,7 +5144,11 @@ function HouseholdSetup({
   }, [inviteCode]);
 
   return (
-    <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
+    <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center p-6 gap-8">
+      <div className="flex items-center gap-3">
+        <BrandLogo size={38} className="shadow-sm rounded-xl" />
+        <span className="text-2xl font-extrabold tracking-tight text-slate-900">UnityWealth</span>
+      </div>
       <div className="w-full max-w-3xl grid grid-cols-1 md:grid-cols-2 gap-8">
         <div className="bg-white p-8 rounded-3xl shadow-xl shadow-slate-200 border border-slate-100 flex flex-col justify-between">
           <div>

@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="uw-bg" x1="6" y1="4" x2="58" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#1e1b4b" />
+      <stop offset="52%" stop-color="#3730a3" />
+      <stop offset="100%" stop-color="#4f46e5" />
+    </linearGradient>
+    <radialGradient id="uw-glow" cx="76%" cy="20%" r="60%">
+      <stop offset="0%" stop-color="#34d399" stop-opacity="0.30" />
+      <stop offset="100%" stop-color="#34d399" stop-opacity="0" />
+    </radialGradient>
+    <linearGradient id="uw-mark" x1="15" y1="36" x2="46" y2="16" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff" />
+      <stop offset="38%" stop-color="#f8fafc" />
+      <stop offset="68%" stop-color="#6ee7b7" />
+      <stop offset="100%" stop-color="#34d399" />
+    </linearGradient>
+    <linearGradient id="uw-arrow" x1="34" y1="25" x2="48" y2="14" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#6ee7b7" />
+      <stop offset="100%" stop-color="#a7f3d0" />
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded Squircle Crest -->
+  <rect width="64" height="64" rx="16" fill="url(#uw-bg)" />
+  <rect width="64" height="64" rx="16" fill="url(#uw-glow)" />
+  <rect x="1" y="1" width="62" height="62" rx="15" stroke="#ffffff" stroke-opacity="0.16" stroke-width="1.5" />
+
+  <!-- Continuous Unified "U" + Ascending Wealth Stem -->
+  <path
+    d="M 16.5 22.5 L 16.5 35.5 A 13 13 0 0 0 42.5 35.5 L 42.5 16"
+    stroke="url(#uw-mark)"
+    stroke-width="7.4"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+
+  <!-- Crisp Ascending Arrowhead -->
+  <path
+    d="M 33.8 24.2 L 42.5 15.5 L 51.2 24.2"
+    stroke="url(#uw-arrow)"
+    stroke-width="7.4"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+  />
+</svg>

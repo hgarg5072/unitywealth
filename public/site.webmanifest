@@ -1,0 +1,28 @@
+{
+  "name": "UnityWealth — Global Family Wealth Engine",
+  "short_name": "UnityWealth",
+  "description": "Cross-border investment aggregator for families with drift analysis, wealth journey tracking, and portfolio sync.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f8fafc",
+  "theme_color": "#3730a3",
+  "icons": [
+    {
+      "src": "/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
