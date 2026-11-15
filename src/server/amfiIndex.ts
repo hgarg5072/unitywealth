@@ -116,8 +116,9 @@ function buildIndex(rawText: string): AmfiIndex {
       byIsin.set(isin, scheme);
     }
 
-    // Build inverted posting list of unique alphanumeric words >= 2 chars
-    const words = nameLower.replace(/[^a-z0-9 ]/g, " ").split(/\s+/);
+    // Build inverted posting list of unique alphanumeric words >= 2 chars (splitting glued index numbers like next50 -> next 50)
+    const normalizedForTokens = nameLower.replace(/([a-z])(\d)/g, "$1 $2").replace(/(\d)([a-z])/g, "$1 $2");
+    const words = normalizedForTokens.replace(/[^a-z0-9 ]/g, " ").split(/\s+/);
     const seen = new Set<string>();
     for (const w of words) {
       if (w.length < 2 || seen.has(w)) continue;
@@ -274,8 +275,10 @@ export function findAmfiMatchIndexed(idx: AmfiIndex, holding: any): AmfiScheme |
     .replace(/,?\s*ISIN\s*:.*$/i, "")
     .replace(/\(formerly[^)]*\)/gi, "")
     .replace(/\(erstwhile[^)]*\)/gi, "")
-    .replace(/^[A-Z0-9]{3,10}\s*[-–—]\s*/i, "")
-    .toLowerCase();
+    .replace(/^[A-Z0-9]{2,15}\s*[-–—]\s*/i, "")
+    .toLowerCase()
+    .replace(/([a-z])(\d)/g, "$1 $2")
+    .replace(/(\d)([a-z])/g, "$1 $2");
 
   const wantsDirect = /\bdirect\b/.test(cleanedTarget);
   const wantsIdcw = /\b(idcw|dividend|payout|reinvestment)\b/.test(cleanedTarget);

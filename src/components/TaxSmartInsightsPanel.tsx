@@ -300,7 +300,7 @@ export const TaxSmartInsightsPanel: React.FC<TaxSmartInsightsPanelProps> = ({
                   </span>
                 </div>
                 <p className="text-xs text-slate-700 leading-relaxed">
-                  <strong>{cl.ownerName}&apos;s {cl.ticker}</strong> ({cl.units} sh from {cl.acquiredDate}) crosses LTCG in{' '}
+                  <strong>{cl.ownerName}&apos;s {shortenAssetName(cl.assetName, cl.ticker)}</strong> ({cl.units} sh from {cl.acquiredDate}) crosses LTCG in{' '}
                   <strong>{cl.daysToLtcg} days</strong> — cutting tax from{' '}
                   {formatCompactINR(cl.taxNowINR)} to {formatCompactINR(cl.taxAfterCliffINR)}. Do not sell this tranche yet!
                 </p>

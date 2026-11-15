@@ -24,6 +24,7 @@ import {
   getLotsForHolding
 } from '../shared/taxAndRsuMath';
 import { HoldingTaxLotsDrawer } from './HoldingTaxLotsDrawer';
+import { formatCompactTickerBadge } from '../lib/formatAssetName';
 
 export type AssetRegionFilter =
   | 'all'
@@ -590,7 +591,9 @@ export function HoldingsExplorer({
                       {h.displayName}
                     </div>
                     <div className="flex items-center gap-1.5 flex-wrap mt-1 text-[10px] font-bold">
-                      <span className="font-mono text-slate-500">{h.ticker}</span>
+                      {formatCompactTickerBadge(h.ticker) && (
+                        <span className="font-mono text-slate-500">{formatCompactTickerBadge(h.ticker)}</span>
+                      )}
                       <span className="px-1.5 py-0.5 rounded bg-white border border-slate-200 text-slate-600 uppercase text-[9px]">
                         {h.assetClass}
                       </span>
@@ -769,8 +772,12 @@ export function HoldingsExplorer({
                         </a>
                       </div>
                       <div className="flex items-center gap-1.5 flex-wrap mt-0.5 text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                        <span className="font-mono text-slate-500">{h.ticker}</span>
-                        <span>•</span>
+                        {formatCompactTickerBadge(h.ticker) && (
+                          <>
+                            <span className="font-mono text-slate-500">{formatCompactTickerBadge(h.ticker)}</span>
+                            <span>•</span>
+                          </>
+                        )}
                         <span>{h.assetClass}</span>
                         <span>•</span>
                         <span className="bg-indigo-50 text-indigo-700 px-1.5 py-0.5 rounded text-[9px] font-black">

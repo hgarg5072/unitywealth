@@ -2,7 +2,7 @@ import React, { useMemo, useState } from 'react';
 import { Globe, Zap } from 'lucide-react';
 import { motion } from 'motion/react';
 import { Holding } from '../../types';
-import { shortenAssetName } from '../../lib/formatAssetName';
+import { formatCompactTickerBadge, shortenAssetName } from '../../lib/formatAssetName';
 import { getHoldingOwnerId } from '../../shared/formatters';
 import { MarketPulseRibbon } from '../MarketPulseRibbon';
 import { AddTickerRow } from '../AddTickerRow';
@@ -178,9 +178,11 @@ export default function LiveMarketsView({
                       {shortenAssetName(h.originalName || h.ticker, h.ticker)}
                     </h3>
                     <div className="flex items-center gap-1.5 flex-wrap mt-2">
-                      <span className="text-[10px] font-mono text-slate-400 font-bold uppercase tracking-wider">
-                        {h.ticker}
-                      </span>
+                      {formatCompactTickerBadge(h.ticker) && (
+                        <span className="text-[10px] font-mono text-slate-400 font-bold uppercase tracking-wider">
+                          {formatCompactTickerBadge(h.ticker)}
+                        </span>
+                      )}
                       <span className="text-[9px] text-indigo-500 font-black uppercase tracking-widest bg-indigo-50 px-1.5 py-0.5 rounded">
                         {h.assetClass}
                       </span>
