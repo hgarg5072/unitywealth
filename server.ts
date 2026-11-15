@@ -1213,8 +1213,8 @@ async function startServer() {
         updatedAt: Date.now()
       };
 
-      const baseUrl = resolveRequestBaseUrl(req);
-      const joinUrl = `${baseUrl}/j/${code}`;
+      const shareBaseUrl = (process.env.SHORT_URL || resolveRequestBaseUrl(req)).replace(/\/$/, "");
+      const joinUrl = `${shareBaseUrl}/j/${code}`;
 
       let emailOutcome: any = null;
       if (toEmail && typeof toEmail === "string") {

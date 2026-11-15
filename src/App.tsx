@@ -1182,10 +1182,14 @@ export default function App() {
     }
   };
 
+  const shortShareOrigin = window.location.hostname.endsWith('.up.railway.app')
+    ? 'https://uw.up.railway.app'
+    : window.location.origin;
+
   const copyInviteValue = async (mode: 'code' | 'link') => {
     const code = householdInviteCode || household?.settings?.inviteCode || '';
     if (!code) return;
-    const value = mode === 'code' ? code : `${window.location.origin}/j/${code}`;
+    const value = mode === 'code' ? code : `${shortShareOrigin}/j/${code}`;
     try {
       await navigator.clipboard.writeText(value);
       setCopiedInviteField(mode);
@@ -3092,7 +3096,7 @@ export default function App() {
                         <p className="text-xs text-slate-600">
                           Code: <span className="font-mono font-black text-slate-900 bg-white px-2 py-0.5 rounded border border-slate-200">{householdInviteCode || data.household.settings?.inviteCode}</span>
                           {' • '}
-                          Short Link: <span className="font-mono font-bold text-indigo-700">{window.location.host}/j/{householdInviteCode || data.household.settings?.inviteCode}</span>
+                          Short Link: <span className="font-mono font-bold text-indigo-700">{shortShareOrigin.replace(/^https?:\/\//, '')}/j/{householdInviteCode || data.household.settings?.inviteCode}</span>
                         </p>
                       </div>
                       <div className="flex items-center gap-2 shrink-0">
