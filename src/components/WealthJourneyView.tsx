@@ -1,4 +1,5 @@
 import React, { useState, useMemo, useEffect } from 'react';
+import { shortenAssetName } from '../lib/formatAssetName';
 import {
   ResponsiveContainer,
   AreaChart,
@@ -108,14 +109,9 @@ export function formatCompactUSD(val: number): string {
   return `${sign}$${Math.round(abs).toLocaleString('en-US')}`;
 }
 
-function cleanDisplayAssetName(raw: string): string {
+function cleanDisplayAssetName(raw: string, ticker?: string): string {
   if (!raw) return 'Asset';
-  return raw
-    .replace(/,?\s*ISIN\s*:.*$/i, '')
-    .replace(/\s*-\s*Direct(\s+Plan)?(\s*-\s*Growth(\s+Option)?)?/gi, '')
-    .replace(/\s*-\s*Regular(\s+Plan)?(\s*-\s*Growth(\s+Option)?)?/gi, '')
-    .replace(/\s*\(?(Direct|Regular)\)?\s*\(?(Growth)\)?$/gi, '')
-    .trim();
+  return shortenAssetName(raw, ticker) || 'Asset';
 }
 
 function formatMonthLabel(ym: string): string {
@@ -286,7 +282,7 @@ export function WealthJourneyView({
           key,
           ticker,
           name: orig,
-          displayName: cleanDisplayAssetName(orig),
+          displayName: cleanDisplayAssetName(orig, ticker),
           assetClass: h.assetClass || 'Equity',
           currency: cur,
           provider: h.provider || 'Portfolio',

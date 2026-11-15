@@ -97,75 +97,7 @@ import { handleFirestoreError, OperationType } from './lib/firebase-utils';
 import axios from 'axios';
 import { DashboardData, Holding, AssetClass, Currency, PortfolioTargets, User, Invite, TargetCategory, TickerWeight, HouseholdSettings } from './types';
 import { BrandLogo } from './components/BrandLogo';
-
-
-function shortenAssetName(name: string): string {
-  if (!name) return '';
-  let clean = name.trim();
-
-  // 1. Strip ISIN metadata and parenthetical rename/category suffixes
-  clean = clean
-    .replace(/,?\s*ISIN\s*:\s*[A-Z0-9]+.*$/i, '')
-    .replace(/\s*\((formerly|erstwhile|non-demat|equity|debt|hybrid)[^)]*\).*$/i, '')
-    .replace(/\s*\([GD]\)\s*$/i, '');
-
-  // 2. Remove folio/scheme code prefixes at the start (e.g., "PP001ZG - ", "102T801 - ", "G202-")
-  clean = clean.replace(/^[A-Z0-9]{3,10}\s*[\-–—]\s*(?=[A-Za-z])/i, '');
-
-  // 3. Remove plan/option noise (handles both " - Direct Plan" and tight "-Growth-Regular Plan")
-  const stopMarkers = [
-    /\s*[\-–—]\s*Direct\s*(Plan)?.*$/i,
-    /\s*[\-–—]\s*Regular\s*(Plan)?.*$/i,
-    /\s*[\-–—]\s*Institutional\s*(Plan)?.*$/i,
-    /\s*[\-–—]\s*Retail\s*(Plan)?.*$/i,
-    /\s*[\-–—]\s*Plan\s*[A-Z0-9]+\b.*$/i,
-    /\s*[\-–—]\s*(Growth|IDCW|Dividend|Payout|Reinvestment|Bonus)\b.*$/i,
-    /\b(Direct|Regular)\s+Plan\b.*$/i,
-    /\b(Growth|IDCW)\s+Option\b.*$/i,
-  ];
-  stopMarkers.forEach((s) => {
-    clean = clean.replace(s, '');
-  });
-
-  // 4. Abbreviate verbose Indian AMC prefixes & common long words
-  const replacements: [RegExp, string][] = [
-    [/^Aditya Birla Sun Life\b/i, 'ABSL'],
-    [/^Birla Sun Life\b/i, 'ABSL'],
-    [/^ICICI Prudential\b/i, 'ICICI Pru'],
-    [/^Parag Parikh\b/i, 'PPFAS'],
-    [/^Franklin India\b/i, 'Franklin'],
-    [/^Templeton India\b/i, 'Templeton'],
-    [/^Nippon India\b/i, 'Nippon'],
-    [/^Motilal Oswal\b/i, 'Motilal'],
-    [/^Kotak Mahindra\b/i, 'Kotak'],
-    [/^Mirae Asset\b/i, 'Mirae'],
-    [/^Mahindra Manulife\b/i, 'Mahindra'],
-    [/^Canara Robeco\b/i, 'Canara'],
-    [/^DSP BlackRock\b/i, 'DSP'],
-    [/^WhiteOak Capital\b/i, 'WhiteOak'],
-    [/^Invesco India\b/i, 'Invesco'],
-    [/^Bandhan\b/i, 'Bandhan'],
-    [/\bDeveloped World Overseas Equity Passive\b/gi, 'Developed World'],
-    [/\bInternational\b/gi, 'Intl'],
-    [/\bOpportunities\b/gi, 'Opp'],
-    [/\bInfrastructure\b/gi, 'Infra'],
-    [/\bTechnology\b/gi, 'Tech'],
-    [/\bHealthcare\b/gi, 'Health'],
-    [/\bManufacturing\b/gi, 'Mfg'],
-    [/\s+and\s+/gi, ' & '],
-  ];
-  replacements.forEach(([pattern, short]) => {
-    clean = clean.replace(pattern, short);
-  });
-
-  // 5. Strip trailing "Mutual Fund" / "Fund" / "Scheme" if at least 2 words remain
-  const strippedTrailing = clean.replace(/\s+(Mutual\s+Fund|Fund|Scheme|Plan|Option)\s*$/i, '').trim();
-  if (strippedTrailing.split(/\s+/).length >= 2) {
-    clean = strippedTrailing;
-  }
-
-  return clean.replace(/\s*[\-–—,]+\s*$/, '').replace(/\s{2,}/g, ' ').trim();
-}
+import { shortenAssetName } from './lib/formatAssetName';
 
 function getHoldingOwnerId(h: Pick<Holding, 'userId' | 'ownerId'>): string {
   return h.ownerId || h.userId;
@@ -927,7 +859,7 @@ export default function App() {
     autoSnapDoneRef.current = '';
     const memberName = data?.household?.membersData?.find((m: any) => m.id === resolvedOwner)?.name;
     setNotification({
-      message: `Added ${shortenAssetName(payload.originalName || upperTicker)}${memberName ? ` for ${memberName}` : ''}!`,
+      message: `Added ${shortenAssetName(payload.originalName || upperTicker, upperTicker)}${memberName ? ` for ${memberName}` : ''}!`,
       type: 'success'
     });
   };
@@ -2176,7 +2108,7 @@ export default function App() {
       equityDrift,
       memberContributions,
       providerBreakdown,
-      topHoldingName: topHolding ? shortenAssetName(topHolding.originalName || topHolding.ticker) : '',
+      topHoldingName: topHolding ? shortenAssetName(topHolding.originalName || topHolding.ticker, topHolding.ticker) : '',
       topHoldingPct,
       daysSinceSync,
       unmappedForeignCount: unmappedForeignHoldings.length,
@@ -5906,7 +5838,7 @@ function AddTickerRow({ onAdd, householdId, foreignOnly = false }: { onAdd: (res
                 <span className="text-[8px] bg-slate-100 text-slate-500 px-1 rounded font-bold uppercase">{r.exchDisp}</span>
               </div>
               <div className="flex justify-between items-end">
-                <span className="text-[9px] text-slate-500 truncate font-semibold max-w-[190px]">{shortenAssetName(r.shortname)}</span>
+                <span className="text-[9px] text-slate-500 truncate font-semibold max-w-[190px]">{shortenAssetName(r.shortname, r.symbol)}</span>
                 {r.currentPrice > 0 && (
                   <div className="text-[10px] font-black text-emerald-600 tabular-nums">
                     {r.isIndia ? '₹' : '$'}{r.currentPrice.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
@@ -6003,7 +5935,7 @@ function LiveMarketsView({ holdings, members, householdId }: { holdings: Holding
                 <div className="flex justify-between items-start mb-4">
                   <div className="flex flex-col">
                     <span className="text-[10px] font-mono text-indigo-400 font-bold">{asset.symbol}</span>
-                    <span className="text-xs font-bold leading-tight line-clamp-2" title={asset.shortname}>{shortenAssetName(asset.shortname)}</span>
+                    <span className="text-xs font-bold leading-tight line-clamp-2" title={asset.shortname}>{shortenAssetName(asset.shortname, asset.symbol)}</span>
                   </div>
                   <span className="bg-emerald-500/10 text-emerald-400 text-[8px] font-black px-1.5 py-0.5 rounded border border-emerald-500/20">LIVE</span>
                 </div>
@@ -6028,7 +5960,7 @@ function LiveMarketsView({ holdings, members, householdId }: { holdings: Holding
             <div className="flex justify-between items-start gap-3 mb-6">
               <div className="flex flex-col min-w-0">
                 <h3 className="font-bold text-slate-800 text-sm leading-tight line-clamp-2" title={h.originalName || h.ticker}>
-                  {shortenAssetName(h.originalName || h.ticker)}
+                  {shortenAssetName(h.originalName || h.ticker, h.ticker)}
                 </h3>
                 <div className="flex items-center gap-1.5 flex-wrap mt-2">
                   <span className="text-[10px] font-mono text-slate-400 font-bold uppercase tracking-wider">{h.ticker}</span>

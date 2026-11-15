@@ -89,7 +89,7 @@ interface Props {
   fxRate: number;
   members?: { id: string; name: string }[];
   showMemberFilter?: boolean;
-  formatName: (raw: string) => string;
+  formatName: (raw: string, ticker?: string) => string;
   title?: string;
   compactHeader?: boolean;
   onAddClick?: () => void;
@@ -147,7 +147,7 @@ export function HoldingsExplorer({
           : qty * price;
       const ownerId = h.ownerId || h.userId || '';
       const ownerName = members.find((m) => m.id === ownerId)?.name || '';
-      const displayName = formatName(h.originalName || h.ticker || 'Asset');
+      const displayName = formatName(h.originalName || h.ticker || 'Asset', h.ticker);
       const accountBucket = normalizeAccountBucket(h);
       const weightPct = totalAllINR > 0 ? (valINR / totalAllINR) * 100 : 0;
 
@@ -518,7 +518,12 @@ export function HoldingsExplorer({
               <div key={h.id} className="p-3.5 rounded-xl bg-slate-50 border border-slate-100 space-y-2">
                 <div className="flex items-start justify-between gap-2">
                   <div className="min-w-0 flex-1">
-                    <div className="font-bold text-slate-900 text-sm leading-snug">{h.displayName}</div>
+                    <div
+                      className="font-bold text-slate-900 text-sm leading-snug break-words"
+                      title={h.originalName || h.ticker}
+                    >
+                      {h.displayName}
+                    </div>
                     <div className="flex items-center gap-1.5 flex-wrap mt-1 text-[10px] font-bold">
                       <span className="font-mono text-slate-500">{h.ticker}</span>
                       <span className="px-1.5 py-0.5 rounded bg-white border border-slate-200 text-slate-600 uppercase text-[9px]">

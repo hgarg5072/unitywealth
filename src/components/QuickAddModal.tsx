@@ -10,6 +10,7 @@ import {
   FileUp
 } from 'lucide-react';
 import { AssetClass, Currency } from '../types';
+import { shortenAssetName } from '../lib/formatAssetName';
 
 interface MemberOption {
   id: string;
@@ -339,7 +340,9 @@ export function QuickAddModal({
                         className="w-full px-3.5 py-2.5 text-left hover:bg-indigo-50/50 flex items-center justify-between gap-2"
                       >
                         <div className="min-w-0">
-                          <div className="text-xs font-bold text-slate-900 truncate">{r.shortname || r.symbol}</div>
+                          <div className="text-xs font-bold text-slate-900 truncate" title={r.shortname || r.symbol}>
+                            {shortenAssetName(r.shortname || r.symbol, r.symbol)}
+                          </div>
                           <div className="text-[10px] text-slate-400 font-mono">
                             {r.symbol} • {r.exchDisp}
                           </div>
