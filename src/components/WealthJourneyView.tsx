@@ -283,7 +283,7 @@ export function WealthJourneyView({
           provider: h.provider || 'Portfolio',
           units: qty,
           price,
-          valueINR
+          valueINR: valINR
         });
       }
     });
@@ -420,7 +420,7 @@ export function WealthJourneyView({
           provider: h.provider || 'Portfolio',
           units: qty,
           price,
-          valueINR
+          valueINR: valINR
         });
       });
 
