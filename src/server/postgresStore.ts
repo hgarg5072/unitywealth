@@ -9,6 +9,7 @@ export interface MemberSnapshotBreakdown {
   indianEquityINR?: number;
   foreignEquityINR?: number;
   debtINR?: number;
+  realEstateEquityINR?: number;
 }
 
 export interface HoldingSnapshotBreakdown {
@@ -41,6 +42,8 @@ export interface WealthSnapshotRecord {
   indianEquityINR: number;
   foreignEquityINR: number;
   debtINR: number;
+  realEstateEquityINR?: number;
+  realEstateLoanINR?: number;
   fxRate: number;
   holdingsCount: number;
   memberBreakdown: MemberSnapshotBreakdown[];
@@ -147,6 +150,10 @@ export async function initPostgresStore(): Promise<{
         ADD COLUMN IF NOT EXISTS holdings_breakdown JSONB NOT NULL DEFAULT '[]'::jsonb;
       ALTER TABLE uw_wealth_snapshots
         ADD COLUMN IF NOT EXISTS rebalance_meta JSONB NOT NULL DEFAULT '{}'::jsonb;
+      ALTER TABLE uw_wealth_snapshots
+        ADD COLUMN IF NOT EXISTS real_estate_equity_inr DOUBLE PRECISION NOT NULL DEFAULT 0;
+      ALTER TABLE uw_wealth_snapshots
+        ADD COLUMN IF NOT EXISTS real_estate_loan_inr DOUBLE PRECISION NOT NULL DEFAULT 0;
 
       CREATE INDEX IF NOT EXISTS idx_uw_wealth_hh_month
         ON uw_wealth_snapshots (household_id, snapshot_month ASC);
@@ -375,10 +382,10 @@ export async function upsertWealthSnapshotPg(snap: WealthSnapshotRecord): Promis
   await pool.query(
     `INSERT INTO uw_wealth_snapshots (
        household_id, snapshot_month, recorded_at, total_inr, total_usd,
-       indian_equity_inr, foreign_equity_inr, debt_inr, fx_rate,
+       indian_equity_inr, foreign_equity_inr, debt_inr, real_estate_equity_inr, real_estate_loan_inr, fx_rate,
        holdings_count, member_breakdown, provider_breakdown,
        holdings_breakdown, rebalance_meta, source, note
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13::jsonb,$14::jsonb,$15,$16)
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb,$14::jsonb,$15::jsonb,$16::jsonb,$17,$18)
      ON CONFLICT (household_id, snapshot_month) DO UPDATE SET
        recorded_at = EXCLUDED.recorded_at,
        total_inr = EXCLUDED.total_inr,
@@ -386,6 +393,8 @@ export async function upsertWealthSnapshotPg(snap: WealthSnapshotRecord): Promis
        indian_equity_inr = EXCLUDED.indian_equity_inr,
        foreign_equity_inr = EXCLUDED.foreign_equity_inr,
        debt_inr = EXCLUDED.debt_inr,
+       real_estate_equity_inr = EXCLUDED.real_estate_equity_inr,
+       real_estate_loan_inr = EXCLUDED.real_estate_loan_inr,
        fx_rate = EXCLUDED.fx_rate,
        holdings_count = EXCLUDED.holdings_count,
        member_breakdown = EXCLUDED.member_breakdown,
@@ -403,6 +412,8 @@ export async function upsertWealthSnapshotPg(snap: WealthSnapshotRecord): Promis
       snap.indianEquityINR,
       snap.foreignEquityINR,
       snap.debtINR,
+      Number(snap.realEstateEquityINR) || 0,
+      Number(snap.realEstateLoanINR) || 0,
       snap.fxRate,
       snap.holdingsCount,
       JSON.stringify(snap.memberBreakdown || []),
@@ -440,6 +451,8 @@ export async function getWealthHistoryPg(householdId: string): Promise<WealthSna
     indianEquityINR: Number(r.indian_equity_inr) || 0,
     foreignEquityINR: Number(r.foreign_equity_inr) || 0,
     debtINR: Number(r.debt_inr) || 0,
+    realEstateEquityINR: Number(r.real_estate_equity_inr) || 0,
+    realEstateLoanINR: Number(r.real_estate_loan_inr) || 0,
     fxRate: Number(r.fx_rate) || 84,
     holdingsCount: Number(r.holdings_count) || 0,
     memberBreakdown: Array.isArray(r.member_breakdown) ? r.member_breakdown : [],

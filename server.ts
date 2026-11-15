@@ -44,6 +44,10 @@ import {
   EmailProviderType,
   StoredEmailConfig
 } from "./src/server/emailService";
+import {
+  fetchGoogleSheetXlsxBuffer,
+  parseRealEstateWorkbook
+} from "./src/server/realEstateSheetImporter";
 
 // Initialize Firebase Admin (Lazy helper)
 function getFirestoreInstance() {
@@ -1557,6 +1561,8 @@ async function startServer() {
         indianEquityINR,
         foreignEquityINR,
         debtINR,
+        realEstateEquityINR,
+        realEstateLoanINR,
         fxRate,
         holdingsCount,
         memberBreakdown,
@@ -1591,6 +1597,8 @@ async function startServer() {
         indianEquityINR: Number(indianEquityINR) || 0,
         foreignEquityINR: Number(foreignEquityINR) || 0,
         debtINR: Number(debtINR) || 0,
+        realEstateEquityINR: Number(realEstateEquityINR) || 0,
+        realEstateLoanINR: Number(realEstateLoanINR) || 0,
         fxRate: Number(fxRate) || 84,
         holdingsCount: Number(holdingsCount) || 0,
         memberBreakdown: Array.isArray(memberBreakdown) ? memberBreakdown : [],
@@ -1637,6 +1645,8 @@ async function startServer() {
         indianEquityINR,
         foreignEquityINR,
         debtINR,
+        realEstateEquityINR,
+        realEstateLoanINR,
         fxRate,
         memberBreakdown,
         note
@@ -1668,6 +1678,8 @@ async function startServer() {
         indianEquityINR: indEq,
         foreignEquityINR: forEq,
         debtINR: debtVal,
+        realEstateEquityINR: Number(realEstateEquityINR) || 0,
+        realEstateLoanINR: Number(realEstateLoanINR) || 0,
         fxRate: rate,
         holdingsCount: 0,
         memberBreakdown: Array.isArray(memberBreakdown) ? memberBreakdown : [],
@@ -1694,6 +1706,64 @@ async function startServer() {
     } catch (e: any) {
       const code = e.statusCode || 500;
       res.status(code).json({ error: e.message || "Failed to delete snapshot" });
+    }
+  });
+
+  // --- Real Estate, Installment Ledger & Home Loan Persistence + Sheet Import ---
+  app.get("/api/real-estate/:householdId", async (req, res) => {
+    try {
+      const { householdId } = req.params;
+      await verifyCallerHouseholdAccess(req, householdId);
+      const saved = await getAppStateKeyPg<any[]>(`real_estate:${householdId}`);
+      res.json({ properties: Array.isArray(saved) ? saved : [] });
+    } catch (e: any) {
+      const code = e.statusCode || 500;
+      res.status(code).json({ error: e.message || "Failed to load real estate records" });
+    }
+  });
+
+  app.post("/api/real-estate/:householdId", async (req, res) => {
+    try {
+      const { householdId } = req.params;
+      await verifyCallerHouseholdAccess(req, householdId);
+      const properties = Array.isArray(req.body?.properties) ? req.body.properties : [];
+      await setAppStateKeyPg(`real_estate:${householdId}`, properties);
+      res.json({ success: true, properties });
+    } catch (e: any) {
+      const code = e.statusCode || 500;
+      res.status(code).json({ error: e.message || "Failed to save real estate records" });
+    }
+  });
+
+  app.post("/api/real-estate/import-sheet/parse", async (req, res) => {
+    try {
+      const { householdId, sheetUrl, fileBase64, propertyName, members } = req.body || {};
+      if (!householdId) {
+        return res.status(400).json({ error: "householdId is required" });
+      }
+      await verifyCallerHouseholdAccess(req, householdId);
+
+      let buffer: Buffer;
+      if (fileBase64 && typeof fileBase64 === "string") {
+        const cleanB64 = fileBase64.replace(/^data:[^;]+;base64,/, "");
+        buffer = Buffer.from(cleanB64, "base64");
+      } else if (sheetUrl && typeof sheetUrl === "string") {
+        buffer = await fetchGoogleSheetXlsxBuffer(sheetUrl.trim());
+      } else {
+        return res.status(400).json({ error: "Provide either a Google Sheets URL or an .xlsx file" });
+      }
+
+      const parsedProperty = parseRealEstateWorkbook(buffer, {
+        householdId,
+        propertyName,
+        sheetUrl: typeof sheetUrl === "string" ? sheetUrl.trim() : undefined,
+        members: Array.isArray(members) ? members : []
+      });
+
+      res.json({ success: true, property: parsedProperty });
+    } catch (e: any) {
+      const code = e.statusCode || 400;
+      res.status(code).json({ error: e.message || "Failed to import spreadsheet" });
     }
   });
 

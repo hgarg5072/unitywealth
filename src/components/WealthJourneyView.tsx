@@ -40,6 +40,7 @@ export interface MemberSnapshotEntry {
   indianEquityINR?: number;
   foreignEquityINR?: number;
   debtINR?: number;
+  realEstateEquityINR?: number;
 }
 
 export interface HoldingSnapshotEntry {
@@ -72,6 +73,8 @@ export interface WealthSnapshotItem {
   indianEquityINR: number;
   foreignEquityINR: number;
   debtINR: number;
+  realEstateEquityINR?: number;
+  realEstateLoanINR?: number;
   fxRate: number;
   holdingsCount: number;
   memberBreakdown: MemberSnapshotEntry[];
@@ -164,6 +167,9 @@ interface Props {
     note: string;
   }) => Promise<void>;
   onDeleteMonth: (month: string) => Promise<void>;
+  realEstateEquityINR?: number;
+  realEstateByMember?: Record<string, number>;
+  includeRealEstate?: boolean;
 }
 
 export function WealthJourneyView({
@@ -178,7 +184,10 @@ export function WealthJourneyView({
   isRecording,
   onRecordCurrentSnapshot,
   onBackfillMonth,
-  onDeleteMonth
+  onDeleteMonth,
+  realEstateEquityINR = 0,
+  realEstateByMember = {},
+  includeRealEstate = true
 }: Props) {
   // Scope: 'family' (combined) or a specific member.id — synced with global header member pills
   const [internalScope, setInternalScope] = useState<'family' | string>('family');
@@ -443,6 +452,7 @@ export function WealthJourneyView({
         indianEquityINR: stats.indianEquityValINR,
         foreignEquityINR: stats.foreignEquityValINR,
         debtINR: stats.debtValINR,
+        realEstateEquityINR,
         fxRate: safeFx,
         holdingsCount: holdingSnapList.length,
         memberBreakdown: Array.from(memberMap.values()),
@@ -464,16 +474,18 @@ export function WealthJourneyView({
     if (range === '1Y') return sorted.slice(-12);
     if (range === '3Y') return sorted.slice(-36);
     return sorted;
-  }, [snapshots, stats, holdings, members, safeFx, range, targetEqPct, targetIndOfEqPct]);
+  }, [snapshots, stats, holdings, members, safeFx, range, targetEqPct, targetIndOfEqPct, realEstateEquityINR]);
 
   // Project series through the selected scope ('family' vs individual member)
   const scopedSeries = useMemo(() => {
     return effectiveSeries.map((s) => {
       if (scope === 'family') {
         const eq = (s.indianEquityINR || 0) + (s.foreignEquityINR || 0);
-        const tot = s.totalINR || eq + (s.debtINR || 0);
-        const eqPct = tot > 0 ? (eq / tot) * 100 : 0;
-        const debtPct = tot > 0 ? ((s.debtINR || 0) / tot) * 100 : 0;
+        const liquidTot = s.totalINR || eq + (s.debtINR || 0);
+        const reEq = includeRealEstate ? (s.realEstateEquityINR ?? realEstateEquityINR ?? 0) : 0;
+        const tot = liquidTot + reEq;
+        const eqPct = liquidTot > 0 ? (eq / liquidTot) * 100 : 0;
+        const debtPct = liquidTot > 0 ? ((s.debtINR || 0) / liquidTot) * 100 : 0;
         const indOfEqPct = eq > 0 ? ((s.indianEquityINR || 0) / eq) * 100 : 0;
         const forOfEqPct = eq > 0 ? ((s.foreignEquityINR || 0) / eq) * 100 : 0;
         const tEq = s.rebalanceMeta?.targetEquityPct ?? targetEqPct;
@@ -487,6 +499,7 @@ export function WealthJourneyView({
           foreignEquityINR: s.foreignEquityINR || 0,
           equityINR: eq,
           debtINR: s.debtINR || 0,
+          realEstateEquityINR: reEq,
           equityPct: Number(eqPct.toFixed(1)),
           debtPct: Number(debtPct.toFixed(1)),
           indOfEqPct: Number(indOfEqPct.toFixed(1)),
@@ -500,9 +513,13 @@ export function WealthJourneyView({
 
       // Individual Member Scope
       const mem = (s.memberBreakdown || []).find((mb) => mb.id === scope);
-      const memTotal = mem?.valueINR || 0;
+      const memLiquid = mem?.valueINR || 0;
+      const memReEq = includeRealEstate
+        ? (mem?.realEstateEquityINR ?? realEstateByMember[scope] ?? 0)
+        : 0;
+      const memTotal = memLiquid + memReEq;
       const hhTotal = s.totalINR || 1;
-      const share = hhTotal > 0 ? memTotal / hhTotal : 0;
+      const share = hhTotal > 0 ? memLiquid / hhTotal : 0;
       // Use exact per-member breakdown when stored, else proportional fallback for legacy snapshots
       const hasExactAssetSplit =
         mem &&
@@ -511,8 +528,8 @@ export function WealthJourneyView({
       const forINR = hasExactAssetSplit ? mem?.foreignEquityINR || 0 : (s.foreignEquityINR || 0) * share;
       const dbtINR = hasExactAssetSplit ? mem?.debtINR || 0 : (s.debtINR || 0) * share;
       const eqINR = indINR + forINR;
-      const eqPct = memTotal > 0 ? (eqINR / memTotal) * 100 : 0;
-      const debtPct = memTotal > 0 ? (dbtINR / memTotal) * 100 : 0;
+      const eqPct = memLiquid > 0 ? (eqINR / memLiquid) * 100 : 0;
+      const debtPct = memLiquid > 0 ? (dbtINR / memLiquid) * 100 : 0;
       const indOfEqPct = eqINR > 0 ? (indINR / eqINR) * 100 : 0;
       const forOfEqPct = eqINR > 0 ? (forINR / eqINR) * 100 : 0;
       const alignment = Math.max(0, 100 - Math.abs(eqPct - targetEqPct));
@@ -535,7 +552,7 @@ export function WealthJourneyView({
         raw: s
       };
     });
-  }, [effectiveSeries, scope, targetEqPct, targetIndOfEqPct]);
+  }, [effectiveSeries, scope, targetEqPct, targetIndOfEqPct, includeRealEstate, realEstateEquityINR, realEstateByMember]);
 
   const chartData = useMemo(() => {
     const div = currency === 'USD' ? safeFx : 1;
@@ -558,11 +575,12 @@ export function WealthJourneyView({
       };
       members.forEach((m) => {
         const found = (pt.raw.memberBreakdown || []).find((mb) => mb.id === m.id || mb.name === m.name);
-        row[`m_${m.id}`] = Math.round(((found?.valueINR || 0) / div));
+        const reAdd = includeRealEstate ? (found?.realEstateEquityINR ?? realEstateByMember[m.id] ?? 0) : 0;
+        row[`m_${m.id}`] = Math.round((((found?.valueINR || 0) + reAdd) / div));
       });
       return row;
     });
-  }, [scopedSeries, currency, safeFx, members]);
+  }, [scopedSeries, currency, safeFx, members, includeRealEstate, realEstateByMember]);
 
   // Stock / Fund Chart Data (either Live Market Trajectory × Units OR Recorded Monthly Snapshots)
   const stockFundSeries = useMemo(() => {

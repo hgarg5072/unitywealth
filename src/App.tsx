@@ -95,9 +95,11 @@ import {
 import { auth, db } from './lib/firebase';
 import { handleFirestoreError, OperationType } from './lib/firebase-utils';
 import axios from 'axios';
-import { DashboardData, Holding, AssetClass, Currency, PortfolioTargets, User, Invite, TargetCategory, TickerWeight, HouseholdSettings } from './types';
+import { DashboardData, Holding, AssetClass, Currency, PortfolioTargets, User, Invite, TargetCategory, TickerWeight, HouseholdSettings, RealEstateProperty } from './types';
 import { BrandLogo } from './components/BrandLogo';
 import { shortenAssetName } from './lib/formatAssetName';
+import { RealEstateView } from './components/RealEstateView';
+import { computeHouseholdRealEstateTotals } from './lib/realEstateMath';
 
 function getHoldingOwnerId(h: Pick<Holding, 'userId' | 'ownerId'>): string {
   return h.ownerId || h.userId;
@@ -116,8 +118,10 @@ export default function App() {
   const [user, setUser] = useState<User | null>(null);
   const [data, setData] = useState<DashboardData | null>(null);
   const [fxRates, setFxRates] = useState<Record<string, number>>({ INR: 83.5, USD: 1.0 });
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'wealth' | 'targets' | 'accounts' | 'liveMarkets' | 'rebalance'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'wealth' | 'targets' | 'accounts' | 'liveMarkets' | 'rebalance' | 'realEstate'>('dashboard');
   const [dashboardView, setDashboardView] = useState<'combined' | string>('combined');
+  const [realEstateProperties, setRealEstateProperties] = useState<RealEstateProperty[] | null>(null);
+  const [showPropertyInDashboard, setShowPropertyInDashboard] = useState<boolean>(true);
   const [isSaving, setIsSaving] = useState(false);
   const [loading, setLoading] = useState(true);
   const [showSyncModal, setShowSyncModal] = useState(false);
@@ -2116,11 +2120,12 @@ export default function App() {
     };
   }, [data, fxRates]);
 
-  // Load persisted PostgreSQL wealth history & notifications when household loads
+  // Load persisted PostgreSQL wealth history, notifications & real estate when household loads
   useEffect(() => {
     if (!user?.householdId || !auth.currentUser) {
       setWealthSnapshots([]);
       setAppNotifications([]);
+      setRealEstateProperties(null);
       return;
     }
     let active = true;
@@ -2128,9 +2133,10 @@ export default function App() {
       try {
         const idToken = await auth.currentUser!.getIdToken();
         const headers = { Authorization: `Bearer ${idToken}` };
-        const [histRes, notifRes] = await Promise.all([
+        const [histRes, notifRes, reRes] = await Promise.all([
           fetch(`/api/wealth-history/${user.householdId}`, { headers }),
-          fetch(`/api/notifications/${user.householdId}`, { headers })
+          fetch(`/api/notifications/${user.householdId}`, { headers }),
+          fetch(`/api/real-estate/${user.householdId}`, { headers })
         ]);
         if (histRes.ok && active) {
           const hj = await histRes.json();
@@ -2139,6 +2145,12 @@ export default function App() {
         if (notifRes.ok && active) {
           const nj = await notifRes.json();
           if (Array.isArray(nj.notifications)) setAppNotifications(nj.notifications);
+        }
+        if (reRes.ok && active) {
+          const rj = await reRes.json();
+          if (Array.isArray(rj.properties) && rj.properties.length > 0) {
+            setRealEstateProperties(rj.properties);
+          }
         }
       } catch (err) {
         console.warn('Persisted wealth/notification fetch warning:', err);
@@ -2149,6 +2161,74 @@ export default function App() {
       active = false;
     };
   }, [user?.householdId]);
+
+  const effectiveRealEstateList = useMemo<RealEstateProperty[]>(() => {
+    if (realEstateProperties !== null) return realEstateProperties;
+    const fromSettings = data?.household?.settings?.realEstateProperties;
+    return Array.isArray(fromSettings) ? fromSettings : [];
+  }, [realEstateProperties, data?.household?.settings?.realEstateProperties]);
+
+  const realEstateTotals = useMemo(
+    () =>
+      computeHouseholdRealEstateTotals(
+        effectiveRealEstateList,
+        (data?.household?.membersData || []).map((m: any) => ({ id: m.id, name: m.name }))
+      ),
+    [effectiveRealEstateList, data?.household?.membersData]
+  );
+
+  const handleSaveRealEstateProperties = async (nextProps: RealEstateProperty[]) => {
+    if (!user?.householdId || !auth.currentUser) return;
+    setRealEstateProperties(nextProps);
+    const idToken = await auth.currentUser.getIdToken();
+    await Promise.all([
+      fetch(`/api/real-estate/${user.householdId}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`
+        },
+        body: JSON.stringify({ properties: nextProps })
+      }),
+      updateDoc(doc(db, 'households', user.householdId), {
+        settings: {
+          ...(household?.settings || data?.household?.settings || {}),
+          realEstateProperties: nextProps
+        }
+      }).catch(() => {})
+    ]);
+    autoSnapDoneRef.current = '';
+  };
+
+  const handleImportRealEstateSheet = async (opts: {
+    sheetUrl?: string;
+    fileBase64?: string;
+    propertyName?: string;
+  }): Promise<RealEstateProperty> => {
+    if (!user?.householdId || !auth.currentUser) {
+      throw new Error('Sign in required');
+    }
+    const idToken = await auth.currentUser.getIdToken();
+    const res = await fetch('/api/real-estate/import-sheet/parse', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`
+      },
+      body: JSON.stringify({
+        householdId: user.householdId,
+        sheetUrl: opts.sheetUrl,
+        fileBase64: opts.fileBase64,
+        propertyName: opts.propertyName,
+        members: (data?.household?.membersData || []).map((m: any) => ({ id: m.id, name: m.name }))
+      })
+    });
+    const json = await res.json();
+    if (!res.ok || !json.property) {
+      throw new Error(json.error || 'Failed to parse spreadsheet');
+    }
+    return json.property as RealEstateProperty;
+  };
 
   const handleInlineUpdateHolding = async (id: string, nextQty: number, nextPrice?: number) => {
     const patch: Record<string, number> = {
@@ -2184,7 +2264,7 @@ export default function App() {
 
       const memberAssetMap = new Map<
         string,
-        { id: string; name: string; valueINR: number; indianEquityINR: number; foreignEquityINR: number; debtINR: number }
+        { id: string; name: string; valueINR: number; indianEquityINR: number; foreignEquityINR: number; debtINR: number; realEstateEquityINR?: number }
       >();
       householdStats.memberContributions.forEach((m: any) => {
         memberAssetMap.set(m.id, {
@@ -2193,7 +2273,8 @@ export default function App() {
           valueINR: 0,
           indianEquityINR: 0,
           foreignEquityINR: 0,
-          debtINR: 0
+          debtINR: 0,
+          realEstateEquityINR: Math.round(realEstateTotals.byMemberEquityINR[m.id] || 0)
         });
       });
 
@@ -2255,6 +2336,8 @@ export default function App() {
           indianEquityINR: householdStats.indianEquityValINR,
           foreignEquityINR: householdStats.foreignEquityValINR,
           debtINR: householdStats.debtValINR,
+          realEstateEquityINR: Math.round(realEstateTotals.totalEquityINR),
+          realEstateLoanINR: Math.round(realEstateTotals.totalLoanOutstandingINR),
           fxRate: rate,
           holdingsCount: holdingsBreakdown.length,
           memberBreakdown: Array.from(memberAssetMap.values()),
@@ -2507,6 +2590,7 @@ export default function App() {
           <SidebarBtn active={activeTab === 'dashboard'} onClick={() => { setActiveTab('dashboard'); setIsMenuOpen(false); }} icon={<PieChartIcon size={18} />} label="Dashboard" />
           <SidebarBtn active={activeTab === 'wealth'} onClick={() => { setActiveTab('wealth'); setIsMenuOpen(false); }} icon={<TrendingUp size={18} />} label="Wealth Journey" badge={wealthSnapshots.length > 0 ? `${wealthSnapshots.length}M` : 'NEW'} />
           <SidebarBtn active={activeTab === 'rebalance'} onClick={() => { setActiveTab('rebalance'); setIsMenuOpen(false); }} icon={<Activity size={18} />} label="Rebalance & SIP" />
+          <SidebarBtn active={activeTab === 'realEstate'} onClick={() => { setActiveTab('realEstate'); setIsMenuOpen(false); }} icon={<Landmark size={18} />} label="Real Estate" badge={realEstateTotals.totalEquityINR > 0 ? formatCompactINR(realEstateTotals.totalEquityINR) : undefined} />
           <SidebarBtn active={activeTab === 'liveMarkets'} onClick={() => { setActiveTab('liveMarkets'); setIsMenuOpen(false); }} icon={<Zap size={18} />} label="Live Markets" />
           <SidebarBtn active={activeTab === 'targets'} onClick={() => { setActiveTab('targets'); setIsMenuOpen(false); }} icon={<Settings size={18} />} label="Target Manager" />
           <SidebarBtn active={activeTab === 'accounts'} onClick={() => { setActiveTab('accounts'); setIsMenuOpen(false); }} icon={<Link size={18} />} label="Family & Accounts" />
@@ -2709,7 +2793,48 @@ export default function App() {
                 </div>
 
                 <div className="lg:col-span-12 grid grid-cols-2 lg:grid-cols-4 gap-2.5 sm:gap-4 md:gap-6">
-                  <StatCardModern label={dashboardView === 'combined' ? "Combined Net Worth" : `${data.household.membersData?.find((m: any) => m.id === dashboardView)?.name}'s Portfolio`} value={formatCompactINR(stats.totalValINR)} subValue={`₹${stats.totalValINR.toLocaleString('en-IN', { maximumFractionDigits: 0 })} • $${stats.totalValUSD.toLocaleString('en-US', { maximumFractionDigits: 0 })}`} />
+                  {(() => {
+                    const activePropEq =
+                      dashboardView === 'combined'
+                        ? realEstateTotals.totalEquityINR
+                        : realEstateTotals.byMemberEquityINR[dashboardView] || 0;
+                    const includeProp = showPropertyInDashboard && activePropEq > 0;
+                    const headlineINR = stats.totalValINR + (includeProp ? activePropEq : 0);
+                    const headlineUSD = headlineINR / (fxRates.INR || 84);
+                    const subText =
+                      activePropEq > 0
+                        ? includeProp
+                          ? `Liquid ${formatCompactINR(stats.totalValINR)} + Property ${formatCompactINR(activePropEq)}`
+                          : `Liquid Only • (+${formatCompactINR(activePropEq)} Property)`
+                        : `₹${stats.totalValINR.toLocaleString('en-IN', { maximumFractionDigits: 0 })} • $${stats.totalValUSD.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+                    return (
+                      <StatCardModern
+                        label={
+                          dashboardView === 'combined'
+                            ? 'Combined Net Worth'
+                            : `${data.household.membersData?.find((m: any) => m.id === dashboardView)?.name}'s Net Worth`
+                        }
+                        value={formatCompactINR(headlineINR)}
+                        subValue={subText}
+                        actionPill={
+                          activePropEq > 0 ? (
+                            <button
+                              type="button"
+                              onClick={() => setShowPropertyInDashboard(!showPropertyInDashboard)}
+                              className={`px-1.5 py-0.5 rounded text-[9px] font-black uppercase transition-colors ${
+                                showPropertyInDashboard
+                                  ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                                  : 'bg-slate-100 text-slate-500'
+                              }`}
+                              title="Toggle paid-in real estate equity in headline net worth"
+                            >
+                              {showPropertyInDashboard ? '+Property' : 'Liquid'}
+                            </button>
+                          ) : undefined
+                        }
+                      />
+                    );
+                  })()}
                   <StatCardModern label="Indian Portfolio" value={formatCompactINR(stats.holdings.filter(h => h.currency === 'INR').reduce((s, h) => s + h.quantity * h.currentPrice, 0))} subValue="Mutual Funds, Stocks & Debt" isSecondary />
                   <StatCardModern label="Foreign Portfolio" value={`$${(stats.holdings.filter(h => h.currency === 'USD').reduce((s, h) => s + h.quantity * h.currentPrice, 0)).toLocaleString('en-US', { maximumFractionDigits: 0 })}`} subValue="US Equities & RSU" isSecondary />
                   <StatCardModern label="Allocation Accuracy" value={`${(100 - Math.abs(stats.equityDrift) * 100).toFixed(1)}%`} subValue={`${(Math.abs(stats.equityDrift) * 100).toFixed(1)}% Drift detected`} isAlert={Math.abs(stats.equityDrift) > 0.05} />
@@ -2806,20 +2931,35 @@ export default function App() {
                     <div className="bg-indigo-50/80 sm:bg-white p-5 md:p-6 rounded-xl border-t-4 border-t-indigo-500 sm:border-t-slate-200 border-x-indigo-100/50 border-b-indigo-100/50 sm:border-slate-200 shadow-lg sm:shadow-sm ring-1 ring-indigo-500/10 sm:ring-0">
                       <h3 className="text-sm font-black text-indigo-900 mb-4 uppercase tracking-widest">Family Contributions</h3>
                       <div className="space-y-4">
-                        {stats.memberContributions.map(m => (
-                          <div key={m.id} className="p-4 bg-slate-50 border border-slate-100 rounded-xl">
-                            <div className="flex justify-between items-center mb-2">
-                              <span className="text-sm font-bold text-slate-700">{m.name}</span>
-                              <span className="text-xs font-black text-indigo-600">{(m.percentage * 100).toFixed(1)}%</span>
-                            </div>
-                            <div className="w-full bg-slate-200 h-1.5 rounded-full overflow-hidden">
-                              <motion.div initial={{ width: 0 }} animate={{ width: `${m.percentage * 100}%` }} className="h-full bg-indigo-500" />
-                            </div>
-                            <div className="mt-2 text-[10px] text-slate-400 font-bold uppercase tracking-wider">
-                              Contribution: ₹{m.value.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
-                            </div>
-                          </div>
-                        ))}
+                        {(() => {
+                          const inclProp = showPropertyInDashboard && realEstateTotals.totalEquityINR > 0;
+                          const enrichedMembers = stats.memberContributions
+                            .map((m) => {
+                              const propShare = inclProp ? realEstateTotals.byMemberEquityINR[m.id] || 0 : 0;
+                              const val = m.value + propShare;
+                              return { ...m, propShare, totalWithProp: val };
+                            })
+                            .sort((a, b) => b.totalWithProp - a.totalWithProp);
+                          const grandTotal = enrichedMembers.reduce((acc, m) => acc + m.totalWithProp, 0) || 1;
+                          return enrichedMembers.map((m) => {
+                            const pct = (m.totalWithProp / grandTotal) * 100;
+                            return (
+                              <div key={m.id} className="p-4 bg-slate-50 border border-slate-100 rounded-xl">
+                                <div className="flex justify-between items-center mb-2">
+                                  <span className="text-sm font-bold text-slate-700">{m.name}</span>
+                                  <span className="text-xs font-black text-indigo-600">{pct.toFixed(1)}%</span>
+                                </div>
+                                <div className="w-full bg-slate-200 h-1.5 rounded-full overflow-hidden">
+                                  <motion.div initial={{ width: 0 }} animate={{ width: `${pct}%` }} className="h-full bg-indigo-500" />
+                                </div>
+                                <div className="mt-2 text-[10px] text-slate-400 font-bold uppercase tracking-wider">
+                                  Contribution: ₹{m.totalWithProp.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
+                                  {m.propShare > 0 ? ` (incl. ${formatCompactINR(m.propShare)} property)` : ''}
+                                </div>
+                              </div>
+                            );
+                          });
+                        })()}
                       </div>
                     </div>
                   )}
@@ -2890,6 +3030,24 @@ export default function App() {
                       </div>
                     )}
 
+                    {effectiveRealEstateList.length > 0 && (
+                      <div className="pt-2 border-t border-slate-100 flex items-center justify-between text-xs">
+                        <div>
+                          <span className="font-bold text-slate-700">Real Estate Equity</span>
+                          <span className="ml-1.5 font-mono font-black text-emerald-700">
+                            {formatCompactINR(realEstateTotals.totalEquityINR)}
+                          </span>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setActiveTab('realEstate')}
+                          className="text-indigo-600 font-bold hover:underline"
+                        >
+                          EMI &amp; Swipes →
+                        </button>
+                      </div>
+                    )}
+
                     <button
                       type="button"
                       onClick={() => openQuickAdd('preset')}
@@ -2952,6 +3110,21 @@ export default function App() {
                   onRecordCurrentSnapshot={() => recordWealthSnapshot('manual_button', true)}
                   onBackfillMonth={handleBackfillMonth}
                   onDeleteMonth={handleDeleteSnapshotMonth}
+                  realEstateEquityINR={realEstateTotals.totalEquityINR}
+                  realEstateByMember={realEstateTotals.byMemberEquityINR}
+                  includeRealEstate={showPropertyInDashboard && realEstateTotals.totalEquityINR > 0}
+                />
+              </motion.div>
+            )}
+
+            {activeTab === 'realEstate' && (
+              <motion.div key="realEstate" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -16 }}>
+                <RealEstateView
+                  householdId={user.householdId || ''}
+                  members={(data.household.membersData || []).map((m: any) => ({ id: m.id, name: m.name }))}
+                  properties={effectiveRealEstateList}
+                  onSaveProperties={handleSaveRealEstateProperties}
+                  onImportSheet={handleImportRealEstateSheet}
                 />
               </motion.div>
             )}
@@ -3833,10 +4006,13 @@ function AccountStatusItem({ label, isActive }: { label: string, isActive?: bool
   );
 }
 
-function StatCardModern({ label, value, subValue, trend, isSecondary, isAlert, trendType }: { label: string, value: string, subValue: string, trend?: string, isSecondary?: boolean, isAlert?: boolean, trendType?: 'good' | 'bad' | 'neutral' }) {
+function StatCardModern({ label, value, subValue, trend, isSecondary, isAlert, trendType, actionPill }: { label: string, value: string, subValue: string, trend?: string, isSecondary?: boolean, isAlert?: boolean, trendType?: 'good' | 'bad' | 'neutral', actionPill?: React.ReactNode }) {
   return (
     <div className={`bg-white p-3.5 sm:p-5 rounded-xl border shadow-sm min-w-0 ${isAlert ? 'border-l-4 border-l-amber-400 border-slate-200' : 'border-slate-200'}`}>
-      <div className="text-[10px] sm:text-xs font-semibold text-slate-500 uppercase tracking-wider leading-tight">{label}</div>
+      <div className="flex items-center justify-between gap-1.5">
+        <div className="text-[10px] sm:text-xs font-semibold text-slate-500 uppercase tracking-wider leading-tight truncate">{label}</div>
+        {actionPill}
+      </div>
       <div className="text-lg sm:text-2xl font-bold mt-1 text-slate-800 leading-tight">{value}</div>
       {trend ? <div className={`text-[10px] sm:text-xs font-medium mt-1 ${trendType === 'bad' ? 'text-rose-500' : 'text-emerald-600'}`}>{trend}</div> : <div className="text-[10px] sm:text-xs mt-1 text-slate-400 leading-snug">{subValue}</div>}
     </div>
