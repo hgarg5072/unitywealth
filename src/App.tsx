@@ -295,15 +295,19 @@ export default function App() {
       }
       const hhData = hhSnap.data();
       
-      // Fetch real authenticated members data
+      // Fetch real authenticated members data (with settings.memberProfiles fallback for instant sync)
+      const cachedProfiles: Record<string, any> = hhData.settings?.memberProfiles || {};
       const realMembersData = await Promise.all(
         (hhData.members || []).map(async (mId: string) => {
           try {
             const uDoc = await getDoc(doc(db, 'users', mId));
-            return uDoc.exists() ? { id: mId, ...uDoc.data() } : null;
+            if (uDoc.exists()) {
+              return { id: mId, ...uDoc.data() };
+            }
           } catch {
-            return null;
+            // Fall through to cached profile if user doc is still syncing
           }
+          return cachedProfiles[mId] ? { id: mId, ...cachedProfiles[mId] } : null;
         })
       );
 
@@ -735,7 +739,10 @@ export default function App() {
         name: trimmedName,
         members: [user.id],
         settings: {
-          inviteCode
+          inviteCode,
+          memberProfiles: {
+            [user.id]: { id: user.id, name: user.name, email: user.email }
+          }
         },
         targets: {
            assetSplit: { Equity: 0.70, Debt: 0.30 },
@@ -808,6 +815,26 @@ export default function App() {
       const targetHhName: string = payload.householdName || "Family Portfolio";
 
       await updateDoc(doc(db, 'users', user.id), { householdId: targetHhId });
+
+      // Sync joiner's profile into household settings so all active family tabs update in real time
+      try {
+        const hhRef = doc(db, 'households', targetHhId);
+        const hhSnap = await getDoc(hhRef);
+        if (hhSnap.exists()) {
+          const existingSettings = hhSnap.data().settings || {};
+          await updateDoc(hhRef, {
+            settings: {
+              ...existingSettings,
+              memberProfiles: {
+                ...(existingSettings.memberProfiles || {}),
+                [user.id]: { id: user.id, name: user.name, email: user.email }
+              }
+            }
+          });
+        }
+      } catch (profileSyncErr) {
+        console.warn("Member profile sync warning:", profileSyncErr);
+      }
 
       if (firestoreInviteId) {
         try {

@@ -72,6 +72,7 @@ export interface HouseholdSettings {
   lastAlertSent?: number;
   inviteCode?: string;
   manualMembers?: ManualMember[];
+  memberProfiles?: Record<string, { id: string; name: string; email: string }>;
 }
 
 export interface Household {
