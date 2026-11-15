@@ -53,6 +53,7 @@ import {
   User as UserIcon,
 } from 'lucide-react';
 import { WealthJourneyView, WealthSnapshotItem, formatCompactINR } from './components/WealthJourneyView';
+import { HoldingsExplorer } from './components/HoldingsExplorer';
 import { MarketPulseRibbon } from './components/MarketPulseRibbon';
 import { NotificationDrawer, AppNotificationItem, SmartInsightAlert } from './components/NotificationDrawer';
 import { QuickAddModal } from './components/QuickAddModal';
@@ -521,7 +522,7 @@ export default function App() {
       if (e.code === 'auth/popup-blocked') {
         msg = "Pop-up was blocked by your browser. Please allow pop-ups for this site, or sign in using Email & Password.";
       } else if (e.code === 'auth/unauthorized-domain') {
-        msg = "This hosted domain is not yet whitelisted in Firebase Auth for Google OAuth. Please sign in with Email & Password or use an API key for outgoing email.";
+        msg = `Domain "${window.location.hostname}" is not yet added under Firebase Console → Authentication → Settings → Authorized domains. Sign in with Email & Password right away, or add "${window.location.hostname}" for Google Sign-In.`;
       } else if (e.code === 'auth/account-exists-with-different-credential') {
         msg = "This email is already associated with a password login. Please sign in using your email and password.";
       } else if (e.code === 'auth/popup-closed-by-user') {
@@ -1178,12 +1179,12 @@ export default function App() {
   const copyInviteValue = async (mode: 'code' | 'link') => {
     const code = householdInviteCode || household?.settings?.inviteCode || '';
     if (!code) return;
-    const value = mode === 'code' ? code : `${window.location.origin}/?invite=${code}`;
+    const value = mode === 'code' ? code : `${window.location.origin}/j/${code}`;
     try {
       await navigator.clipboard.writeText(value);
       setCopiedInviteField(mode);
       setNotification({
-        message: mode === 'code' ? `Copied Invite Code: ${code}` : 'Copied shareable Join Family link!',
+        message: mode === 'code' ? `Copied Invite Code: ${code}` : `Copied short join link: ${value}`,
         type: 'success'
       });
       setTimeout(() => setCopiedInviteField(null), 2500);
@@ -2090,6 +2091,8 @@ export default function App() {
     const targetEquityPct = data.household.targets?.assetSplit?.Equity ?? 0.7;
     const actualEquityPct = totalValINR > 0 ? equityValINR / totalValINR : 0;
     const equityDrift = actualEquityPct - targetEquityPct;
+    const targetIndianEquityOfEquity = data.household.targets?.equitySplit?.Indian ?? 0.6;
+    const actualIndianEquityPctOfEquity = equityValINR > 0 ? indianEquityValINR / equityValINR : 0;
 
     const memberContributions = (data.household.membersData || []).map((m) => {
       const value = realHoldings.filter((h) => getHoldingOwnerId(h) === m.id).reduce((s, h) => s + h.valINR, 0);
@@ -2129,6 +2132,10 @@ export default function App() {
       foreignEquityValINR,
       debtValINR,
       equityValINR,
+      actualEquityPct,
+      targetEquityPct,
+      actualIndianEquityPctOfEquity,
+      targetIndianEquityOfEquity,
       equityDrift,
       memberContributions,
       providerBreakdown,
@@ -2174,6 +2181,29 @@ export default function App() {
     };
   }, [user?.householdId]);
 
+  const handleInlineUpdateHolding = async (id: string, nextQty: number, nextPrice?: number) => {
+    const patch: Record<string, number> = {
+      quantity: nextQty,
+      priceUpdatedAt: Date.now()
+    };
+    if (typeof nextPrice === 'number' && !isNaN(nextPrice)) {
+      patch.currentPrice = nextPrice;
+    }
+    await updateDoc(doc(db, 'holdings', id), patch);
+    fetch(`/api/portfolio/holding/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ quantity: nextQty, currentPrice: nextPrice })
+    }).catch(() => {});
+    setNotification({ message: 'Holding updated!', type: 'success' });
+  };
+
+  const handleInlineDeleteHolding = async (id: string) => {
+    await deleteDoc(doc(db, 'holdings', id));
+    fetch(`/api/portfolio/holding/${id}`, { method: 'DELETE' }).catch(() => {});
+    setNotification({ message: 'Holding deleted', type: 'success' });
+  };
+
   const recordWealthSnapshot = async (sourceLabel = 'manual_snapshot', showFeedback = false) => {
     if (!user?.householdId || !auth.currentUser || !householdStats || !(householdStats.totalValINR > 0)) return;
     setIsRecordingSnapshot(true);
@@ -2181,6 +2211,67 @@ export default function App() {
       const idToken = await auth.currentUser.getIdToken();
       const now = new Date();
       const ym = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}`;
+      const rate = fxRates.INR || 83.5;
+
+      const memberAssetMap = new Map<
+        string,
+        { id: string; name: string; valueINR: number; indianEquityINR: number; foreignEquityINR: number; debtINR: number }
+      >();
+      householdStats.memberContributions.forEach((m: any) => {
+        memberAssetMap.set(m.id, {
+          id: m.id,
+          name: m.name,
+          valueINR: 0,
+          indianEquityINR: 0,
+          foreignEquityINR: 0,
+          debtINR: 0
+        });
+      });
+
+      const holdingsBreakdown = householdStats.holdings
+        .filter((h: any) => !h.isPlaceholder && h.valINR > 0)
+        .map((h: any) => {
+          const ownerId = getHoldingOwnerId(h);
+          const mEntry = memberAssetMap.get(ownerId) || {
+            id: ownerId,
+            name: household?.membersData?.find((x: any) => x.id === ownerId)?.name || 'Member',
+            valueINR: 0,
+            indianEquityINR: 0,
+            foreignEquityINR: 0,
+            debtINR: 0
+          };
+          mEntry.valueINR += h.valINR;
+          if (h.assetClass === 'Debt') {
+            mEntry.debtINR += h.valINR;
+          } else if (h.currency === 'USD') {
+            mEntry.foreignEquityINR += h.valINR;
+          } else {
+            mEntry.indianEquityINR += h.valINR;
+          }
+          memberAssetMap.set(ownerId, mEntry);
+
+          const ticker = String(h.ticker || '').trim();
+          const orig = String(h.originalName || ticker || 'Asset').trim();
+          return {
+            key: `${ticker.toUpperCase()}|${orig.toLowerCase().slice(0, 40)}`,
+            ticker,
+            name: orig,
+            ownerId,
+            assetClass: h.assetClass || 'Equity',
+            currency: h.currency === 'USD' ? 'USD' : 'INR',
+            provider: h.provider || 'Portfolio',
+            units: Number(h.quantity) || 0,
+            price: Number(h.currentPrice) || 0,
+            valueINR: Math.round(h.valINR)
+          };
+        });
+
+      const actualEqPct = (householdStats.actualEquityPct || 0) * 100;
+      const targetEqPct = (householdStats.targetEquityPct || 0.7) * 100;
+      const actualIndPct = (householdStats.actualIndianEquityPctOfEquity || 0) * 100;
+      const targetIndPct = (householdStats.targetIndianEquityOfEquity || 0.6) * 100;
+      const alignmentPct = Math.max(0, 100 - Math.abs(actualEqPct - targetEqPct));
+
       const res = await fetch('/api/wealth-history/record', {
         method: 'POST',
         headers: {
@@ -2195,16 +2286,20 @@ export default function App() {
           indianEquityINR: householdStats.indianEquityValINR,
           foreignEquityINR: householdStats.foreignEquityValINR,
           debtINR: householdStats.debtValINR,
-          fxRate: fxRates.INR || 83.5,
-          holdingsCount: householdStats.holdings.filter((h) => h.valINR > 0).length,
-          memberBreakdown: householdStats.memberContributions.map((m) => ({
-            id: m.id,
-            name: m.name,
-            valueINR: m.value
-          })),
+          fxRate: rate,
+          holdingsCount: holdingsBreakdown.length,
+          memberBreakdown: Array.from(memberAssetMap.values()),
           providerBreakdown: householdStats.providerBreakdown,
+          holdingsBreakdown,
+          rebalanceMeta: {
+            actualEquityPct: Number(actualEqPct.toFixed(1)),
+            targetEquityPct: Number(targetEqPct.toFixed(1)),
+            actualIndianOfEqPct: Number(actualIndPct.toFixed(1)),
+            targetIndianOfEqPct: Number(targetIndPct.toFixed(1)),
+            alignmentPct: Number(alignmentPct.toFixed(1))
+          },
           source: sourceLabel,
-          note: `${householdStats.holdings.filter((h) => h.valINR > 0).length} active holdings`
+          note: `${holdingsBreakdown.length} active holdings`
         })
       });
       if (res.ok) {
@@ -2837,109 +2932,23 @@ export default function App() {
                   </div>
                 </div>
 
-                {dashboardView !== 'combined' && (
-                  <div className="lg:col-span-12 bg-white p-4 md:p-6 rounded-xl border border-slate-200 shadow-sm">
-                    <div className="flex items-center justify-between mb-4 sm:mb-6">
-                      <h3 className="text-base md:text-lg font-bold text-slate-800">Holdings Details</h3>
-                      <button
-                        type="button"
-                        onClick={() => openQuickAdd('search')}
-                        className="text-xs font-bold text-indigo-600 hover:underline flex items-center gap-1"
-                      >
-                        <Plus size={14} /> Add Holding
-                      </button>
-                    </div>
-
-                    {/* Mobile Cards (< 640px) */}
-                    <div className="sm:hidden space-y-2.5">
-                      {stats.holdings
-                        .filter((h: any) => !h.isPlaceholder)
-                        .sort((a: any, b: any) => b.valINR - a.valINR)
-                        .map((h: any) => (
-                          <div key={h.id} className="p-3.5 rounded-xl bg-slate-50 border border-slate-100 space-y-2">
-                            <div className="flex items-start justify-between gap-2">
-                              <div className="min-w-0">
-                                <div className="font-bold text-slate-900 text-sm leading-snug">
-                                  {shortenAssetName(h.originalName || h.ticker)}
-                                </div>
-                                <div className="text-[10px] text-slate-500 font-mono mt-0.5">
-                                  {h.ticker} • {h.assetClass} {h.provider ? `• ${h.provider}` : ''}
-                                </div>
-                              </div>
-                              <div className="text-right shrink-0">
-                                <div className="text-sm font-black text-slate-900 tabular-nums">
-                                  ₹{h.valINR.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
-                                </div>
-                                <div className="text-[10px] text-slate-500 tabular-nums">
-                                  {h.quantity.toLocaleString('en-IN', { maximumFractionDigits: 3 })} @ {h.currency} {h.currentPrice.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
-                                </div>
-                              </div>
-                            </div>
-                          </div>
-                        ))}
-                    </div>
-
-                    {/* Tablet & Desktop Table */}
-                    <div className="hidden sm:block overflow-x-auto">
-                      <table className="w-full text-left">
-                        <thead>
-                          <tr className="border-b border-slate-100 pb-3">
-                            <th className="pb-4 pt-0 text-xs font-bold text-slate-400 uppercase tracking-widest">Asset Name</th>
-                            <th className="pb-4 pt-0 text-xs font-bold text-slate-400 uppercase tracking-widest">Units</th>
-                            <th className="pb-4 pt-0 text-xs font-bold text-slate-400 uppercase tracking-widest">Price</th>
-                            <th className="pb-4 pt-0 text-xs font-bold text-slate-400 uppercase tracking-widest text-right">Value (INR)</th>
-                          </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-50">
-                          {stats.holdings.filter((h: any) => !h.isPlaceholder).sort((a,b) => b.valINR - a.valINR).map((h: any) => (
-                            <tr key={h.id} className="hover:bg-slate-50/50 transition-colors">
-                              <td className="py-4">
-                                <div className="flex items-center gap-2">
-                                  <div className="font-bold text-slate-800 text-sm" title={h.originalName || h.ticker}>{shortenAssetName(h.originalName || h.ticker)}</div>
-                                  <a 
-                                    href={`https://www.google.com/search?q=${encodeURIComponent((h.originalName || h.ticker) + ' price')}`} 
-                                    target="_blank" 
-                                    rel="noreferrer"
-                                    aria-label={`Look up ${shortenAssetName(h.originalName || h.ticker)} price on Google`}
-                                    className="p-1.5 text-slate-400 hover:text-indigo-600 transition-colors rounded-lg hover:bg-slate-100"
-                                    title="Search on Google"
-                                  >
-                                    <Globe size={14} />
-                                  </a>
-                                </div>
-                                <div className="text-[10px] text-slate-400 font-bold uppercase tracking-wider flex items-center gap-2 flex-wrap mt-0.5">
-                                  <span className="font-mono">{h.ticker}</span>
-                                  <span>•</span>
-                                  <span>{h.assetClass}</span>
-                                  {h.provider && h.provider !== 'Manual' && (
-                                    <>
-                                      <span>•</span>
-                                      <span className="bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded-md text-[9px] font-black uppercase">{h.provider}</span>
-                                    </>
-                                  )}
-                                  {(h.source === 'PDF' || h.source === 'PDF Import') && <span className="bg-amber-50 text-amber-600 px-1.5 py-0.5 rounded-md border border-amber-200/50 text-[9px] font-black uppercase">STATEMENT</span>}
-                                  {h.source === 'Sync' && <span className="bg-violet-50 text-violet-600 px-1.5 py-0.5 rounded-md border border-violet-200/50 text-[9px] font-black uppercase">SYNC</span>}
-                                  {(h.source === 'Manual' || !h.source) && <span className="bg-blue-50 text-blue-600 px-1.5 py-0.5 rounded-md border border-blue-200/50 text-[9px] font-black uppercase">Manual</span>}
-                                  {h.ticker && h.ticker !== 'MANUAL' && h.currentPrice > 0 && <span className="bg-emerald-50 text-emerald-600 px-1.5 py-0.5 rounded-md border border-emerald-200/50 flex items-center gap-1 text-[9px] font-black uppercase"><span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>LIVE</span>}
-                                </div>
-                              </td>
-                              <td className="py-4 text-sm text-slate-600 tabular-nums">
-                                {h.quantity.toLocaleString('en-IN', { maximumFractionDigits: 4 })}
-                              </td>
-                              <td className="py-4 text-sm tabular-nums">
-                                <span className="text-slate-400 mr-1">{h.currency}</span>
-                                <span className="font-medium text-slate-700">{h.currentPrice.toLocaleString('en-IN', { maximumFractionDigits: 2 })}</span>
-                              </td>
-                              <td className="py-4 text-sm font-bold text-slate-900 text-right tabular-nums">
-                                ₹{h.valINR.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  </div>
-                )}
+                <div className="lg:col-span-12 bg-white p-4 md:p-6 rounded-xl border border-slate-200 shadow-sm">
+                  <HoldingsExplorer
+                    holdings={stats.holdings}
+                    fxRate={fxRates.INR}
+                    members={(data.household.membersData || []).map((m: any) => ({ id: m.id, name: m.name }))}
+                    showMemberFilter={dashboardView === 'combined'}
+                    formatName={shortenAssetName}
+                    title={
+                      dashboardView === 'combined'
+                        ? 'Family Holdings Details'
+                        : `${data.household.membersData?.find((m: any) => m.id === dashboardView)?.name || 'Member'}'s Holdings Details`
+                    }
+                    onAddClick={() => openQuickAdd('search')}
+                    onUpdateHolding={handleInlineUpdateHolding}
+                    onDeleteHolding={handleInlineDeleteHolding}
+                  />
+                </div>
 
                 <div className="lg:col-span-12 bg-slate-900 rounded-2xl p-5 sm:p-8 text-white flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
                   <div className="min-w-0">
@@ -2965,6 +2974,8 @@ export default function App() {
                 <WealthJourneyView
                   snapshots={wealthSnapshots}
                   stats={householdStats}
+                  holdings={householdStats?.holdings || data.holdings}
+                  targets={data.household.targets}
                   fxRate={fxRates.INR}
                   members={(data.household.membersData || []).map((m: any) => ({ id: m.id, name: m.name }))}
                   isRecording={isRecordingSnapshot}
@@ -3069,9 +3080,11 @@ export default function App() {
                   {(householdInviteCode || data.household.settings?.inviteCode) && (
                     <div className="mb-8 p-4 md:p-5 rounded-2xl bg-gradient-to-r from-indigo-50/80 via-white to-emerald-50/50 border border-indigo-100 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                       <div>
-                        <div className="text-[10px] font-black text-indigo-600 uppercase tracking-widest mb-1">Family Invite Code • Share to Link Accounts</div>
+                        <div className="text-[10px] font-black text-indigo-600 uppercase tracking-widest mb-1">Family Invite Code & Short Join Link</div>
                         <p className="text-xs text-slate-600">
-                          Family members can enter code <span className="font-mono font-black text-slate-900 bg-white px-2 py-0.5 rounded border border-slate-200">{householdInviteCode || data.household.settings?.inviteCode}</span> under <strong>Join Family</strong> (no email setup needed).
+                          Code: <span className="font-mono font-black text-slate-900 bg-white px-2 py-0.5 rounded border border-slate-200">{householdInviteCode || data.household.settings?.inviteCode}</span>
+                          {' • '}
+                          Short Link: <span className="font-mono font-bold text-indigo-700">{window.location.host}/j/{householdInviteCode || data.household.settings?.inviteCode}</span>
                         </p>
                       </div>
                       <div className="flex items-center gap-2 shrink-0">
@@ -4536,11 +4549,6 @@ function DetailViewModal({
   setManualAssetClass: (v: AssetClass) => void,
   setShowManualEntryModal: (v: boolean) => void
 }) {
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [deletingId, setDeletingId] = useState<string | null>(null);
-  const [editVal, setEditVal] = useState<string>('');
-  const [editPrice, setEditPrice] = useState<string>('');
-  const [isProcessing, setIsProcessing] = useState(false);
   const [showTargetPlaceholders, setShowTargetPlaceholders] = useState(false);
 
   const augmentedHoldings = useMemo(() => {
@@ -4564,79 +4572,6 @@ function DetailViewModal({
       
     return showTargetPlaceholders ? [...holdings, ...missing] : holdings;
   }, [holdings, categoryContext, members, showTargetPlaceholders]);
-
-  const groupedByMember = useMemo(() => {
-    const groups: Record<string, Holding[]> = {};
-    augmentedHoldings.forEach(h => {
-      const mId = getHoldingOwnerId(h);
-      if (!groups[mId]) groups[mId] = [];
-      groups[mId].push(h);
-    });
-    return groups;
-  }, [augmentedHoldings]);
-
-  const getSubgroups = (userHoldings: Holding[]) => {
-    return {
-      'Indian Equity': userHoldings.filter(h => (h.assetClass === 'Equity' || h.assetClass === 'Mutual Fund') && h.currency === 'INR'),
-      'Indian Debt': userHoldings.filter(h => h.assetClass === 'Debt' && h.currency === 'INR'),
-      'Foreign Equity': userHoldings.filter(h => (h.assetClass === 'Equity' || h.assetClass === 'Mutual Fund') && h.currency === 'USD'),
-      'Foreign Debt & Cash': userHoldings.filter(h => h.assetClass === 'Debt' && h.currency === 'USD'),
-      'Other': userHoldings.filter(h => {
-        const isIE = (h.assetClass === 'Equity' || h.assetClass === 'Mutual Fund') && h.currency === 'INR';
-        const isID = h.assetClass === 'Debt' && h.currency === 'INR';
-        const isFE = (h.assetClass === 'Equity' || h.assetClass === 'Mutual Fund') && h.currency === 'USD';
-        const isFD = h.assetClass === 'Debt' && h.currency === 'USD';
-        return !isIE && !isID && !isFE && !isFD;
-      })
-    };
-  };
-
-  const deleteHolding = async (id: string) => {
-    setIsProcessing(true);
-    try {
-      await deleteDoc(doc(db, 'holdings', id));
-      fetch(`/api/portfolio/holding/${id}`, { method: 'DELETE' }).catch(() => {});
-      setNotification({ message: 'Holding deleted', type: 'success' });
-      setDeletingId(null);
-    } catch (e) {
-      console.error("Delete holding error:", e);
-      setNotification({ message: 'Delete failed', type: 'error' });
-    } finally {
-      setIsProcessing(false);
-    }
-  };
-
-  const updateHolding = async (id: string) => {
-    if (!editVal || isNaN(parseFloat(editVal))) {
-      setEditingId(null);
-      return;
-    }
-    setIsProcessing(true);
-    try {
-      const nextQty = parseFloat(editVal);
-      const nextPrice = parseFloat(editPrice);
-      const patch: Record<string, number> = {
-        quantity: nextQty,
-        priceUpdatedAt: Date.now()
-      };
-      if (!isNaN(nextPrice)) {
-        patch.currentPrice = nextPrice;
-      }
-      await updateDoc(doc(db, 'holdings', id), patch);
-      fetch(`/api/portfolio/holding/${id}`, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ quantity: nextQty, currentPrice: nextPrice })
-      }).catch(() => {});
-      setEditingId(null);
-      setNotification({ message: 'Quantity updated', type: 'success' });
-    } catch (e) {
-      console.error("Update holding error:", e);
-      setNotification({ message: 'Update failed', type: 'error' });
-    } finally {
-      setIsProcessing(false);
-    }
-  };
 
   return (
     <motion.div 
@@ -4676,199 +4611,64 @@ function DetailViewModal({
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto pb-20">
-          {(Object.entries(groupedByMember) as [string, Holding[]][]).map(([userId, memberHoldings]) => {
-            const member = members.find(m => m.id === userId);
-            const mName = member?.name || 'Unknown Member';
-            
-            const subgroups = getSubgroups(memberHoldings);
-            
-            const renderTable = (subHoldings: Holding[]) => (
-              <div className="overflow-x-auto">
-                <table className="w-full text-left border-collapse mb-10">
-                  <thead className="sticky top-0 bg-white z-10 shadow-sm">
-                    <tr className="border-b border-slate-100">
-                      <th className="px-4 sm:px-8 py-3 md:py-4 text-[9px] md:text-[10px] font-black text-slate-400 uppercase tracking-widest whitespace-nowrap">Asset Name</th>
-                      <th className="px-4 sm:px-8 py-3 md:py-4 text-[9px] md:text-[10px] font-black text-slate-400 uppercase tracking-widest text-right whitespace-nowrap">Units</th>
-                      <th className="px-4 sm:px-8 py-3 md:py-4 text-[9px] md:text-[10px] font-black text-slate-400 uppercase tracking-widest text-right whitespace-nowrap">Price</th>
-                      <th className="px-4 sm:px-8 py-3 md:py-4 text-[9px] md:text-[10px] font-black text-slate-400 uppercase tracking-widest text-right whitespace-nowrap">Value (INR)</th>
-                      {categoryContext && <th className="px-4 sm:px-8 py-3 md:py-4 text-[9px] md:text-[10px] font-black text-slate-400 uppercase tracking-widest text-right whitespace-nowrap">Drift</th>}
-                      <th className="px-4 sm:px-8 py-3 md:py-4 text-[9px] md:text-[10px] font-black text-slate-400 uppercase tracking-widest text-center whitespace-nowrap">Actions</th>
-                    </tr>
-                  </thead>
-                <tbody className="divide-y divide-slate-50">
-                  {subHoldings.sort((a,b) => {
-                    const valA = a.currency === 'INR' ? a.quantity * a.currentPrice : a.quantity * a.currentPrice * fxRates.INR;
-                    const valB = b.currency === 'INR' ? b.quantity * b.currentPrice : b.quantity * b.currentPrice * fxRates.INR;
-                    return valB - valA;
-                  }).map((h) => {
-                    const valINR = h.currency === 'INR' ? h.quantity * h.currentPrice : h.quantity * h.currentPrice * fxRates.INR;
-                    const displayTitle = shortenAssetName(h.originalName || h.ticker);
-                    return (
-                      <tr key={h.id} className="hover:bg-slate-50/50 transition-colors group">
-                        <td className="px-4 sm:px-8 py-4 md:py-5">
-                          <div className="flex flex-col min-w-[120px] md:min-w-0">
-                            <div className="flex items-center gap-2 flex-wrap">
-                              <span className="font-bold text-slate-800 text-xs md:text-sm leading-snug" title={h.originalName || h.ticker}>{displayTitle}</span>
-                              {(h as any).isPlaceholder && (
-                                <div className="flex items-center gap-2">
-                                  <span className="text-[8px] bg-indigo-50 text-indigo-400 px-1.5 py-0.5 rounded-md border border-indigo-100 font-black uppercase tracking-tighter">TARGET</span>
-                                  <button 
-                                    onClick={() => {
-                                      setManualTicker(h.ticker);
-                                      setManualName(h.ticker);
-                                      setManualSource('Manual');
-                                      setManualProvider('Finnhub');
-                                      setManualCurrency('USD');
-                                      setManualAssetClass('Equity');
-                                      setShowManualEntryModal(true);
-                                    }}
-                                    className="text-[8px] font-black text-indigo-600 hover:underline flex items-center gap-1"
-                                  >
-                                    <Plus size={10} /> ADD
-                                  </button>
-                                </div>
-                              )}
-                              {h.provider && h.provider !== 'Manual' && !(h as any).isPlaceholder && (
-                                <span className="text-[8px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded-md font-black uppercase tracking-tighter shrink-0">{h.provider}</span>
-                              )}
-                              {(h.source === 'PDF' || h.source === 'PDF Import') && <span className="text-[8px] bg-amber-50 text-amber-600 px-1.5 py-0.5 rounded-md border border-amber-100/50 font-black uppercase tracking-tighter shrink-0">STATEMENT</span>}
-                              {h.source === 'Sync' && <span className="text-[8px] bg-violet-50 text-violet-600 px-1.5 py-0.5 rounded-md border border-violet-100/50 font-black uppercase tracking-tighter shrink-0">SYNC</span>}
-                            </div>
-                            <div className="flex items-center gap-1.5 mt-1">
-                              <span className="text-[9px] md:text-[10px] text-slate-400 font-mono uppercase font-medium">{h.ticker}</span>
-                            </div>
-                          </div>
-                        </td>
-                        <td className="px-4 sm:px-8 py-4 md:py-5 text-right font-mono text-[11px] md:text-sm whitespace-nowrap">
-                          {editingId === h.id ? (
-                            <div className="flex flex-col items-end gap-1">
-                              <span className="text-[8px] font-black text-blue-400 uppercase">Units</span>
-                              <input 
-                                type="number"
-                                autoFocus
-                                value={editVal}
-                                onChange={(e) => setEditVal(e.target.value)}
-                                onKeyDown={(e) => {
-                                  if (e.key === 'Enter') updateHolding(h.id);
-                                  if (e.key === 'Escape') setEditingId(null);
-                                }}
-                                className="w-20 md:w-24 text-right text-xs font-mono bg-blue-50 border border-blue-200 rounded px-1 py-0.5"
-                              />
-                            </div>
-                          ) : (
-                            h.quantity.toLocaleString('en-IN', { maximumFractionDigits: 4 })
-                          )}
-                        </td>
-                        <td className="px-4 sm:px-8 py-4 md:py-5 text-right font-mono text-[11px] md:text-sm whitespace-nowrap">
-                          {editingId === h.id ? (
-                            <div className="flex flex-col items-end gap-1">
-                              <span className="text-[8px] font-black text-blue-400 uppercase">Price ({h.currency})</span>
-                              <div className="flex items-center gap-1">
-                                <input 
-                                  type="number"
-                                  value={editPrice}
-                                  onChange={(e) => setEditPrice(e.target.value)}
-                                  onKeyDown={(e) => {
-                                    if (e.key === 'Enter') updateHolding(h.id);
-                                    if (e.key === 'Escape') setEditingId(null);
-                                  }}
-                                  className="w-20 md:w-24 text-right text-xs font-mono bg-blue-50 border border-blue-200 rounded px-1 py-0.5"
-                                />
-                                <button onClick={() => updateHolding(h.id)} className="p-1 text-emerald-600 hover:bg-emerald-50 rounded">
-                                  <Check size={14} />
-                                </button>
-                              </div>
-                            </div>
-                          ) : (
-                            <div className="flex flex-col items-end">
-                              <span className="text-[9px] md:text-[10px] font-black text-slate-400 uppercase leading-none mb-1">{h.currency}</span>
-                              <span className="font-medium text-slate-600">{h.currentPrice.toLocaleString('en-IN', { minimumFractionDigits: 2 })}</span>
-                            </div>
-                          )}
-                        </td>
-                        <td className="px-4 sm:px-8 py-4 md:py-5 text-right font-mono text-[11px] md:text-sm whitespace-nowrap">
-                          <div className="flex flex-col items-end">
-                             <span className="font-bold text-slate-800">
-                               ₹{valINR.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
-                             </span>
-                             {h.currency === 'USD' && (
-                               <span className="text-[8px] md:text-[9px] text-slate-400 font-mono mt-0.5">
-                                 ${(h.quantity * h.currentPrice).toLocaleString('en-IN', { maximumFractionDigits: 2 })}
-                               </span>
-                             )}
-                          </div>
-                        </td>
-                        {categoryContext && (
-                          <td className="px-4 sm:px-8 py-4 md:py-5 text-right whitespace-nowrap">
-                            {(() => {
-                              const weightInCat = categoryContext.tickerWeights?.find((tw: any) => tw.ticker.toUpperCase() === h.ticker.toUpperCase())?.weight || (categoryContext.isUnmapped ? 0 : 100);
-                              const targetValINR = (totalForeignVal || 0) * (categoryContext.percentage / 100) * (weightInCat / 100);
-                              const drift = valINR - targetValINR;
-                              return (
-                                <div className="flex flex-col items-end">
-                                  <span className={`text-[9px] md:text-[10px] font-black uppercase font-mono ${drift > 0 ? 'text-rose-500' : 'text-emerald-500'}`}>
-                                    {drift > 0 ? '+' : ''}₹{drift.toLocaleString('en-IN', { maximumFractionDigits: 0 })}
-                                  </span>
-                                  <span className="text-[7px] md:text-[8px] text-slate-400 font-black uppercase tracking-tighter">Goal: ₹{targetValINR.toLocaleString('en-IN', { maximumFractionDigits: 0 })}</span>
-                                </div>
-                              );
-                            })()}
-                          </td>
-                        )}
-                        <td className="px-4 sm:px-8 py-4 md:py-5 text-center">
-                           <div className="flex items-center justify-center gap-1 md:gap-2">
-                            {deletingId === h.id ? (
-                              <div className="flex items-center gap-2">
-                                 <div className="flex flex-col gap-1">
-                                    <button onClick={() => deleteHolding(h.id)} disabled={isProcessing} className="px-3 py-1 bg-rose-600 text-white text-[9px] font-black rounded hover:bg-rose-700 disabled:opacity-50">DELETE</button>
-                                    <button onClick={() => setDeletingId(null)} disabled={isProcessing} className="px-3 py-1 bg-slate-100 text-slate-500 text-[9px] font-black rounded hover:bg-slate-200">CANCEL</button>
-                                 </div>
-                              </div>
-                            ) : (h as any).isPlaceholder ? (
-                                <div className="p-2 text-slate-300">
-                                  <Settings size={14} className="opacity-50" />
-                                </div>
-                              ) : (
-                                <>
-                                  <button onClick={() => { setEditingId(h.id); setDeletingId(null); setEditVal(h.quantity.toString()); setEditPrice(h.currentPrice.toString());}} title="Edit Details" disabled={isProcessing} className="p-1.5 text-indigo-600 bg-indigo-50 hover:bg-indigo-100 border border-indigo-100 rounded-lg disabled:opacity-50"><Settings size={14} /></button>
-                                  <button onClick={() => { setDeletingId(h.id); setEditingId(null); }} title="Delete Holding" disabled={isProcessing} className="p-1.5 text-rose-600 bg-rose-50 hover:bg-rose-100 border border-rose-100 rounded-lg disabled:opacity-50"><Trash size={14} /></button>
-                                </>
-                            )}
-                           </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
-            </div>
-          );
-
-            return (
-              <div key={userId} className="mb-10">
-                <div className="px-4 sm:px-8 py-3 md:py-4 bg-indigo-50/50 flex items-center justify-between sticky top-0 z-20 backdrop-blur-sm border-y border-indigo-100/50">
-                  <h4 className="text-indigo-800 font-black uppercase tracking-tight flex items-center gap-2 text-xs md:text-sm">
-                    <Users size={14} className="md:w-4 md:h-4" /> {mName}'s Sections
-                  </h4>
-                </div>
-                
-                {Object.entries(subgroups).map(([groupName, groupHoldings]) => {
-                  if (groupHoldings.length === 0) return null;
-                  return (
-                    <div key={groupName} className="mt-6">
-                      <div className="px-4 sm:px-8 flex items-center gap-2 sm:gap-3 mb-2">
-                        <div className="h-px bg-slate-100 flex-1"></div>
-                        <h5 className="text-[9px] md:text-[10px] font-black text-slate-400 uppercase tracking-widest leading-none py-1.5 px-3 bg-white border border-slate-100 rounded-full shadow-sm whitespace-nowrap">{groupName}</h5>
-                        <div className="h-px bg-slate-100 flex-1"></div>
-                      </div>
-                      {renderTable(groupHoldings)}
-                    </div>
-                  );
-                })}
+        <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-4">
+          {showTargetPlaceholders && augmentedHoldings.some((h: any) => h.isPlaceholder) && (
+            <div className="p-3.5 rounded-2xl bg-indigo-50/70 border border-indigo-100 space-y-2">
+              <div className="text-[10px] font-black text-indigo-700 uppercase tracking-wider">Unallocated Target Tickers</div>
+              <div className="flex flex-wrap gap-2">
+                {augmentedHoldings
+                  .filter((h: any) => h.isPlaceholder)
+                  .map((h: any) => (
+                    <button
+                      key={h.id}
+                      type="button"
+                      onClick={() => {
+                        setManualTicker(h.ticker);
+                        setManualName(h.ticker);
+                        setManualSource('Manual');
+                        setManualProvider('Finnhub');
+                        setManualCurrency('USD');
+                        setManualAssetClass('Equity');
+                        setShowManualEntryModal(true);
+                      }}
+                      className="px-3 py-1.5 rounded-xl bg-white border border-indigo-200 text-xs font-bold text-indigo-700 hover:bg-indigo-100 flex items-center gap-1"
+                    >
+                      <Plus size={12} /> Add {h.ticker}
+                    </button>
+                  ))}
               </div>
-            );
-          })}
+            </div>
+          )}
+
+          <HoldingsExplorer
+            holdings={holdings}
+            fxRate={fxRates.INR || 84}
+            members={members.map((m: any) => ({ id: m.id, name: m.name }))}
+            showMemberFilter={members.length > 1}
+            formatName={shortenAssetName}
+            compactHeader
+            onUpdateHolding={async (id, nextQty, nextPrice) => {
+              const patch: Record<string, number> = {
+                quantity: nextQty,
+                priceUpdatedAt: Date.now()
+              };
+              if (typeof nextPrice === 'number' && !isNaN(nextPrice)) {
+                patch.currentPrice = nextPrice;
+              }
+              await updateDoc(doc(db, 'holdings', id), patch);
+              fetch(`/api/portfolio/holding/${id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ quantity: nextQty, currentPrice: nextPrice })
+              }).catch(() => {});
+              setNotification({ message: 'Holding updated', type: 'success' });
+            }}
+            onDeleteHolding={async (id) => {
+              await deleteDoc(doc(db, 'holdings', id));
+              fetch(`/api/portfolio/holding/${id}`, { method: 'DELETE' }).catch(() => {});
+              setNotification({ message: 'Holding deleted', type: 'success' });
+            }}
+          />
         </div>
 
         <div className="p-6 bg-slate-50 border-t border-slate-100 flex items-center justify-between">

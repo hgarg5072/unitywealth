@@ -484,6 +484,15 @@ async function startServer() {
     });
   });
 
+  function resolveRequestBaseUrl(req: express.Request): string {
+    const host = req.get("host") || "";
+    const proto = req.get("x-forwarded-proto") || (host.includes("localhost") ? "http" : "https");
+    if (host && !host.includes("localhost") && !host.startsWith("127.")) {
+      return `${proto}://${host}`.replace(/\/$/, "");
+    }
+    return (process.env.APP_URL || `${proto}://${host}` || "https://uw.up.railway.app").replace(/\/$/, "");
+  }
+
   function getRedirectUri(req: express.Request) {
     const host = req.get('host');
     const protocol = req.get('x-forwarded-proto') || (host?.includes('localhost') ? 'http' : 'https');
@@ -493,9 +502,13 @@ async function startServer() {
     
     console.log(`[Google OAuth Debug] Host: ${host}, Proto: ${protocol}, Detected: ${detectedUri}`);
 
+    if (host && !host.includes('localhost') && !host.startsWith('127.')) {
+      return detectedUri;
+    }
+
     if (process.env.APP_URL) {
       const appUrl = process.env.APP_URL.replace(/\/$/, "");
-      if (host?.includes('localhost') && appUrl.includes('.run.app')) {
+      if (host?.includes('localhost')) {
         return `http://${host}/auth/callback`;
       }
       return `${appUrl}/auth/callback`;
@@ -1200,10 +1213,8 @@ async function startServer() {
         updatedAt: Date.now()
       };
 
-      const host = req.get("host");
-      const proto = req.get("x-forwarded-proto") || (host?.includes("localhost") ? "http" : "https");
-      const baseUrl = (process.env.APP_URL || `${proto}://${host}`).replace(/\/$/, "");
-      const joinUrl = `${baseUrl}/?invite=${code}`;
+      const baseUrl = resolveRequestBaseUrl(req);
+      const joinUrl = `${baseUrl}/j/${code}`;
 
       let emailOutcome: any = null;
       if (toEmail && typeof toEmail === "string") {
@@ -1272,6 +1283,12 @@ async function startServer() {
       console.error("[InviteCode] Error:", e?.response?.data || e.message);
       res.status(status).json({ error: e?.response?.data?.error?.message || e.message || "Failed to generate invite code" });
     }
+  });
+
+  // Short invite redirect link (e.g. https://uw.up.railway.app/j/K7M4P9 -> /?invite=K7M4P9)
+  app.get("/j/:code", (req, res) => {
+    const clean = normalizeInviteCode(req.params.code);
+    return res.redirect(302, clean ? `/?invite=${encodeURIComponent(clean)}` : "/");
   });
 
   // Public preview of an invite code (returns household name & inviter display name only)
@@ -1491,6 +1508,8 @@ async function startServer() {
         holdingsCount,
         memberBreakdown,
         providerBreakdown,
+        holdingsBreakdown,
+        rebalanceMeta,
         source,
         note
       } = req.body || {};
@@ -1523,6 +1542,8 @@ async function startServer() {
         holdingsCount: Number(holdingsCount) || 0,
         memberBreakdown: Array.isArray(memberBreakdown) ? memberBreakdown : [],
         providerBreakdown: providerBreakdown && typeof providerBreakdown === "object" ? providerBreakdown : {},
+        holdingsBreakdown: Array.isArray(holdingsBreakdown) ? holdingsBreakdown : [],
+        rebalanceMeta: rebalanceMeta && typeof rebalanceMeta === "object" ? rebalanceMeta : {},
         source: String(source || "auto"),
         note: String(note || "")
       });
@@ -2376,6 +2397,228 @@ async function startServer() {
     return candidates[0];
   }
 
+  const assetHistoryCache = new Map<string, { ts: number; payload: any }>();
+  const ASSET_HISTORY_TTL_MS = 6 * 60 * 60 * 1000;
+
+  function formatShortHistoryLabel(isoDate: string, rangeKey: string): string {
+    const [y, m, d] = isoDate.split("-");
+    const months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const mi = parseInt(m, 10) - 1;
+    if (!y || isNaN(mi) || mi < 0 || mi > 11) return isoDate;
+    if (rangeKey === "6M") {
+      return `${parseInt(d || "1", 10)} ${months[mi]}`;
+    }
+    return `${months[mi]} '${y.slice(-2)}`;
+  }
+
+  function downsamplePoints<T>(arr: T[], maxPts = 48): T[] {
+    if (arr.length <= maxPts) return arr;
+    const out: T[] = [];
+    const step = (arr.length - 1) / (maxPts - 1);
+    for (let i = 0; i < maxPts - 1; i++) {
+      out.push(arr[Math.round(i * step)]);
+    }
+    out.push(arr[arr.length - 1]);
+    return out;
+  }
+
+  app.get("/api/asset-history/:symbol", async (req, res) => {
+    const rawSymbol = String(req.params.symbol || "").trim();
+    const rawName = String(req.query.name || "").trim();
+    const rangeRaw = String(req.query.range || "1Y").toUpperCase();
+    const rangeKey = (["6M", "1Y", "3Y", "ALL"].includes(rangeRaw) ? rangeRaw : "1Y") as "6M" | "1Y" | "3Y" | "ALL";
+    const cacheKey = `${rawSymbol.toUpperCase()}|${rawName.toLowerCase().slice(0, 40)}|${rangeKey}`;
+
+    const cached = assetHistoryCache.get(cacheKey);
+    if (cached && Date.now() - cached.ts < ASSET_HISTORY_TTL_MS) {
+      return res.json(cached.payload);
+    }
+
+    const windowDays = rangeKey === "6M" ? 185 : rangeKey === "1Y" ? 366 : rangeKey === "3Y" ? 1096 : 1826;
+    const minTsMs = Date.now() - windowDays * 24 * 60 * 60 * 1000;
+
+    try {
+      // 1. Check if this is an Indian Mutual Fund (AMFI scheme code or ISIN/name match)
+      let schemeCode = /^\d{5,6}$/.test(rawSymbol) ? rawSymbol : "";
+      if (!schemeCode && (rawName || rawSymbol)) {
+        const isExplicitStock = /\.(NS|BO|NSE|BSE|US)$/i.test(rawSymbol) || (/^[A-Z]{1,5}$/.test(rawSymbol) && !rawName.toLowerCase().includes("fund"));
+        if (!isExplicitStock) {
+          const mfData = await getAmfiData();
+          const mf = findAmfiMatch(mfData, { ticker: rawSymbol, originalName: rawName });
+          if (mf?.symbol && /^\d{5,6}$/.test(String(mf.symbol))) {
+            schemeCode = String(mf.symbol);
+          }
+        }
+      }
+
+      if (schemeCode) {
+        try {
+          const mfRes = await axios.get(`https://api.mfapi.in/mf/${encodeURIComponent(schemeCode)}`, {
+            timeout: 8000,
+            headers: { "User-Agent": YAHOO_HEADERS["User-Agent"] }
+          });
+          const navRows: any[] = Array.isArray(mfRes.data?.data) ? mfRes.data.data : [];
+          const parsedPts: { date: string; ts: number; price: number }[] = [];
+          for (const item of navRows) {
+            const parts = String(item?.date || "").split("-");
+            const nav = parseFloat(item?.nav);
+            if (parts.length === 3 && nav > 0) {
+              const iso = `${parts[2]}-${parts[1]}-${parts[0]}`;
+              const ts = Date.parse(`${iso}T00:00:00Z`);
+              if (!isNaN(ts) && ts >= minTsMs) {
+                parsedPts.push({ date: iso, ts, price: nav });
+              }
+            }
+          }
+          parsedPts.sort((a, b) => a.ts - b.ts);
+          if (parsedPts.length >= 2) {
+            const sampled = downsamplePoints(parsedPts, 48).map((p) => ({
+              date: p.date,
+              label: formatShortHistoryLabel(p.date, rangeKey),
+              price: Number(p.price.toFixed(4))
+            }));
+            const first = sampled[0].price;
+            const last = sampled[sampled.length - 1].price;
+            const payload = {
+              symbol: schemeCode,
+              source: "AMFI",
+              currency: "INR",
+              range: rangeKey,
+              changePct: first > 0 ? Number((((last - first) / first) * 100).toFixed(2)) : 0,
+              points: sampled
+            };
+            assetHistoryCache.set(cacheKey, { ts: Date.now(), payload });
+            return res.json(payload);
+          }
+        } catch (mfErr: any) {
+          console.warn(`[AssetHistory] MFAPI failed for ${schemeCode}:`, mfErr.message);
+        }
+      }
+
+      // 2. Stock / ETF History via Yahoo Finance v8 chart (query1 + query2, plus .BO fallback for .NS)
+      const yahooPrimary = toYahooSymbol(rawSymbol);
+      const yRange = rangeKey === "6M" ? "6mo" : rangeKey === "1Y" ? "1y" : rangeKey === "3Y" ? "3y" : "5y";
+      const yInterval = rangeKey === "6M" || rangeKey === "1Y" ? "1wk" : "1mo";
+      const candidateSyms = yahooPrimary.endsWith(".NS")
+        ? [yahooPrimary, yahooPrimary.replace(/\.NS$/, ".BO")]
+        : [yahooPrimary];
+
+      for (const ySym of candidateSyms) {
+        for (const host of ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]) {
+          try {
+            const yRes = await axios.get(
+              `https://${host}/v8/finance/chart/${encodeURIComponent(ySym)}?range=${yRange}&interval=${yInterval}`,
+              { timeout: 6500, headers: YAHOO_HEADERS }
+            );
+            const result = yRes.data?.chart?.result?.[0];
+            const timestamps: number[] = result?.timestamp || [];
+            const closes: (number | null)[] = result?.indicators?.quote?.[0]?.close || [];
+            const currency = result?.meta?.currency || (ySym.endsWith(".NS") || ySym.endsWith(".BO") ? "INR" : "USD");
+            const pts: { date: string; label: string; price: number }[] = [];
+            for (let i = 0; i < timestamps.length; i++) {
+              const c = closes[i];
+              if (typeof c === "number" && c > 0 && timestamps[i]) {
+                const iso = new Date(timestamps[i] * 1000).toISOString().slice(0, 10);
+                pts.push({
+                  date: iso,
+                  label: formatShortHistoryLabel(iso, rangeKey),
+                  price: Number(c.toFixed(2))
+                });
+              }
+            }
+            if (pts.length >= 2) {
+              const sampled = downsamplePoints(pts, 52);
+              const first = sampled[0].price;
+              const last = sampled[sampled.length - 1].price;
+              const payload = {
+                symbol: rawSymbol,
+                source: "Yahoo",
+                currency,
+                range: rangeKey,
+                changePct: first > 0 ? Number((((last - first) / first) * 100).toFixed(2)) : 0,
+                points: sampled
+              };
+              assetHistoryCache.set(cacheKey, { ts: Date.now(), payload });
+              return res.json(payload);
+            }
+          } catch {
+            // Try next host/candidate
+          }
+        }
+      }
+
+      // 3. Fallback: TradingView multi-horizon performance anchor points (always reliable on cloud IPs)
+      const isIndia = /\.(NS|BO|NSE|BSE)$/i.test(yahooPrimary);
+      try {
+        const tvTickers = isIndia
+          ? (() => {
+              const m = toTradingViewIndiaTicker(yahooPrimary);
+              return m.fallback ? [m.primary, m.fallback] : [m.primary];
+            })()
+          : (() => {
+              const clean = yahooPrimary.replace(/\.US$/i, "").toUpperCase();
+              return [`NASDAQ:${clean}`, `NYSE:${clean}`, `AMEX:${clean}`];
+            })();
+        const tvEndpoint = isIndia
+          ? "https://scanner.tradingview.com/india/scan"
+          : "https://scanner.tradingview.com/america/scan";
+        const tvRes = await axios.post(
+          tvEndpoint,
+          {
+            symbols: { tickers: tvTickers },
+            columns: ["close", "Perf.1M", "Perf.3M", "Perf.6M", "Perf.Y", "Perf.3Y", "Perf.5Y"]
+          },
+          { timeout: 6000, headers: { "Content-Type": "application/json", "User-Agent": YAHOO_HEADERS["User-Agent"] } }
+        );
+        const row = (tvRes.data?.data || []).find((it: any) => typeof it?.d?.[0] === "number" && it.d[0] > 0);
+        if (row) {
+          const [close, p1m, p3m, p6m, p1y, p3y, p5y] = row.d;
+          const anchors: { daysAgo: number; perf: number | null }[] = [
+            { daysAgo: 1825, perf: typeof p5y === "number" ? p5y : null },
+            { daysAgo: 1095, perf: typeof p3y === "number" ? p3y : null },
+            { daysAgo: 365, perf: typeof p1y === "number" ? p1y : null },
+            { daysAgo: 182, perf: typeof p6m === "number" ? p6m : null },
+            { daysAgo: 91, perf: typeof p3m === "number" ? p3m : null },
+            { daysAgo: 30, perf: typeof p1m === "number" ? p1m : null },
+            { daysAgo: 0, perf: 0 }
+          ];
+          const pts = anchors
+            .filter((a) => a.daysAgo <= windowDays + 5 && a.perf !== null && 1 + (a.perf as number) / 100 > 0)
+            .map((a) => {
+              const iso = new Date(Date.now() - a.daysAgo * 86400000).toISOString().slice(0, 10);
+              const histPrice = a.daysAgo === 0 ? close : close / (1 + (a.perf as number) / 100);
+              return {
+                date: iso,
+                label: formatShortHistoryLabel(iso, rangeKey),
+                price: Number(histPrice.toFixed(2))
+              };
+            });
+          if (pts.length >= 2) {
+            const first = pts[0].price;
+            const last = pts[pts.length - 1].price;
+            const payload = {
+              symbol: rawSymbol,
+              source: "TradingView",
+              currency: isIndia ? "INR" : "USD",
+              range: rangeKey,
+              changePct: first > 0 ? Number((((last - first) / first) * 100).toFixed(2)) : 0,
+              points: pts
+            };
+            assetHistoryCache.set(cacheKey, { ts: Date.now(), payload });
+            return res.json(payload);
+          }
+        }
+      } catch (tvErr: any) {
+        console.warn("[AssetHistory] TradingView fallback warning:", tvErr.message);
+      }
+
+      return res.json({ symbol: rawSymbol, source: "none", points: [], changePct: 0 });
+    } catch (e: any) {
+      console.error("[AssetHistory] Error:", e.message);
+      res.status(500).json({ error: "Failed to load asset history" });
+    }
+  });
+
   app.post("/api/portfolio/refresh", async (req, res) => {
     const householdId = (req.query.householdId as string) || req.body?.householdId;
     const clientHoldings: any[] | undefined = Array.isArray(req.body?.holdings) ? req.body.holdings : undefined;
@@ -2688,7 +2931,7 @@ async function startServer() {
         return { sent: false, error: "householdId is required" };
       }
 
-      const appUrl = (opts?.baseUrl || process.env.APP_URL || "https://unitywealth-production.up.railway.app").replace(/\/$/, "");
+      const appUrl = (opts?.baseUrl || process.env.APP_URL || "https://uw.up.railway.app").replace(/\/$/, "");
 
       // Fast path when client passes exact live computed report from RebalanceView
       if (opts?.clientReport && opts.toEmail) {

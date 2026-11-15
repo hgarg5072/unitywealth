@@ -2,6 +2,36 @@ import pg from "pg";
 
 const { Pool } = pg;
 
+export interface MemberSnapshotBreakdown {
+  id: string;
+  name: string;
+  valueINR: number;
+  indianEquityINR?: number;
+  foreignEquityINR?: number;
+  debtINR?: number;
+}
+
+export interface HoldingSnapshotBreakdown {
+  key: string;
+  ticker: string;
+  name: string;
+  ownerId: string;
+  assetClass: string;
+  currency: string;
+  provider: string;
+  units: number;
+  price: number;
+  valueINR: number;
+}
+
+export interface RebalanceSnapshotMeta {
+  actualEquityPct?: number;
+  targetEquityPct?: number;
+  actualIndianOfEqPct?: number;
+  targetIndianOfEqPct?: number;
+  alignmentPct?: number;
+}
+
 export interface WealthSnapshotRecord {
   householdId: string;
   snapshotMonth: string; // YYYY-MM
@@ -13,8 +43,10 @@ export interface WealthSnapshotRecord {
   debtINR: number;
   fxRate: number;
   holdingsCount: number;
-  memberBreakdown: { id: string; name: string; valueINR: number }[];
+  memberBreakdown: MemberSnapshotBreakdown[];
   providerBreakdown: Record<string, number>;
+  holdingsBreakdown?: HoldingSnapshotBreakdown[];
+  rebalanceMeta?: RebalanceSnapshotMeta;
   source: string;
   note?: string;
 }
@@ -104,10 +136,17 @@ export async function initPostgresStore(): Promise<{
         holdings_count INTEGER NOT NULL DEFAULT 0,
         member_breakdown JSONB NOT NULL DEFAULT '[]'::jsonb,
         provider_breakdown JSONB NOT NULL DEFAULT '{}'::jsonb,
+        holdings_breakdown JSONB NOT NULL DEFAULT '[]'::jsonb,
+        rebalance_meta JSONB NOT NULL DEFAULT '{}'::jsonb,
         source TEXT NOT NULL DEFAULT 'auto',
         note TEXT NOT NULL DEFAULT '',
         UNIQUE (household_id, snapshot_month)
       );
+
+      ALTER TABLE uw_wealth_snapshots
+        ADD COLUMN IF NOT EXISTS holdings_breakdown JSONB NOT NULL DEFAULT '[]'::jsonb;
+      ALTER TABLE uw_wealth_snapshots
+        ADD COLUMN IF NOT EXISTS rebalance_meta JSONB NOT NULL DEFAULT '{}'::jsonb;
 
       CREATE INDEX IF NOT EXISTS idx_uw_wealth_hh_month
         ON uw_wealth_snapshots (household_id, snapshot_month ASC);
@@ -337,8 +376,9 @@ export async function upsertWealthSnapshotPg(snap: WealthSnapshotRecord): Promis
     `INSERT INTO uw_wealth_snapshots (
        household_id, snapshot_month, recorded_at, total_inr, total_usd,
        indian_equity_inr, foreign_equity_inr, debt_inr, fx_rate,
-       holdings_count, member_breakdown, provider_breakdown, source, note
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13,$14)
+       holdings_count, member_breakdown, provider_breakdown,
+       holdings_breakdown, rebalance_meta, source, note
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb,$12::jsonb,$13::jsonb,$14::jsonb,$15,$16)
      ON CONFLICT (household_id, snapshot_month) DO UPDATE SET
        recorded_at = EXCLUDED.recorded_at,
        total_inr = EXCLUDED.total_inr,
@@ -350,6 +390,8 @@ export async function upsertWealthSnapshotPg(snap: WealthSnapshotRecord): Promis
        holdings_count = EXCLUDED.holdings_count,
        member_breakdown = EXCLUDED.member_breakdown,
        provider_breakdown = EXCLUDED.provider_breakdown,
+       holdings_breakdown = CASE WHEN jsonb_array_length(EXCLUDED.holdings_breakdown) > 0 THEN EXCLUDED.holdings_breakdown ELSE uw_wealth_snapshots.holdings_breakdown END,
+       rebalance_meta = CASE WHEN EXCLUDED.rebalance_meta <> '{}'::jsonb THEN EXCLUDED.rebalance_meta ELSE uw_wealth_snapshots.rebalance_meta END,
        source = EXCLUDED.source,
        note = CASE WHEN EXCLUDED.note <> '' THEN EXCLUDED.note ELSE uw_wealth_snapshots.note END`,
     [
@@ -365,6 +407,8 @@ export async function upsertWealthSnapshotPg(snap: WealthSnapshotRecord): Promis
       snap.holdingsCount,
       JSON.stringify(snap.memberBreakdown || []),
       JSON.stringify(snap.providerBreakdown || {}),
+      JSON.stringify(snap.holdingsBreakdown || []),
+      JSON.stringify(snap.rebalanceMeta || {}),
       snap.source || "auto",
       snap.note || ""
     ]
@@ -400,6 +444,8 @@ export async function getWealthHistoryPg(householdId: string): Promise<WealthSna
     holdingsCount: Number(r.holdings_count) || 0,
     memberBreakdown: Array.isArray(r.member_breakdown) ? r.member_breakdown : [],
     providerBreakdown: r.provider_breakdown && typeof r.provider_breakdown === "object" ? r.provider_breakdown : {},
+    holdingsBreakdown: Array.isArray(r.holdings_breakdown) ? r.holdings_breakdown : [],
+    rebalanceMeta: r.rebalance_meta && typeof r.rebalance_meta === "object" ? r.rebalance_meta : {},
     source: r.source || "auto",
     note: r.note || ""
   }));
