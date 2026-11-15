@@ -2576,9 +2576,17 @@ export default function App() {
         ${isMenuOpen ? 'translate-x-0' : '-translate-x-full'}
       `}>
         <div className="flex items-center justify-between mb-10">
-          <div className="flex items-center gap-3">
-            <BrandLogo size={36} className="shadow-xs rounded-xl" />
-            <span className="text-xl font-bold tracking-tight text-slate-900">UnityWealth</span>
+          <div className="flex items-center gap-2.5">
+            <BrandLogo size={38} className="shadow-xs rounded-xl" />
+            <div className="leading-none">
+              <div className="text-xl tracking-tight">
+                <span className="font-extrabold text-slate-900">unity</span>
+                <span className="font-semibold text-emerald-600">wealth</span>
+              </div>
+              <div className="text-[8.5px] font-bold tracking-[0.16em] text-slate-400 uppercase mt-0.5">
+                Portfolio &amp; Rebalancing
+              </div>
+            </div>
           </div>
           <button aria-label="Close navigation menu" onClick={() => setIsMenuOpen(false)} className="lg:hidden p-2 text-slate-400 hover:text-slate-600 rounded-lg">
             <X size={20} />
@@ -5082,12 +5090,8 @@ function LandingPage({ onLogin, onSignup, onForgot, onReset, onGoogleLogin, pend
   return (
     <div className="min-h-dvh bg-slate-50 flex items-center justify-center p-4 sm:p-6">
       <div className="w-full max-w-md bg-white rounded-3xl shadow-xl shadow-slate-200 overflow-hidden">
-        <div className="bg-indigo-600 p-6 sm:p-8 text-white">
-          <div className="flex items-center gap-3.5 mb-3 sm:mb-4">
-            <BrandLogo size={44} variant="onDark" className="shadow-md rounded-xl" />
-            <h1 className="text-2xl font-bold tracking-tight">UnityWealth</h1>
-          </div>
-          <p className="text-indigo-100 font-medium text-sm sm:text-base">Global Family Wealth Engine</p>
+        <div className="bg-[#0a1626] px-6 py-7 sm:px-8 sm:py-8 text-white flex items-center justify-center border-b border-slate-800/60">
+          <BrandLogo lockup size={64} className="max-w-full" />
         </div>
         <div className="p-6 sm:p-8">
           {pendingInviteCode && (
@@ -5306,8 +5310,16 @@ function HouseholdSetup({
   return (
     <div className="min-h-dvh bg-slate-50 flex flex-col items-center justify-center p-4 sm:p-6 gap-6 sm:gap-8">
       <div className="flex items-center gap-3 pt-2 sm:pt-0">
-        <BrandLogo size={38} className="shadow-sm rounded-xl" />
-        <span className="text-2xl font-extrabold tracking-tight text-slate-900">UnityWealth</span>
+        <BrandLogo size={42} className="shadow-sm rounded-xl" />
+        <div className="leading-none">
+          <div className="text-2xl tracking-tight">
+            <span className="font-extrabold text-slate-900">unity</span>
+            <span className="font-semibold text-emerald-600">wealth</span>
+          </div>
+          <div className="text-[9.5px] font-bold tracking-[0.18em] text-slate-400 uppercase mt-1">
+            Portfolio &amp; Rebalancing
+          </div>
+        </div>
       </div>
       <div className="w-full max-w-3xl grid grid-cols-1 md:grid-cols-2 gap-5 sm:gap-8">
         <div className="bg-white p-6 sm:p-8 rounded-3xl shadow-xl shadow-slate-200 border border-slate-100 flex flex-col justify-between">
