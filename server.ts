@@ -801,15 +801,15 @@ async function startServer() {
       if (!email || !String(email).includes("@")) {
         return res.status(400).json({ error: "Valid recipient email is required" });
       }
-      const subject = "[UnityWealth] Outgoing Email Verified";
-      const text = `Hi!\n\nYour UnityWealth family office outgoing email gateway is active and ready to send Family Invitations and Automated Rebalance Plans.\n\nSent at ${new Date().toLocaleString("en-IN")}.`;
+      const subject = "UnityWealth — Email delivery confirmed";
+      const text = `Hi,\n\nYour UnityWealth family portfolio email notifications are active for ${email}.\n\nFamily invitations and rebalance summaries will be delivered from UnityWealth <unitywealth.alerts@gmail.com>.\n\nSent at ${new Date().toLocaleString("en-IN")}.\n\n— UnityWealth`;
       const html = `
-        <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;padding:24px;background:#f8fafc;">
+        <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;padding:24px;background:#f8fafc;color:#0f172a;">
           <div style="max-width:480px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;padding:24px;">
-            <div style="font-size:11px;font-weight:800;color:#4f46e5;text-transform:uppercase;letter-spacing:0.12em;">UnityWealth Gateway Check</div>
-            <h2 style="margin:8px 0 12px;color:#0f172a;">Outgoing Email Connected</h2>
-            <p style="color:#334155;font-size:14px;line-height:1.6;">
-              Your household email sender is live and ready to deliver <strong>Family Invitations</strong> and <strong>Rebalance &amp; Zero-Sell SIP Reports</strong>.
+            <div style="font-size:12px;font-weight:700;color:#4f46e5;margin-bottom:6px;">UnityWealth</div>
+            <h2 style="margin:0 0 12px;font-size:18px;color:#0f172a;">Email delivery confirmed</h2>
+            <p style="margin:0;color:#334155;font-size:14px;line-height:1.6;">
+              Your household email notifications are active for <strong>${String(email).trim()}</strong>. Family invitations and rebalance summaries will arrive from this address.
             </p>
           </div>
         </div>`;

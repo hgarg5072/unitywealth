@@ -1,4 +1,5 @@
 import axios from "axios";
+import crypto from "crypto";
 import tls from "tls";
 import { OAuth2Client } from "google-auth-library";
 import { Resend } from "resend";
@@ -50,6 +51,66 @@ function encodeMimeHeaderUtf8(value: string): string {
   return `=?UTF-8?B?${Buffer.from(clean, "utf8").toString("base64")}?=`;
 }
 
+function encodeQuotedPrintableUtf8(input: string): string {
+  const normalized = (input || "").replace(/\r?\n/g, "\r\n");
+  const rawLines = normalized.split("\r\n");
+  const outLines: string[] = [];
+
+  for (const rawLine of rawLines) {
+    const buf = Buffer.from(rawLine, "utf8");
+    let current = "";
+
+    for (let i = 0; i < buf.length; i++) {
+      const b = buf[i];
+      const isLastByte = i === buf.length - 1;
+      let token: string;
+
+      if ((b === 0x20 || b === 0x09) && !isLastByte) {
+        token = String.fromCharCode(b);
+      } else if (b >= 33 && b <= 126 && b !== 61 && !(i === 0 && b === 46)) {
+        token = String.fromCharCode(b);
+      } else {
+        token = `=${b.toString(16).toUpperCase().padStart(2, "0")}`;
+      }
+
+      if (current.length + token.length > 75) {
+        outLines.push(`${current}=`);
+        current = token;
+      } else {
+        current += token;
+      }
+    }
+    outLines.push(current);
+  }
+
+  return outLines.join("\r\n");
+}
+
+function wrapCleanHtmlDocument(title: string, bodyInner: string): string {
+  return [
+    "<!DOCTYPE html>",
+    '<html lang="en">',
+    "<head>",
+    '<meta charset="UTF-8" />',
+    '<meta name="viewport" content="width=device-width, initial-scale=1.0" />',
+    `<title>${title.replace(/[<>&"]/g, "")}</title>`,
+    "</head>",
+    '<body style="margin:0;padding:0;background-color:#f8fafc;">',
+    bodyInner.trim(),
+    "</body>",
+    "</html>"
+  ].join("\r\n");
+}
+
+function formatFromAddress(fromEmail: string, fromName?: string): string {
+  if (!fromName) return fromEmail;
+  const cleanName = fromName.replace(/[\r\n"]+/g, " ").trim();
+  if (/^[A-Za-z0-9 _.-]+$/.test(cleanName)) {
+    return `"${cleanName}" <${fromEmail}>`;
+  }
+  return `${encodeMimeHeaderUtf8(cleanName)} <${fromEmail}>`;
+}
+
 function buildMultipartRawEmail(opts: {
   fromEmail: string;
   fromName?: string;
@@ -58,29 +119,35 @@ function buildMultipartRawEmail(opts: {
   text: string;
   html: string;
 }): string {
-  const boundary = `uw_boundary_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  const displayFrom = opts.fromName
-    ? `${encodeMimeHeaderUtf8(opts.fromName)} <${opts.fromEmail}>`
-    : opts.fromEmail;
+  const boundary = `000000000000${crypto.randomBytes(8).toString("hex")}`;
+  const senderDomain = (opts.fromEmail.split("@")[1] || "gmail.com").trim();
+  const messageId = `<${crypto.randomUUID()}@${senderDomain}>`;
+  const rfcDate = new Date().toUTCString();
+  const displayFrom = formatFromAddress(opts.fromEmail, opts.fromName);
+  const fullHtml = opts.html.trim().toLowerCase().startsWith("<!doctype")
+    ? opts.html
+    : wrapCleanHtmlDocument(opts.subject, opts.html);
 
   const lines = [
+    `Date: ${rfcDate}`,
+    `Message-ID: ${messageId}`,
     `From: ${displayFrom}`,
-    `To: ${opts.toEmail}`,
+    `To: <${opts.toEmail.trim()}>`,
     `Subject: ${encodeMimeHeaderUtf8(opts.subject)}`,
     "MIME-Version: 1.0",
     `Content-Type: multipart/alternative; boundary="${boundary}"`,
     "",
     `--${boundary}`,
     'Content-Type: text/plain; charset="UTF-8"',
-    "Content-Transfer-Encoding: base64",
+    "Content-Transfer-Encoding: quoted-printable",
     "",
-    Buffer.from(opts.text, "utf8").toString("base64").replace(/(.{76})/g, "$1\r\n"),
+    encodeQuotedPrintableUtf8(opts.text),
     "",
     `--${boundary}`,
     'Content-Type: text/html; charset="UTF-8"',
-    "Content-Transfer-Encoding: base64",
+    "Content-Transfer-Encoding: quoted-printable",
     "",
-    Buffer.from(opts.html, "utf8").toString("base64").replace(/(.{76})/g, "$1\r\n"),
+    encodeQuotedPrintableUtf8(fullHtml),
     "",
     `--${boundary}--`,
     ""
@@ -569,8 +636,8 @@ export function buildInvitationEmailContent(params: {
   inviteCode: string;
   joinUrl: string;
 }) {
-  const subject = `Join ${params.householdName} on UnityWealth (Code: ${params.inviteCode})`;
-  const text = `Hi!\n\n${params.inviterName} invited you to join the shared family portfolio "${params.householdName}" on UnityWealth.\n\n1-Click Join Link:\n${params.joinUrl}\n\nOr sign in at UnityWealth and enter Family Invite Code: ${params.inviteCode}\n\n— UnityWealth Family Office`;
+  const subject = `${params.inviterName} invited you to ${params.householdName} on UnityWealth`;
+  const text = `Hi,\n\n${params.inviterName} invited you to join the shared family portfolio "${params.householdName}" on UnityWealth.\n\nJoin link:\n${params.joinUrl}\n\nFamily Invite Code: ${params.inviteCode}\n\n— UnityWealth`;
 
   const html = `
   <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f8fafc;padding:32px 16px;color:#0f172a;">
@@ -624,7 +691,7 @@ export function buildRebalanceEmailContent(params: {
     return `Rs. ${Math.round(v).toLocaleString("en-IN")}`;
   };
 
-  const subject = `[UnityWealth] ${params.householdName} ${params.mode === "sip" ? "Zero-Sell SIP Plan" : "Rebalance Report"} (${params.accuracy.toFixed(1)}% Aligned)`;
+  const subject = `${params.householdName} — ${params.mode === "sip" ? "Monthly SIP Plan" : "Portfolio Rebalance Summary"} (${params.accuracy.toFixed(1)}% aligned)`;
 
   const orderLinesText =
     params.orders.length > 0
