@@ -5234,23 +5234,20 @@ function LiveMarketsView({ holdings, members, householdId }: { holdings: Holding
          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {uniqueHoldings.sort((a,b) => (a.assetClass || '').localeCompare(b.assetClass || '')).map(h => (
           <div key={h.id} className="bg-white p-6 rounded-3xl shadow-sm border border-slate-100 hover:border-emerald-200 transition-all group relative overflow-hidden">
-            {h.ticker && h.ticker !== 'MANUAL' && h.currentPrice > 0 && (
-              <div className="absolute top-0 right-0 p-3">
-                <span className="flex items-center gap-1 text-[7px] font-black text-emerald-500 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-100">
-                  <span className="w-1 h-1 rounded-full bg-emerald-500 animate-pulse"></span>
-                  LIVE
-                </span>
-              </div>
-            )}
-            
-              <div className="flex justify-between items-start mb-6">
-              <div className="flex flex-col max-w-[75%]">
+            <div className="flex justify-between items-start gap-3 mb-6">
+              <div className="flex flex-col min-w-0">
                 <h3 className="font-bold text-slate-800 text-sm leading-tight line-clamp-2" title={h.originalName || h.ticker}>
                   {shortenAssetName(h.originalName || h.ticker)}
                 </h3>
-                <div className="flex items-center gap-2 mt-2">
+                <div className="flex items-center gap-1.5 flex-wrap mt-2">
                   <span className="text-[10px] font-mono text-slate-400 font-bold uppercase tracking-wider">{h.ticker}</span>
-                  <span className="text-[9px] text-indigo-400 font-black uppercase tracking-widest bg-indigo-50 px-1.5 py-0.5 rounded">{h.assetClass}</span>
+                  <span className="text-[9px] text-indigo-500 font-black uppercase tracking-widest bg-indigo-50 px-1.5 py-0.5 rounded">{h.assetClass}</span>
+                  {h.ticker && h.ticker !== 'MANUAL' && h.source !== 'Manual' && h.currentPrice > 0 && (
+                    <span className="inline-flex items-center gap-1 text-[8px] font-black text-emerald-600 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-100">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                      LIVE
+                    </span>
+                  )}
                 </div>
               </div>
               <a 
@@ -5258,7 +5255,7 @@ function LiveMarketsView({ holdings, members, householdId }: { holdings: Holding
                 target="_blank" 
                 rel="noreferrer"
                 aria-label={`Search ${h.originalName || h.ticker} price on Google`}
-                className="p-2 bg-slate-50 text-slate-400 hover:text-emerald-500 hover:bg-emerald-50 rounded-xl transition-all"
+                className="p-2 bg-slate-50 text-slate-400 hover:text-emerald-500 hover:bg-emerald-50 rounded-xl transition-all shrink-0"
               >
                 <Globe size={14} />
               </a>
