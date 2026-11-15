@@ -561,3 +561,50 @@ export async function upsertCachedQuotesPg(quotes: CachedQuoteRecord[]): Promise
     // non-fatal
   }
 }
+
+const fallbackStateKeys = new Map<string, any>();
+
+export async function setAppStateKeyPg(key: string, payload: any): Promise<void> {
+  if (!key) return;
+  if (payload === null || payload === undefined) {
+    fallbackStateKeys.delete(key);
+    if (pgReady && pool) {
+      try {
+        await pool.query("DELETE FROM uw_app_state WHERE state_key = $1", [key]);
+      } catch (err: any) {
+        console.warn("[Postgres] deleteAppStateKeyPg error:", err.message);
+      }
+    }
+    return;
+  }
+  fallbackStateKeys.set(key, payload);
+  if (!pgReady || !pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO uw_app_state (state_key, payload, updated_at)
+       VALUES ($1, $2::jsonb, $3)
+       ON CONFLICT (state_key)
+       DO UPDATE SET payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at`,
+      [key, JSON.stringify(payload), Date.now()]
+    );
+  } catch (err: any) {
+    console.warn("[Postgres] setAppStateKeyPg error:", err.message);
+  }
+}
+
+export async function getAppStateKeyPg<T = any>(key: string): Promise<T | null> {
+  if (!key) return null;
+  if (pgReady && pool) {
+    try {
+      const res = await pool.query("SELECT payload FROM uw_app_state WHERE state_key = $1 LIMIT 1", [key]);
+      if (res.rows.length > 0 && res.rows[0].payload !== undefined) {
+        const val = res.rows[0].payload as T;
+        fallbackStateKeys.set(key, val);
+        return val;
+      }
+    } catch (err: any) {
+      console.warn("[Postgres] getAppStateKeyPg error:", err.message);
+    }
+  }
+  return (fallbackStateKeys.get(key) as T) ?? null;
+}

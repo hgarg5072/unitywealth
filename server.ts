@@ -29,8 +29,20 @@ import {
   getNotificationsPg,
   markNotificationsReadPg,
   getCachedQuotesPg,
-  upsertCachedQuotesPg
+  upsertCachedQuotesPg,
+  setAppStateKeyPg,
+  getAppStateKeyPg
 } from "./src/server/postgresStore";
+import {
+  getEmailDeliveryStatus,
+  saveHouseholdEmailConfig,
+  sendHouseholdEmail,
+  buildInvitationEmailContent,
+  buildRebalanceEmailContent,
+  resolveEmailConfig,
+  EmailProviderType,
+  StoredEmailConfig
+} from "./src/server/emailService";
 
 // Initialize Firebase Admin (Lazy helper)
 function getFirestoreInstance() {
@@ -455,14 +467,18 @@ async function startServer() {
   }
 
   // API Routes
-  app.get("/api/health", (req, res) => {
+  app.get("/api/health", async (req, res) => {
     const pgStatus = getPostgresStatus();
+    const emailStatus = await getEmailDeliveryStatus();
     res.json({
       status: "ok",
       postgres: pgStatus.connected,
       postgresPool: pgStatus,
       resend: !!process.env.RESEND_API_KEY,
       google: !!process.env.GOOGLE_CLIENT_ID && !!process.env.GOOGLE_CLIENT_SECRET,
+      emailConfigured: emailStatus.configured,
+      emailProvider: emailStatus.provider,
+      emailSender: emailStatus.senderEmail,
       appUrl: process.env.APP_URL
     });
   });
@@ -498,27 +514,38 @@ async function startServer() {
   app.get("/api/auth/google/url", (req, res) => {
     const client = getGoogleClient(req);
     const redirectUri = getRedirectUri(req);
-    console.log(`[Google OAuth] Generating Auth URL`);
-    console.log(`[Google OAuth] Redirect URI: ${redirectUri}`);
-    console.log(`[Google OAuth] HINT: Ensure this exact URI is added to "Authorized redirect URIs" in Google Cloud Console.`);
+    const householdId = typeof req.query.householdId === 'string' ? req.query.householdId : '';
+    const userId = typeof req.query.userId === 'string' ? req.query.userId : '';
+    const statePayload = Buffer.from(JSON.stringify({ householdId, userId })).toString('base64url');
+    console.log(`[Google OAuth] Generating Auth URL (Redirect URI: ${redirectUri})`);
     
     const url = client.generateAuthUrl({
       access_type: 'offline',
       prompt: 'consent select_account',
+      state: statePayload,
       scope: [
         'https://www.googleapis.com/auth/userinfo.email',
         'https://www.googleapis.com/auth/userinfo.profile',
-        'https://www.googleapis.com/auth/gmail.readonly'
+        'https://www.googleapis.com/auth/gmail.readonly',
+        'https://www.googleapis.com/auth/gmail.send'
       ]
     });
-    res.json({ url });
+    res.json({ url, redirectUri });
   });
 
   app.get(["/auth/callback", "/auth/callback/"], async (req, res) => {
-    const { code } = req.query;
+    const { code, state } = req.query;
     if (typeof code !== 'string') return res.status(400).send("No code provided");
 
     const client = getGoogleClient(req);
+    let parsedState: { householdId?: string; userId?: string } = {};
+    if (typeof state === 'string' && state) {
+      try {
+        parsedState = JSON.parse(Buffer.from(state, 'base64url').toString('utf8'));
+      } catch {
+        // ignore invalid state
+      }
+    }
 
     try {
       const { tokens } = await client.getToken(code);
@@ -533,64 +560,227 @@ async function startServer() {
 
       const db = getDB();
       let user = Object.values(db.users).find((u: any) => u.email.toLowerCase() === email.toLowerCase()) as any;
+      const existingCfg = await resolveEmailConfig(parsedState.householdId);
+      const mergedTokens = {
+        access_token: tokens.access_token || undefined,
+        refresh_token: tokens.refresh_token || existingCfg?.tokens?.refresh_token || user?.googleTokens?.refresh_token || undefined,
+        expiry_date: tokens.expiry_date || Date.now() + 50 * 60 * 1000,
+        scope: tokens.scope || undefined
+      };
 
       if (!user) {
-        // Sign up new user
-        const id = "u_" + Math.random().toString(36).substr(2, 9);
+        const id = parsedState.userId || ("u_" + Math.random().toString(36).substr(2, 9));
         user = { 
           id, 
           email, 
           name, 
           googleId,
-          googleTokens: tokens,
-          householdId: null,
+          googleTokens: mergedTokens,
+          householdId: parsedState.householdId || null,
           provider: 'google'
         };
         db.users[id] = user;
         saveDB(db);
-        console.log(`[Google OAuth] Created new user: ${email}`);
+        console.log(`[Google OAuth] Created new user & email sender: ${email}`);
       } else {
-        // Log in existing user and update tokens
-        user.googleTokens = tokens;
+        user.googleTokens = { ...(user.googleTokens || {}), ...mergedTokens };
         user.googleId = googleId;
+        if (parsedState.householdId && !user.householdId) {
+          user.householdId = parsedState.householdId;
+        }
         saveDB(db);
-        console.log(`[Google OAuth] Logged in existing user: ${email}`);
+        console.log(`[Google OAuth] Connected Gmail OAuth tokens for: ${email}`);
       }
+
+      if (parsedState.userId && parsedState.userId !== user.id) {
+        db.users[parsedState.userId] = {
+          ...(db.users[parsedState.userId] || { id: parsedState.userId, email, name }),
+          googleTokens: mergedTokens,
+          householdId: parsedState.householdId || null
+        };
+        saveDB(db);
+      }
+
+      await saveHouseholdEmailConfig(parsedState.householdId || user.householdId, {
+        provider: "gmail_oauth",
+        senderEmail: email,
+        senderName: name || "UnityWealth Family Office",
+        tokens: mergedTokens,
+        updatedAt: Date.now()
+      });
+      await setAppStateKeyPg(`gmail_tokens:${parsedState.userId || email.toLowerCase()}`, mergedTokens);
       
       res.send(`
         <html>
-          <body>
+          <body style="font-family:sans-serif;padding:32px;text-align:center;">
             <script>
               if (window.opener) {
+                window.opener.postMessage({ 
+                  type: 'OAUTH_EMAIL_CONNECTED',
+                  senderEmail: ${JSON.stringify(email)},
+                  user: ${JSON.stringify(user)}
+                }, '*');
                 window.opener.postMessage({ 
                   type: 'OAUTH_AUTH_SUCCESS',
                   user: ${JSON.stringify(user)}
                 }, '*');
                 window.close();
               } else {
-                window.location.href = '/';
+                window.location.href = '/?emailConnected=1';
               }
             </script>
-            <p>Authentication successful. You can close this window.</p>
+            <h3>Gmail Sender Connected (${email})</h3>
+            <p>You can close this window and return to UnityWealth.</p>
           </body>
         </html>
       `);
-    } catch (error) {
-      console.error("Google Auth Error:", error);
-      res.status(500).send("Authentication failed");
+    } catch (error: any) {
+      console.error("Google Auth Error:", error?.response?.data || error.message);
+      res.status(500).send("Authentication failed: " + (error?.response?.data?.error_description || error.message));
     }
   });
 
-  app.post("/api/auth/google/save-tokens", (req, res) => {
-    const { userId, tokens } = req.body;
+  // --- Email Delivery Configuration & Diagnostics APIs ---
+  app.get("/api/email/status", async (req, res) => {
+    try {
+      const householdId = typeof req.query.householdId === "string" ? req.query.householdId : null;
+      const status = await getEmailDeliveryStatus(householdId);
+      res.json(status);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message || "Failed to read email status" });
+    }
+  });
+
+  app.post("/api/email/save-google-token", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization || "";
+      const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : String(req.body?.idToken || "");
+      if (!idToken) return res.status(401).json({ error: "Authentication token required" });
+
+      const caller = await verifyFirebaseIdToken(idToken);
+      const { householdId, accessToken, senderEmail, senderName } = req.body || {};
+      if (!accessToken) return res.status(400).json({ error: "Google OAuth accessToken is required" });
+
+      const existing = await resolveEmailConfig(householdId);
+      const keepRefresh =
+        existing && (existing.provider === "gmail_oauth" || existing.provider === "gmail_token") && existing.senderEmail?.toLowerCase() === (senderEmail || caller.email).toLowerCase()
+          ? existing.tokens?.refresh_token
+          : undefined;
+
+      const cfg: StoredEmailConfig = {
+        provider: keepRefresh ? "gmail_oauth" : "gmail_token",
+        senderEmail: (senderEmail || caller.email || "").trim(),
+        senderName: (senderName || caller.name || "UnityWealth Family Office").trim(),
+        tokens: {
+          access_token: accessToken,
+          refresh_token: keepRefresh,
+          expiry_date: Date.now() + 50 * 60 * 1000
+        },
+        updatedAt: Date.now()
+      };
+      await saveHouseholdEmailConfig(householdId, cfg);
+      const status = await getEmailDeliveryStatus(householdId);
+      res.json({ success: true, status });
+    } catch (e: any) {
+      console.error("[SaveGoogleToken Error]", e.message);
+      res.status(500).json({ error: e.message || "Failed to store Gmail token" });
+    }
+  });
+
+  app.post("/api/email/configure-provider", async (req, res) => {
+    try {
+      const authHeader = req.headers.authorization || "";
+      const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : String(req.body?.idToken || "");
+      if (!idToken) return res.status(401).json({ error: "Authentication token required" });
+
+      const caller = await verifyFirebaseIdToken(idToken);
+      const { householdId, provider, senderEmail, senderName, apiKey } = req.body || {};
+
+      if (provider === "none" || provider === "disconnect") {
+        await saveHouseholdEmailConfig(householdId, null);
+        const status = await getEmailDeliveryStatus(householdId);
+        return res.json({ success: true, status });
+      }
+
+      const validProviders: EmailProviderType[] = ["brevo", "resend", "gmail_smtp"];
+      if (!validProviders.includes(provider)) {
+        return res.status(400).json({ error: "Unsupported email provider" });
+      }
+      if (!apiKey || !String(apiKey).trim()) {
+        return res.status(400).json({ error: "API Key or App Password is required" });
+      }
+      const cleanEmail = String(senderEmail || (provider === "resend" ? "onboarding@resend.dev" : caller.email) || "").trim();
+      if (!cleanEmail.includes("@")) {
+        return res.status(400).json({ error: "Valid sender email address is required" });
+      }
+
+      const cfg: StoredEmailConfig = {
+        provider,
+        senderEmail: cleanEmail,
+        senderName: String(senderName || caller.name || "UnityWealth Family Office").trim(),
+        apiKey: String(apiKey).trim(),
+        updatedAt: Date.now()
+      };
+      await saveHouseholdEmailConfig(householdId, cfg);
+      const status = await getEmailDeliveryStatus(householdId);
+      res.json({ success: true, status });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message || "Failed to save email provider" });
+    }
+  });
+
+  app.post("/api/email/test", async (req, res) => {
+    try {
+      const { email, householdId } = req.body || {};
+      if (!email || !String(email).includes("@")) {
+        return res.status(400).json({ error: "Valid recipient email is required" });
+      }
+      const subject = "[UnityWealth] Outgoing Email Verified";
+      const text = `Hi!\n\nYour UnityWealth family office outgoing email gateway is active and ready to send Family Invitations and Automated Rebalance Plans.\n\nSent at ${new Date().toLocaleString("en-IN")}.`;
+      const html = `
+        <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;padding:24px;background:#f8fafc;">
+          <div style="max-width:480px;margin:0 auto;background:#ffffff;border:1px solid #e2e8f0;border-radius:16px;padding:24px;">
+            <div style="font-size:11px;font-weight:800;color:#4f46e5;text-transform:uppercase;letter-spacing:0.12em;">UnityWealth Gateway Check</div>
+            <h2 style="margin:8px 0 12px;color:#0f172a;">Outgoing Email Connected</h2>
+            <p style="color:#334155;font-size:14px;line-height:1.6;">
+              Your household email sender is live and ready to deliver <strong>Family Invitations</strong> and <strong>Rebalance &amp; Zero-Sell SIP Reports</strong>.
+            </p>
+          </div>
+        </div>`;
+
+      const result = await sendHouseholdEmail({
+        householdId,
+        to: String(email).trim(),
+        subject,
+        text,
+        html
+      });
+      res.json({
+        success: result.sent,
+        ...result
+      });
+    } catch (e: any) {
+      res.status(500).json({ success: false, sent: false, error: e.message });
+    }
+  });
+
+  app.post("/api/auth/google/save-tokens", async (req, res) => {
+    const { userId, tokens, householdId, email, name } = req.body;
     const db = getDB();
     if (db.users[userId]) {
       db.users[userId].googleTokens = tokens;
       saveDB(db);
-      res.json({ success: true });
-    } else {
-      res.status(404).json({ error: "User not found" });
     }
+    if (tokens?.access_token && email) {
+      await saveHouseholdEmailConfig(householdId, {
+        provider: tokens.refresh_token ? "gmail_oauth" : "gmail_token",
+        senderEmail: email,
+        senderName: name || "UnityWealth Family Office",
+        tokens,
+        updatedAt: Date.now()
+      });
+    }
+    res.json({ success: true });
   });
 
   // --- Gmail Sync Logic ---
@@ -736,11 +926,18 @@ async function startServer() {
   });
 
   app.post("/api/debug/send-test-email", async (req, res) => {
-    const { email } = req.body;
+    const { email, householdId } = req.body || {};
     if (!email) return res.status(400).json({ error: "Email required" });
-    
-    await logEmail(email, "UnityWealth Test Connectivity", "This is a test email to verify your Resend configuration. If you received this, your email gateway is working correctly!");
-    res.json({ success: true, message: "Test email sent" });
+
+    const subject = "[UnityWealth] Test Email Delivery";
+    const text = "Hi!\n\nYour UnityWealth outgoing email gateway is active and verified for Family Invitations and Rebalance Reports.";
+    const html = `<div style="font-family:sans-serif;padding:20px;"><h2>UnityWealth Email Gateway Verified</h2><p>Your outgoing email sender is active and ready to deliver Family Invitations and Rebalance Plans.</p></div>`;
+    const result = await sendHouseholdEmail({ householdId, to: String(email).trim(), subject, text, html });
+    res.json({
+      success: result.sent,
+      message: result.sent ? `Test email sent via ${result.provider} (${result.senderEmail})` : (result.error || "Email not sent"),
+      ...result
+    });
   });
 
   app.post("/api/auth/signup", (req, res) => {
@@ -1002,6 +1199,12 @@ async function startServer() {
         updatedAt: Date.now()
       };
 
+      const host = req.get("host");
+      const proto = req.get("x-forwarded-proto") || (host?.includes("localhost") ? "http" : "https");
+      const baseUrl = (process.env.APP_URL || `${proto}://${host}`).replace(/\/$/, "");
+      const joinUrl = `${baseUrl}/?invite=${code}`;
+
+      let emailOutcome: any = null;
       if (toEmail && typeof toEmail === "string") {
         const cleanEmail = toEmail.trim().toLowerCase();
         if (cleanEmail) {
@@ -1019,30 +1222,49 @@ async function startServer() {
               status: "pending"
             });
           }
-          const host = req.get("host");
-          const proto = req.get("x-forwarded-proto") || (host?.includes("localhost") ? "http" : "https");
-          const baseUrl = (process.env.APP_URL || `${proto}://${host}`).replace(/\/$/, "");
-          logEmail(
-            cleanEmail,
-            `Join ${resolvedHouseholdName} on UnityWealth (Invite Code: ${code})`,
-            `${inviterName || caller.name || "A family member"} invited you to join '${resolvedHouseholdName}' on UnityWealth.\n\nInvite Code: ${code}\nDirect Join Link: ${baseUrl}/?invite=${code}`
-          ).catch(() => {});
+
+          const content = buildInvitationEmailContent({
+            householdName: resolvedHouseholdName,
+            inviterName: inviterName || caller.name || caller.email || "A family member",
+            inviteCode: code,
+            joinUrl
+          });
+          emailOutcome = await sendHouseholdEmail({
+            householdId,
+            to: cleanEmail,
+            subject: content.subject,
+            text: content.text,
+            html: content.html
+          });
+
+          if (emailOutcome.sent) {
+            await addNotificationPg({
+              householdId,
+              type: "family",
+              severity: "info",
+              title: "Family Invitation Emailed",
+              message: `Sent invite code ${code} to ${cleanEmail} via ${emailOutcome.senderEmail || emailOutcome.provider}.`,
+              createdAt: Date.now()
+            }).catch(() => {});
+          }
         }
       }
 
       saveDB(db);
       await upsertInviteCodePg(db.inviteCodes[code]);
 
-      const host = req.get("host");
-      const proto = req.get("x-forwarded-proto") || (host?.includes("localhost") ? "http" : "https");
-      const baseUrl = (process.env.APP_URL || `${proto}://${host}`).replace(/\/$/, "");
-
       res.json({
         success: true,
         code,
         householdId,
         householdName: resolvedHouseholdName,
-        joinUrl: `${baseUrl}/?invite=${code}`
+        joinUrl,
+        emailSent: emailOutcome ? emailOutcome.sent : undefined,
+        emailProvider: emailOutcome?.provider,
+        senderEmail: emailOutcome?.senderEmail,
+        emailError: emailOutcome?.error,
+        gmailComposeUrl: emailOutcome?.gmailComposeUrl,
+        mailtoUrl: emailOutcome?.mailtoUrl
       });
     } catch (e: any) {
       const status = e?.response?.status === 403 ? 403 : 500;
@@ -2357,79 +2579,387 @@ async function startServer() {
     });
   });
 
-  // Rebalance Check Logic
-  async function checkAndSendRebalanceAlert(householdId: string, force: boolean = false) {
-    try {
-      const hhSnap = await firestore.collection('households').doc(householdId).get();
-      if (!hhSnap.exists) return;
-      const household = hhSnap.data() as any;
+  // --- Firestore REST Document Parser & Rebalance Email Engine ---
+  function parseFirestoreValue(val: any): any {
+    if (!val || typeof val !== "object") return undefined;
+    if ("stringValue" in val) return val.stringValue;
+    if ("doubleValue" in val) return Number(val.doubleValue);
+    if ("integerValue" in val) return Number(val.integerValue);
+    if ("booleanValue" in val) return Boolean(val.booleanValue);
+    if ("nullValue" in val) return null;
+    if ("arrayValue" in val) {
+      return (val.arrayValue?.values || []).map(parseFirestoreValue);
+    }
+    if ("mapValue" in val) {
+      const out: Record<string, any> = {};
+      for (const [k, v] of Object.entries(val.mapValue?.fields || {})) {
+        out[k] = parseFirestoreValue(v);
+      }
+      return out;
+    }
+    return undefined;
+  }
 
-      if (household.settings?.emailAlertsEnabled === false && !force) return;
+  function parseFirestoreDoc(doc: any): any {
+    if (!doc?.fields) return null;
+    return parseFirestoreValue({ mapValue: { fields: doc.fields } });
+  }
 
-      const holdingsSnap = await firestore.collection('holdings').where('householdId', '==', householdId).get();
-      const holdings = holdingsSnap.docs.map(d => d.data());
-      if (holdings.length === 0) return;
+  async function firestoreRestQueryHoldings(householdId: string, idToken: string): Promise<any[]> {
+    const url = `https://firestore.googleapis.com/v1/projects/${firebaseConfig.projectId}/databases/${firebaseConfig.firestoreDatabaseId}/documents:runQuery`;
+    const resp = await axios.post(
+      url,
+      {
+        structuredQuery: {
+          from: [{ collectionId: "holdings" }],
+          where: {
+            fieldFilter: {
+              field: { fieldPath: "householdId" },
+              op: "EQUAL",
+              value: { stringValue: householdId }
+            }
+          }
+        }
+      },
+      {
+        timeout: 12000,
+        httpsAgent: ipv4HttpsAgent,
+        headers: {
+          Authorization: `Bearer ${idToken}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+    if (!Array.isArray(resp.data)) return [];
+    return resp.data
+      .filter((row: any) => row?.document?.fields)
+      .map((row: any) => parseFirestoreDoc(row.document));
+  }
 
-      let fxRate = 83.5;
+  async function resolveHouseholdMemberToken(householdId: string, bearerIdToken?: string): Promise<string | null> {
+    if (bearerIdToken) return bearerIdToken;
+    const db = getDB();
+    let entry: any = Object.values(db.inviteCodes || {}).find((e: any) => e.householdId === householdId);
+    if (!entry) {
+      entry = await getInviteByHouseholdPg(householdId);
+    }
+    if (entry?.refreshToken) {
       try {
-        const fxRes = await axios.get('https://open.er-api.com/v6/latest/USD');
-        fxRate = fxRes.data.rates?.INR || 83.5;
-      } catch(e) {}
+        const fresh = await refreshFirebaseIdToken(entry.refreshToken);
+        return fresh;
+      } catch (e: any) {
+        console.warn(`[Rebalance] Failed to refresh token for ${householdId}:`, e.message);
+      }
+    }
+    if (entry?.lastIdToken && Date.now() - (entry.lastTokenAt || 0) < 45 * 60 * 1000) {
+      return entry.lastIdToken;
+    }
+    return null;
+  }
+
+  function classifyAssetClassServer(h: any): "Equity" | "Debt" | "Gold" {
+    const label = `${h.name || ""} ${h.originalName || ""} ${h.ticker || ""}`.toLowerCase();
+    if (h.assetClass === "Gold" || /\b(gold|sgb|silver)\b/.test(label)) return "Gold";
+    if (
+      h.assetClass === "Debt" ||
+      /\b(arbitrage|liquid|overnight|money market|gilt|corporate bond|short duration|ultra short|debt|fixed deposit|treasury)\b/.test(label)
+    ) {
+      return "Debt";
+    }
+    return "Equity";
+  }
+
+  async function checkAndSendRebalanceAlert(
+    householdId: string,
+    force: boolean = false,
+    opts?: {
+      idToken?: string;
+      toEmail?: string;
+      recipientName?: string;
+      mode?: "full" | "sip";
+      freshInflowINR?: number;
+      clientReport?: any;
+      baseUrl?: string;
+    }
+  ): Promise<any> {
+    try {
+      if (!householdId) {
+        return { sent: false, error: "householdId is required" };
+      }
+
+      const appUrl = (opts?.baseUrl || process.env.APP_URL || "https://unitywealth-production.up.railway.app").replace(/\/$/, "");
+
+      // Fast path when client passes exact live computed report from RebalanceView
+      if (opts?.clientReport && opts.toEmail) {
+        const cr = opts.clientReport;
+        const content = buildRebalanceEmailContent({
+          householdName: cr.householdName || "Family Portfolio",
+          recipientName: opts.recipientName || "Investor",
+          totalValINR: Number(cr.totalValINR) || 0,
+          totalValUSD: Number(cr.totalValUSD) || 0,
+          accuracy: Number(cr.accuracy) || 0,
+          threshold: Number(cr.threshold) || 95,
+          actualEquityPct: Number(cr.actualEquityPct) || 0,
+          targetEquityPct: Number(cr.targetEquityPct) || 0.7,
+          indianEquityPctOfEq: Number(cr.indianEquityPctOfEq) || 0,
+          foreignEquityPctOfEq: Number(cr.foreignEquityPctOfEq) || 0,
+          mode: opts.mode === "sip" ? "sip" : "full",
+          executiveSummary:
+            cr.executiveSummary ||
+            `Portfolio alignment is ${Number(cr.accuracy || 0).toFixed(1)}% across Rs. ${((Number(cr.totalValINR) || 0) / 1_00_000).toFixed(2)}L combined family net worth.`,
+          orders: Array.isArray(cr.orders) ? cr.orders : [],
+          appUrl
+        });
+
+        const delivery = await sendHouseholdEmail({
+          householdId,
+          to: opts.toEmail,
+          subject: content.subject,
+          text: content.text,
+          html: content.html
+        });
+
+        if (delivery.sent) {
+          await addNotificationPg({
+            householdId,
+            type: "rebalance",
+            severity: "info",
+            title: opts.mode === "sip" ? "Zero-Sell SIP Plan Emailed" : "Rebalance Report Emailed",
+            message: `Sent ${opts.mode === "sip" ? "Zero-Sell SIP plan" : "rebalance execution plan"} to ${opts.toEmail} (${Number(cr.accuracy || 0).toFixed(1)}% aligned).`,
+            createdAt: Date.now()
+          }).catch(() => {});
+        }
+        return delivery;
+      }
+
+      const idToken = await resolveHouseholdMemberToken(householdId, opts?.idToken);
+      if (!idToken) {
+        return {
+          sent: false,
+          provider: "none",
+          error: "Could not authenticate household data session. Open Rebalance while signed in and click 'Email Rebalance Plan'."
+        };
+      }
+
+      const hhRaw = await firestoreRestGet(`households/${householdId}`, idToken);
+      const household = parseFirestoreDoc(hhRaw);
+      if (!household) {
+        return { sent: false, error: "Household not found" };
+      }
+
+      if (household.settings?.emailAlertsEnabled === false && !force) {
+        return { sent: false, skipped: true, reason: "Email alerts disabled for this household" };
+      }
+
+      const holdings = await firestoreRestQueryHoldings(householdId, idToken);
+      if (holdings.length === 0) {
+        return { sent: false, error: "Add at least one holding to your portfolio before generating a rebalance report." };
+      }
+
+      let fxRate = 84.0;
+      try {
+        const fxRes = await axios.get("https://open.er-api.com/v6/latest/USD", { timeout: 6000 });
+        fxRate = fxRes.data?.rates?.INR || 84.0;
+      } catch {}
 
       let totalValINR = 0;
       let equityValINR = 0;
+      let debtValINR = 0;
+      let indianEqINR = 0;
+      let foreignEqINR = 0;
+
       holdings.forEach((h: any) => {
-        const val = h.quantity * h.currentPrice;
-        const valINR = h.currency === 'USD' ? val * fxRate : val;
+        const qty = Number(h.quantity) || 0;
+        const price = Number(h.currentPrice) || 0;
+        const val = qty * price;
+        const isUsd = String(h.currency || "INR").toUpperCase() === "USD";
+        const valINR = isUsd ? val * fxRate : val;
         totalValINR += valINR;
-        if (h.assetClass === 'Equity' || h.assetClass === 'Mutual Fund') {
+        const cls = classifyAssetClassServer(h);
+        if (cls === "Debt") {
+          debtValINR += valINR;
+        } else {
           equityValINR += valINR;
+          if (isUsd) foreignEqINR += valINR;
+          else indianEqINR += valINR;
         }
       });
 
-      if (totalValINR === 0) return;
+      if (totalValINR <= 0) {
+        return { sent: false, error: "Total portfolio value is zero." };
+      }
 
       const actualEquityPct = equityValINR / totalValINR;
-      const targetEquityPct = household.targets.assetSplit.Equity || 0.7;
+      const targetEquityPct = Number(household.targets?.assetSplit?.Equity ?? 0.7);
+      const targetDebtPct = Number(household.targets?.assetSplit?.Debt ?? (1 - targetEquityPct));
+      const targetIndianSplit = Number(household.targets?.equitySplit?.Indian ?? 0.6);
+      const targetForeignSplit = Number(household.targets?.equitySplit?.Foreign ?? 0.4);
       const drift = Math.abs(actualEquityPct - targetEquityPct);
-      const accuracy = 100 - (drift * 100);
-      const threshold = household.settings?.accuracyThreshold || 95;
+      const accuracy = Math.max(0, 100 - drift * 100);
+      const threshold = Number(household.settings?.accuracyThreshold ?? 95);
 
-      if (accuracy < threshold || force) {
-        const lastSent = household.settings?.lastAlertSent;
-        const now = Date.now();
-        if (!force && lastSent && (now - lastSent < 24 * 60 * 60 * 1000)) return;
-
-        const members = household.members || [];
-        if (members.length === 0) return;
-        const adminUserSnap = await firestore.collection('users').doc(members[0]).get();
-        if (!adminUserSnap.exists) return;
-        const adminUser = adminUserSnap.data() as any;
-
-        const summary = `Hi ${adminUser.name},
-
-Your portfolio allocation at UnityWealth requires attention. Accuracy: ${accuracy.toFixed(1)}% (Threshold: ${threshold}%)
-
-Current Allocation:
-- Equity: ${(actualEquityPct * 100).toFixed(1)}%
-- Debt: ${((1 - actualEquityPct) * 100).toFixed(1)}%
-
-Best regards,
-UnityWealth Team`;
-
-        await logEmail(adminUser.email, "[UnityWealth] Rebalance Alert", summary);
-        await hhSnap.ref.update({ 'settings.lastAlertSent': now });
+      if (accuracy >= threshold && !force) {
+        return { sent: false, skipped: true, accuracy, reason: "Portfolio is already within target threshold" };
       }
-    } catch (e) {
-      console.error("Alert task error:", e);
+
+      const lastSentKey = `rebalance_last_sent:${householdId}`;
+      const lastSent = (await getAppStateKeyPg<number>(lastSentKey)) || Number(household.settings?.lastAlertSent || 0);
+      const now = Date.now();
+      if (!force && lastSent && now - lastSent < 24 * 60 * 60 * 1000) {
+        return { sent: false, skipped: true, reason: "Alert already sent within the last 24 hours" };
+      }
+
+      // Resolve recipient email
+      let recipientEmail = (opts?.toEmail || "").trim();
+      let recipientName = (opts?.recipientName || "").trim();
+      if (!recipientEmail) {
+        const members: string[] = Array.isArray(household.members) ? household.members : [];
+        for (const mId of members) {
+          const prof = household.settings?.memberProfiles?.[mId];
+          if (prof?.email && prof.email.includes("@")) {
+            recipientEmail = prof.email;
+            recipientName = prof.name || "Investor";
+            break;
+          }
+          try {
+            const uDoc = parseFirestoreDoc(await firestoreRestGet(`users/${mId}`, idToken));
+            if (uDoc?.email && uDoc.email.includes("@")) {
+              recipientEmail = uDoc.email;
+              recipientName = uDoc.name || "Investor";
+              break;
+            }
+          } catch {}
+        }
+      }
+
+      if (!recipientEmail) {
+        return { sent: false, error: "Could not find a recipient email address for this household." };
+      }
+
+      const fmtINR = (v: number) => `Rs. ${Math.round(Math.abs(v)).toLocaleString("en-IN")}`;
+      const fmtUSD = (v: number) => `$${Math.round(Math.abs(v / fxRate)).toLocaleString("en-US")}`;
+      const mode = opts?.mode === "sip" ? "sip" : "full";
+      const orders: { type: string; title: string; category: string; amount: string; description: string }[] = [];
+
+      if (mode === "sip") {
+        const sipInflow = Math.max(1000, Number(opts?.freshInflowINR) || 100_000);
+        const newTotal = totalValINR + sipInflow;
+        const gapInd = Math.max(0, newTotal * targetEquityPct * targetIndianSplit - indianEqINR);
+        const gapUs = Math.max(0, newTotal * targetEquityPct * targetForeignSplit - foreignEqINR);
+        const gapDebt = Math.max(0, newTotal * targetDebtPct - debtValINR);
+        const gapSum = gapInd + gapUs + gapDebt || 1;
+        if (gapInd > 0) {
+          const alloc = (sipInflow * gapInd) / gapSum;
+          orders.push({ type: "buy", title: "Indian Equity SIP", category: "Zero-Sell Inflow", amount: fmtINR(alloc), description: "Route fresh monthly capital into Indian Equity" });
+        }
+        if (gapUs > 0) {
+          const alloc = (sipInflow * gapUs) / gapSum;
+          orders.push({ type: "buy", title: "US / Foreign Equity SIP", category: "Zero-Sell Inflow", amount: `${fmtUSD(alloc)} (${fmtINR(alloc)})`, description: "Route fresh monthly capital into US Equity" });
+        }
+        if (gapDebt > 0) {
+          const alloc = (sipInflow * gapDebt) / gapSum;
+          orders.push({ type: "buy", title: "Arbitrage / Debt Fund SIP", category: "Zero-Sell Inflow", amount: fmtINR(alloc), description: "Park fresh inflow in tax-efficient Arbitrage/Debt" });
+        }
+      } else {
+        const targetIndINR = totalValINR * targetEquityPct * targetIndianSplit;
+        const targetUsINR = totalValINR * targetEquityPct * targetForeignSplit;
+        const targetDebtINR = totalValINR * targetDebtPct;
+        const diffInd = targetIndINR - indianEqINR;
+        const diffUs = targetUsINR - foreignEqINR;
+        const diffDebt = targetDebtINR - debtValINR;
+        if (Math.abs(diffInd) > 2500) {
+          orders.push({
+            type: diffInd > 0 ? "buy" : "sell",
+            title: "Indian Equity / Mutual Funds",
+            category: "Domestic Equity",
+            amount: fmtINR(diffInd),
+            description: diffInd > 0 ? "Underweight vs target Indian Equity split" : "Trim overweight Indian Equity"
+          });
+        }
+        if (Math.abs(diffUs) > 2500) {
+          orders.push({
+            type: diffUs > 0 ? "buy" : "sell",
+            title: "US / Global Equity Sleeve",
+            category: "Foreign Equity",
+            amount: `${fmtUSD(diffUs)} (${fmtINR(diffUs)})`,
+            description: diffUs > 0 ? "Add to US Equity sleeve" : "Trim overweight US Equity sleeve"
+          });
+        }
+        if (Math.abs(diffDebt) > 2500) {
+          orders.push({
+            type: diffDebt > 0 ? "buy" : "sell",
+            title: "Arbitrage / Fixed Income Reserve",
+            category: "Debt & Arbitrage",
+            amount: fmtINR(diffDebt),
+            description: diffDebt > 0 ? "Add stability via Arbitrage/Liquid funds" : "Redeploy surplus Debt into Equity"
+          });
+        }
+      }
+
+      const indianEqShare = equityValINR > 0 ? indianEqINR / equityValINR : 0;
+      const foreignEqShare = equityValINR > 0 ? foreignEqINR / equityValINR : 0;
+      const executiveSummary =
+        accuracy >= threshold
+          ? `${household.name || "Your family portfolio"} is well aligned at ${accuracy.toFixed(1)}% against your ${(targetEquityPct * 100).toFixed(0)}/${(targetDebtPct * 100).toFixed(0)} Equity/Debt target.`
+          : `${household.name || "Your family portfolio"} is currently at ${(actualEquityPct * 100).toFixed(1)}% Equity vs your ${(targetEquityPct * 100).toFixed(0)}% target (${accuracy.toFixed(1)}% alignment vs ${threshold}% threshold). Review the recommended ${mode === "sip" ? "Zero-Sell SIP routing" : "rebalance trades"} below.`;
+
+      const content = buildRebalanceEmailContent({
+        householdName: household.name || "Family Portfolio",
+        recipientName: recipientName || "Investor",
+        totalValINR,
+        totalValUSD: totalValINR / fxRate,
+        accuracy,
+        threshold,
+        actualEquityPct,
+        targetEquityPct,
+        indianEquityPctOfEq: indianEqShare,
+        foreignEquityPctOfEq: foreignEqShare,
+        mode,
+        executiveSummary,
+        orders,
+        appUrl
+      });
+
+      const delivery = await sendHouseholdEmail({
+        householdId,
+        to: recipientEmail,
+        subject: content.subject,
+        text: content.text,
+        html: content.html
+      });
+
+      if (delivery.sent) {
+        await setAppStateKeyPg(lastSentKey, now);
+        await addNotificationPg({
+          householdId,
+          type: "rebalance",
+          severity: accuracy < threshold ? "warning" : "info",
+          title: mode === "sip" ? "Zero-Sell SIP Plan Emailed" : "Rebalance Alert Emailed",
+          message: `Delivered ${mode === "sip" ? "Zero-Sell SIP plan" : "rebalance report"} (${accuracy.toFixed(1)}% aligned) to ${recipientEmail}.`,
+          createdAt: now
+        }).catch(() => {});
+      }
+
+      return {
+        ...delivery,
+        recipientEmail,
+        accuracy
+      };
+    } catch (e: any) {
+      console.error("[Rebalance Email Error]", e?.response?.data || e.message);
+      return {
+        sent: false,
+        error: e?.response?.data?.error?.message || e.message || "Rebalance email check failed"
+      };
     }
   }
 
   app.post("/api/settings/notifications", (req, res) => {
     const { householdId, enabled, threshold } = req.body;
     const db = getDB();
-    if (!db.households[householdId]) return res.status(404).json({ error: "Household not found" });
-    
+    if (!db.households[householdId]) {
+      db.households[householdId] = { id: householdId, settings: {} };
+    }
     if (!db.households[householdId].settings) db.households[householdId].settings = {};
     db.households[householdId].settings.emailAlertsEnabled = enabled;
     db.households[householdId].settings.accuracyThreshold = threshold;
@@ -2439,9 +2969,56 @@ UnityWealth Team`;
   });
 
   app.post("/api/rebalance/check-now", async (req, res) => {
-    const { householdId } = req.body;
-    await checkAndSendRebalanceAlert(householdId, true);
-    res.json({ success: true, message: "Check initiated. If accuracy is below threshold, an email will be sent or logged." });
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : String(req.body?.idToken || "");
+    const { householdId, toEmail, recipientName, mode, freshInflowINR } = req.body || {};
+    const host = req.get("host");
+    const proto = req.get("x-forwarded-proto") || (host?.includes("localhost") ? "http" : "https");
+    const baseUrl = (process.env.APP_URL || `${proto}://${host}`).replace(/\/$/, "");
+
+    const outcome = await checkAndSendRebalanceAlert(householdId, true, {
+      idToken: idToken || undefined,
+      toEmail,
+      recipientName,
+      mode,
+      freshInflowINR,
+      baseUrl
+    });
+
+    res.json({
+      success: Boolean(outcome?.sent),
+      message: outcome?.sent
+        ? `Rebalance report emailed to ${outcome.recipientEmail || toEmail} via ${outcome.senderEmail || outcome.provider}.`
+        : (outcome?.error || "Email was not sent automatically."),
+      ...outcome
+    });
+  });
+
+  app.post("/api/rebalance/send-email", async (req, res) => {
+    const authHeader = req.headers.authorization || "";
+    const idToken = authHeader.startsWith("Bearer ") ? authHeader.slice(7).trim() : String(req.body?.idToken || "");
+    const { householdId, toEmail, recipientName, mode, freshInflowINR, clientReport } = req.body || {};
+    const host = req.get("host");
+    const proto = req.get("x-forwarded-proto") || (host?.includes("localhost") ? "http" : "https");
+    const baseUrl = (process.env.APP_URL || `${proto}://${host}`).replace(/\/$/, "");
+
+    const outcome = await checkAndSendRebalanceAlert(householdId, true, {
+      idToken: idToken || undefined,
+      toEmail,
+      recipientName,
+      mode,
+      freshInflowINR,
+      clientReport,
+      baseUrl
+    });
+
+    res.json({
+      success: Boolean(outcome?.sent),
+      message: outcome?.sent
+        ? `Rebalance plan emailed to ${outcome.recipientEmail || toEmail} via ${outcome.senderEmail || outcome.provider}.`
+        : (outcome?.error || "Outgoing email sender not connected yet."),
+      ...outcome
+    });
   });
 
   app.post("/api/targets/:householdId", (req, res) => {
@@ -2450,7 +3027,7 @@ UnityWealth Team`;
     
     db.households[req.params.householdId].targets = req.body;
     saveDB(db);
-    checkAndSendRebalanceAlert(req.params.householdId); // Trigger check on target update
+    checkAndSendRebalanceAlert(req.params.householdId).catch(() => {}); // Trigger check on target update
     res.json(db.households[req.params.householdId]);
   });
 
@@ -2863,8 +3440,12 @@ BROKER, TICKER & CURRENCY RULES:
     setInterval(() => {
       console.log("[MONITOR] Running background rebalance check for all households...");
       const db = getDB();
-      Object.keys(db.households).forEach(householdId => {
-        checkAndSendRebalanceAlert(householdId).catch(err => console.error("Monitor failed for", householdId, err));
+      const allHouseholdIds = new Set<string>([
+        ...Object.keys(db.households || {}),
+        ...Object.values(db.inviteCodes || {}).map((e: any) => e?.householdId).filter(Boolean)
+      ]);
+      allHouseholdIds.forEach(householdId => {
+        checkAndSendRebalanceAlert(householdId, false).catch(err => console.error("Monitor failed for", householdId, err));
       });
     }, 4 * 60 * 60 * 1000);
   });

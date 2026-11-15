@@ -47,11 +47,16 @@ import {
   Activity,
   Landmark,
   Menu,
+  LogOut,
+  ExternalLink,
+  Send,
+  User as UserIcon,
 } from 'lucide-react';
 import { WealthJourneyView, WealthSnapshotItem, formatCompactINR } from './components/WealthJourneyView';
 import { MarketPulseRibbon } from './components/MarketPulseRibbon';
 import { NotificationDrawer, AppNotificationItem, SmartInsightAlert } from './components/NotificationDrawer';
 import { QuickAddModal } from './components/QuickAddModal';
+import { ProfileFamilyModal, EmailStatusInfo } from './components/ProfileFamilyModal';
 import { motion, AnimatePresence } from 'motion/react';
 import { 
   PieChart, 
@@ -190,6 +195,17 @@ export default function App() {
   const [showNotifications, setShowNotifications] = useState(false);
   const [showQuickAddModal, setShowQuickAddModal] = useState(false);
   const [quickAddInitialMode, setQuickAddInitialMode] = useState<'search' | 'preset' | 'upload'>('search');
+  const [showProfileModal, setShowProfileModal] = useState(false);
+  const [profileModalSection, setProfileModalSection] = useState<'profile' | 'family' | 'email'>('profile');
+  const [emailStatus, setEmailStatus] = useState<EmailStatusInfo | null>(null);
+  const [lastInviteResult, setLastInviteResult] = useState<{
+    sent: boolean;
+    email: string;
+    senderEmail?: string;
+    error?: string;
+    gmailComposeUrl?: string;
+    mailtoUrl?: string;
+  } | null>(null);
   const autoSnapDoneRef = useRef<string>('');
   const [joinCodeInput, setJoinCodeInput] = useState('');
   const [isJoiningFamily, setIsJoiningFamily] = useState(false);
@@ -423,29 +439,89 @@ export default function App() {
     return () => unsubHoldings();
   }, [user?.householdId, household]);
 
+  const fetchEmailStatus = async (hhId?: string | null) => {
+    try {
+      const targetHh = hhId ?? user?.householdId ?? '';
+      const q = targetHh ? `?householdId=${encodeURIComponent(targetHh)}` : '';
+      const res = await fetch(`/api/email/status${q}`);
+      if (res.ok) {
+        const st = await res.json();
+        setEmailStatus(st);
+      }
+    } catch {
+      // non-fatal
+    }
+  };
+
   useEffect(() => {
     fetchFxRates();
   }, []);
+
+  useEffect(() => {
+    fetchEmailStatus(user?.householdId);
+  }, [user?.householdId]);
+
+  useEffect(() => {
+    const onMessage = (ev: MessageEvent) => {
+      if (ev?.data?.type === 'OAUTH_EMAIL_CONNECTED') {
+        fetchEmailStatus(user?.householdId);
+        setNotification({
+          message: `Gmail sender connected (${ev.data.senderEmail || 'Authorized'})! Invites & rebalance alerts are now live.`,
+          type: 'success'
+        });
+      }
+    };
+    window.addEventListener('message', onMessage);
+    try {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('emailConnected') === '1') {
+        params.delete('emailConnected');
+        const next = window.location.pathname + (params.toString() ? `?${params.toString()}` : '');
+        window.history.replaceState({}, '', next);
+        fetchEmailStatus(user?.householdId);
+        setNotification({ message: 'Gmail outgoing email sender connected!', type: 'success' });
+      }
+    } catch {}
+    return () => window.removeEventListener('message', onMessage);
+  }, [user?.householdId]);
 
   const handleGoogleAuth = async () => {
     setLoading(true);
     setNotification(null);
     try {
       const provider = new GoogleAuthProvider();
+      provider.addScope('https://www.googleapis.com/auth/gmail.send');
       provider.setCustomParameters({ prompt: 'select_account' });
       const result = await signInWithPopup(auth, provider);
-      const user = result.user;
-      
-      setNotification({ message: `Welcome, ${user.displayName || user.email || 'User'}!`, type: 'success' });
+      const fbUser = result.user;
+      const credential = GoogleAuthProvider.credentialFromResult(result);
+      if (credential?.accessToken) {
+        try {
+          const idToken = await fbUser.getIdToken();
+          await fetch('/api/email/save-google-token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+            body: JSON.stringify({
+              householdId: user?.householdId || null,
+              accessToken: credential.accessToken,
+              senderEmail: fbUser.email,
+              senderName: fbUser.displayName || fbUser.email
+            })
+          });
+          fetchEmailStatus(user?.householdId);
+        } catch {}
+      }
+
+      setNotification({ message: `Welcome, ${fbUser.displayName || fbUser.email || 'User'}!`, type: 'success' });
       setShowSyncModal(false);
     } catch (e: any) {
       setLoading(false);
       console.error("Google Auth error:", e);
       let msg = e.message;
       if (e.code === 'auth/popup-blocked') {
-        msg = "Pop-up was blocked by your browser. Please allow pop-ups for this site, or sign in using Email & Password or the 1-Click Demo.";
+        msg = "Pop-up was blocked by your browser. Please allow pop-ups for this site, or sign in using Email & Password.";
       } else if (e.code === 'auth/unauthorized-domain') {
-        msg = "This hosted domain is not yet whitelisted in Firebase Auth for Google OAuth. Please sign in with Email & Password or use the 1-Click Demo Account!";
+        msg = "This hosted domain is not yet whitelisted in Firebase Auth for Google OAuth. Please sign in with Email & Password or use an API key for outgoing email.";
       } else if (e.code === 'auth/account-exists-with-different-credential') {
         msg = "This email is already associated with a password login. Please sign in using your email and password.";
       } else if (e.code === 'auth/popup-closed-by-user') {
@@ -455,6 +531,94 @@ export default function App() {
       }
       setNotification({ message: msg, type: 'error' });
     }
+  };
+
+  const authorizeGmailViaPopup = async () => {
+    if (!auth.currentUser) throw new Error('Please sign in first.');
+    const provider = new GoogleAuthProvider();
+    provider.addScope('https://www.googleapis.com/auth/gmail.send');
+    provider.setCustomParameters({ prompt: 'consent select_account' });
+    // Note: Do NOT replace current Firebase session if user signed in via email/password — capture credential on a secondary flow or link if same account:
+    // Actually signInWithPopup on a standalone secondary auth or direct server OAuth avoids logging out email/password users!
+    // Let's try Firebase popup only if current user is Google OR fall back to /api/auth/google/url popup if different!
+    const isGoogleProvider = auth.currentUser.providerData?.some((p) => p.providerId === 'google.com');
+    if (isGoogleProvider) {
+      const result = await signInWithPopup(auth, provider);
+      const cred = GoogleAuthProvider.credentialFromResult(result);
+      if (!cred?.accessToken) {
+        throw new Error('Google did not return a Gmail send token. Please check the permission box in the popup.');
+      }
+      const idToken = await auth.currentUser.getIdToken();
+      const res = await fetch('/api/email/save-google-token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+        body: JSON.stringify({
+          householdId: user?.householdId || null,
+          accessToken: cred.accessToken,
+          senderEmail: result.user.email,
+          senderName: user?.name || result.user.displayName || result.user.email
+        })
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || 'Failed to save Gmail authorization');
+      }
+      await fetchEmailStatus(user?.householdId);
+      return;
+    }
+
+    // For Email/Password users, open the server Google OAuth popup so their current Firebase session is preserved!
+    await connectGoogleOfflineOAuth();
+  };
+
+  const connectGoogleOfflineOAuth = async () => {
+    const q = new URLSearchParams({
+      householdId: user?.householdId || '',
+      userId: user?.id || ''
+    });
+    const res = await fetch(`/api/auth/google/url?${q.toString()}`);
+    if (!res.ok) throw new Error('Google OAuth is not configured on this server.');
+    const { url } = await res.json();
+    const w = 520;
+    const h = 640;
+    const left = window.screenX + Math.max(0, (window.outerWidth - w) / 2);
+    const top = window.screenY + Math.max(0, (window.outerHeight - h) / 2);
+    const popup = window.open(url, 'uw_google_oauth', `width=${w},height=${h},left=${left},top=${top}`);
+    if (!popup) {
+      window.location.href = url;
+    }
+  };
+
+  const handleSaveEmailProviderConfig = async (cfg: {
+    provider: 'brevo' | 'resend' | 'gmail_smtp' | 'disconnect';
+    senderEmail?: string;
+    apiKey?: string;
+  }) => {
+    if (!auth.currentUser) throw new Error('Please sign in first.');
+    const idToken = await auth.currentUser.getIdToken();
+    const res = await fetch('/api/email/configure-provider', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+      body: JSON.stringify({
+        householdId: user?.householdId || null,
+        ...cfg
+      })
+    });
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || 'Failed to configure email provider');
+    if (json.status) setEmailStatus(json.status);
+  };
+
+  const handleSendTestEmailTo = async (recipientEmail: string) => {
+    const res = await fetch('/api/email/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        email: recipientEmail,
+        householdId: user?.householdId || null
+      })
+    });
+    return await res.json();
   };
 
   const fetchInvites = async () => {
@@ -1072,6 +1236,266 @@ export default function App() {
     setData(null);
   };
 
+  const openProfileSettings = (section: 'profile' | 'family' | 'email' = 'profile') => {
+    setProfileModalSection(section);
+    setShowProfileModal(true);
+    setIsMenuOpen(false);
+  };
+
+  const handleUpdateProfileName = async (rawName: string) => {
+    const cleanName = (rawName || '').trim();
+    if (!user || !cleanName) return;
+
+    if (auth.currentUser) {
+      try {
+        await updateProfile(auth.currentUser, { displayName: cleanName });
+      } catch {
+        // non-fatal
+      }
+    }
+
+    await updateDoc(doc(db, 'users', user.id), {
+      name: cleanName,
+      updatedAt: serverTimestamp()
+    });
+
+    if (user.householdId) {
+      try {
+        const hhRef = doc(db, 'households', user.householdId);
+        const hhSnap = await getDoc(hhRef);
+        if (hhSnap.exists()) {
+          const existingSettings = hhSnap.data().settings || {};
+          await updateDoc(hhRef, {
+            settings: {
+              ...existingSettings,
+              memberProfiles: {
+                ...(existingSettings.memberProfiles || {}),
+                [user.id]: {
+                  id: user.id,
+                  name: cleanName,
+                  email: user.email
+                }
+              }
+            }
+          });
+        }
+
+        if (auth.currentUser) {
+          const idToken = await auth.currentUser.getIdToken();
+          await fetch('/api/household/invite-code', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+            body: JSON.stringify({
+              householdId: user.householdId,
+              householdName: household?.name,
+              inviterName: cleanName,
+              refreshToken: auth.currentUser.refreshToken,
+              preferredCode: householdInviteCode || household?.settings?.inviteCode
+            })
+          }).catch(() => {});
+        }
+      } catch (e) {
+        console.warn('Household member profile sync warning:', e);
+      }
+    }
+
+    setUser((prev) => (prev ? { ...prev, name: cleanName } : null));
+    setNotification({ message: `Display name updated to "${cleanName}"!`, type: 'success' });
+  };
+
+  const handleUpdateHouseholdName = async (rawHhName: string) => {
+    const cleanName = (rawHhName || '').trim();
+    if (!user?.householdId || !cleanName) return;
+    await updateDoc(doc(db, 'households', user.householdId), { name: cleanName });
+    if (auth.currentUser) {
+      try {
+        const idToken = await auth.currentUser.getIdToken();
+        await fetch('/api/household/invite-code', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${idToken}` },
+          body: JSON.stringify({
+            householdId: user.householdId,
+            householdName: cleanName,
+            inviterName: user.name,
+            refreshToken: auth.currentUser.refreshToken,
+            preferredCode: householdInviteCode || household?.settings?.inviteCode
+          })
+        });
+      } catch {}
+    }
+    setNotification({ message: `Family renamed to "${cleanName}"!`, type: 'success' });
+  };
+
+  const handleRenameMember = async (memberId: string, rawName: string) => {
+    const cleanName = (rawName || '').trim();
+    if (!user?.householdId || !cleanName) return;
+    if (memberId === user.id) {
+      await handleUpdateProfileName(cleanName);
+      return;
+    }
+
+    const hhRef = doc(db, 'households', user.householdId);
+    const hhSnap = await getDoc(hhRef);
+    if (!hhSnap.exists()) return;
+    const hhData = hhSnap.data();
+    const existingSettings = hhData.settings || {};
+    const prevManual: any[] = Array.isArray(existingSettings.manualMembers) ? existingSettings.manualMembers : [];
+    const updatedManual = prevManual.map((m: any) => (m.id === memberId ? { ...m, name: cleanName } : m));
+    const prevProfiles = existingSettings.memberProfiles || {};
+    const existingProf = prevProfiles[memberId];
+
+    await updateDoc(hhRef, {
+      settings: {
+        ...existingSettings,
+        manualMembers: updatedManual,
+        memberProfiles: existingProf
+          ? { ...prevProfiles, [memberId]: { ...existingProf, name: cleanName } }
+          : prevProfiles
+      }
+    });
+    setNotification({ message: `Updated member name to "${cleanName}".`, type: 'success' });
+  };
+
+  const handleLeaveFamily = async (mode: 'solo_keep_holdings' | 'setup_screen') => {
+    if (!user?.householdId) return;
+    const oldHouseholdId = user.householdId;
+    const oldHouseholdName = household?.name || 'Family Portfolio';
+
+    // Capture own holdings before modifying membership
+    const myHoldings = (data?.holdings || []).filter(
+      (h) => getHoldingOwnerId(h) === user.id && h.id && !String(h.id).startsWith('placeholder-')
+    );
+    const savedTargets = household?.targets || {
+      assetSplit: { Equity: 0.70, Debt: 0.30 },
+      equitySplit: { Indian: 0.60, Foreign: 0.40 },
+      foreignBreakdown: [
+        {
+          name: 'Magnificent 7',
+          percentage: 100,
+          tickerWeights: [
+            { ticker: 'GOOGL', weight: 15 },
+            { ticker: 'MSFT', weight: 15 },
+            { ticker: 'AAPL', weight: 15 },
+            { ticker: 'AMZN', weight: 15 },
+            { ticker: 'NVDA', weight: 15 },
+            { ticker: 'META', weight: 15 },
+            { ticker: 'TSLA', weight: 10 }
+          ]
+        }
+      ]
+    };
+
+    // Notify remaining members while still authorized on oldHouseholdId
+    await pushHouseholdNotification({
+      category: 'family',
+      severity: 'info',
+      title: `${user.name} left ${oldHouseholdName}`,
+      message: `${user.name} unlinked from the shared family portfolio.`
+    });
+
+    // Step 1: Delete own holdings from old household while still a member (required by Firestore rules)
+    if (myHoldings.length > 0) {
+      const delBatch = writeBatch(db);
+      myHoldings.forEach((h) => delBatch.delete(doc(db, 'holdings', h.id)));
+      await delBatch.commit();
+    }
+
+    // Step 2 & 3: Remove cached profile from settings, then remove user.id from members (if other members remain)
+    const oldHhRef = doc(db, 'households', oldHouseholdId);
+    const oldHhSnap = await getDoc(oldHhRef);
+    if (oldHhSnap.exists()) {
+      const hhData = oldHhSnap.data();
+      const existingSettings = hhData.settings || {};
+      const nextProfiles = { ...(existingSettings.memberProfiles || {}) };
+      delete nextProfiles[user.id];
+
+      await updateDoc(oldHhRef, {
+        settings: {
+          ...existingSettings,
+          memberProfiles: nextProfiles
+        }
+      });
+
+      const currentMembers: string[] = Array.isArray(hhData.members) ? hhData.members : [];
+      const nextMembers = currentMembers.filter((mId) => mId !== user.id);
+      if (nextMembers.length > 0) {
+        await updateDoc(oldHhRef, { members: nextMembers });
+      }
+    }
+
+    if (mode === 'setup_screen') {
+      await updateDoc(doc(db, 'users', user.id), {
+        householdId: null,
+        updatedAt: serverTimestamp()
+      });
+      setDashboardView('combined');
+      setActiveTab('dashboard');
+      setHousehold(null);
+      setData(null);
+      setUser((prev) => (prev ? { ...prev, householdId: null } : null));
+      setNotification({
+        message: `You left "${oldHouseholdName}". Create a new portfolio or join a family by code anytime.`,
+        type: 'success'
+      });
+      return;
+    }
+
+    // mode === 'solo_keep_holdings': Create fresh personal solo portfolio & migrate own holdings
+    const newHhId = 'h_' + Math.random().toString(36).slice(2, 11);
+    const newInviteCode = generateClientInviteCode();
+    const firstName = user.name.split(' ')[0] || user.name;
+    const soloName = `${firstName}'s Personal Portfolio`;
+
+    await setDoc(doc(db, 'households', newHhId), {
+      name: soloName,
+      members: [user.id],
+      settings: {
+        inviteCode: newInviteCode,
+        memberProfiles: {
+          [user.id]: { id: user.id, name: user.name, email: user.email }
+        }
+      },
+      targets: savedTargets
+    });
+
+    // Update users/{uid}.householdId BEFORE creating holdings in newHhId (enforced by Firestore rules)
+    await updateDoc(doc(db, 'users', user.id), {
+      householdId: newHhId,
+      updatedAt: serverTimestamp()
+    });
+
+    if (myHoldings.length > 0) {
+      const createBatch = writeBatch(db);
+      myHoldings.forEach((oldH) => {
+        const hid = 'h_' + Math.random().toString(36).slice(2, 11);
+        createBatch.set(doc(db, 'holdings', hid), {
+          userId: user.id,
+          ownerId: user.id,
+          householdId: newHhId,
+          ticker: oldH.ticker,
+          quantity: oldH.quantity,
+          assetClass: oldH.assetClass,
+          currency: oldH.currency,
+          provider: oldH.provider || 'Manual',
+          source: oldH.source || 'Manual',
+          currentPrice: oldH.currentPrice || 0,
+          originalName: oldH.originalName || oldH.ticker,
+          syncedAt: Date.now()
+        });
+      });
+      await createBatch.commit();
+    }
+
+    setDashboardView('combined');
+    setActiveTab('dashboard');
+    setHouseholdInviteCode(newInviteCode);
+    setUser((prev) => (prev ? { ...prev, householdId: newHhId } : null));
+    setNotification({
+      message: `Left "${oldHouseholdName}" and moved ${myHoldings.length} holding${myHoldings.length === 1 ? '' : 's'} to "${soloName}".`,
+      type: 'success'
+    });
+  };
+
   const [showInviteModal, setShowInviteModal] = useState(false);
   const [showAddMemberModal, setShowAddMemberModal] = useState(false);
   const [showManualEntryModal, setShowManualEntryModal] = useState(false);
@@ -1182,6 +1606,7 @@ export default function App() {
   const sendInvite = async () => {
     if (!user?.householdId || !inviteEmail.trim()) return;
     setIsInviting(true);
+    setLastInviteResult(null);
     try {
       const cleanEmail = inviteEmail.trim().toLowerCase();
       const codeToShare = householdInviteCode || household?.settings?.inviteCode || generateClientInviteCode();
@@ -1195,6 +1620,12 @@ export default function App() {
         status: 'pending'
       };
       await setDoc(doc(db, 'invites', inviteId), inviteData);
+
+      let emailSentNow = false;
+      let emailErrorMsg: string | undefined;
+      let gmailComposeUrl: string | undefined;
+      let mailtoUrl: string | undefined;
+      let senderEmailUsed: string | undefined;
 
       if (auth.currentUser) {
         const idToken = await auth.currentUser.getIdToken();
@@ -1216,18 +1647,39 @@ export default function App() {
         if (res.ok) {
           const info = await res.json();
           if (info.code) setHouseholdInviteCode(info.code);
+          emailSentNow = Boolean(info.emailSent);
+          emailErrorMsg = info.emailError;
+          gmailComposeUrl = info.gmailComposeUrl;
+          mailtoUrl = info.mailtoUrl;
+          senderEmailUsed = info.senderEmail;
         }
       }
 
+      setLastInviteResult({
+        sent: emailSentNow,
+        email: cleanEmail,
+        senderEmail: senderEmailUsed,
+        error: emailErrorMsg,
+        gmailComposeUrl,
+        mailtoUrl
+      });
+
       setInviteSent(true);
       setInviteEmail('');
-      setNotification({
-        message: `Added pending invite for ${cleanEmail}! Share code ${codeToShare} or the join link for instant access.`,
-        type: 'success'
-      });
+      if (emailSentNow) {
+        setNotification({
+          message: `Invitation email delivered to ${cleanEmail}${senderEmailUsed ? ` via ${senderEmailUsed}` : ''}!`,
+          type: 'success'
+        });
+      } else {
+        setNotification({
+          message: `Pre-approved ${cleanEmail} (Code: ${codeToShare}). Authorize Gmail or click 'Open in Gmail' in the dialog to deliver the email!`,
+          type: 'info'
+        });
+      }
       setTimeout(() => {
         setInviteSent(false);
-      }, 3000);
+      }, 3500);
     } catch (e: any) {
       handleFirestoreError(e, OperationType.CREATE, 'invites');
     } finally {
@@ -1254,7 +1706,6 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ email: user.email }),
       });
-      const json = await res.json();
       if (res.ok) {
         setNotification({ message: "CAS Request Sent! CAMS/KFintech will email you. Our system will sync it automatically.", type: 'success' });
         setShowSyncModal(false);
@@ -1265,19 +1716,22 @@ export default function App() {
   };
 
   const handleSendTestEmail = async () => {
-    const targetEmail = "hgarg5072@gmail.com";
+    const targetEmail = user?.email || "hgarg5072@gmail.com";
     try {
-      const res = await fetch('/api/debug/send-test-email', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ email: targetEmail }),
-      });
-      if (res.ok) {
-        setNotification({ message: `Test email sent to ${targetEmail}. Check your inbox!`, type: 'success' });
+      const json = await handleSendTestEmailTo(targetEmail);
+      if (json.sent) {
+        setNotification({
+          message: `Test email delivered to ${targetEmail} via ${json.senderEmail || json.provider}!`,
+          type: 'success'
+        });
       } else {
-        setNotification({ message: "Failed to send test email. Check server logs.", type: 'error' });
+        setNotification({
+          message: json.error || 'Outgoing email is not authorized yet — opening Email Setup.',
+          type: 'error'
+        });
+        openProfileSettings('email');
       }
-    } catch (e) {
+    } catch {
       setNotification({ message: "Error sending test email", type: 'error' });
     }
   };
@@ -1285,19 +1739,72 @@ export default function App() {
   const handleTriggerRebalanceCheck = async () => {
     if (!data?.household?.id) return;
     try {
+      const idToken = auth.currentUser ? await auth.currentUser.getIdToken() : '';
       const res = await fetch('/api/rebalance/check-now', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ householdId: data.household.id }),
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {})
+        },
+        body: JSON.stringify({
+          householdId: data.household.id,
+          toEmail: user?.email,
+          recipientName: user?.name
+        }),
       });
-      if (res.ok) {
-        setNotification({ message: "Rebalance check triggered! If accuracy is below threshold, an email will be sent.", type: 'success' });
+      const json = await res.json();
+      if (json.sent) {
+        setNotification({
+          message: `Rebalance report emailed to ${json.recipientEmail || user?.email} via ${json.senderEmail || json.provider}!`,
+          type: 'success'
+        });
       } else {
-        setNotification({ message: "Failed to trigger rebalance check.", type: 'error' });
+        setNotification({
+          message: json.error || 'Authorize Gmail in Email Settings to deliver automatic rebalance alerts.',
+          type: 'error'
+        });
+        if (!emailStatus?.configured) {
+          openProfileSettings('email');
+        }
       }
-    } catch (e) {
-      setNotification({ message: "Error triggering rebalance check", type: 'error' });
+    } catch {
+      setNotification({ message: "Error triggering rebalance email", type: 'error' });
     }
+  };
+
+  const handleSendRebalanceEmail = async (params: {
+    toEmail: string;
+    mode: 'full' | 'sip';
+    freshInflowINR?: number;
+    clientReport: any;
+  }) => {
+    if (!data?.household?.id) {
+      return { sent: false, error: 'Household not loaded' };
+    }
+    const idToken = auth.currentUser ? await auth.currentUser.getIdToken() : '';
+    const res = await fetch('/api/rebalance/send-email', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(idToken ? { Authorization: `Bearer ${idToken}` } : {})
+      },
+      body: JSON.stringify({
+        householdId: data.household.id,
+        toEmail: params.toEmail,
+        recipientName: user?.name || 'Investor',
+        mode: params.mode,
+        freshInflowINR: params.freshInflowINR,
+        clientReport: params.clientReport
+      })
+    });
+    const json = await res.json();
+    if (json.sent) {
+      setNotification({
+        message: `Emailed ${params.mode === 'sip' ? 'Zero-Sell SIP Plan' : 'Rebalance Plan'} to ${params.toEmail}!`,
+        type: 'success'
+      });
+    }
+    return json;
   };
 
   const refreshPrices = async () => {
@@ -1944,17 +2451,36 @@ export default function App() {
           </div>
         </div>
 
-        <div className="mt-8 pt-6 border-t border-slate-100 flex flex-col gap-4">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-full bg-indigo-50 border-2 border-white shadow-sm flex items-center justify-center text-indigo-600 font-bold">
-              {user.name.charAt(0)}
+        <div className="mt-8 pt-6 border-t border-slate-100 flex flex-col gap-3">
+          <button
+            type="button"
+            onClick={() => openProfileSettings('profile')}
+            aria-label="Edit Profile and Family Settings"
+            className="flex items-center justify-between gap-2.5 p-2 -mx-2 rounded-xl hover:bg-slate-50 transition-colors text-left group"
+          >
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="w-10 h-10 rounded-full bg-indigo-50 border-2 border-white shadow-sm flex items-center justify-center text-indigo-600 font-bold shrink-0">
+                {user.name.charAt(0)}
+              </div>
+              <div className="overflow-hidden">
+                <p className="text-sm font-bold truncate text-slate-900 group-hover:text-indigo-600 transition-colors">{user.name}</p>
+                <p className="text-[11px] text-slate-500 truncate">Profile &amp; Family</p>
+              </div>
             </div>
-            <div className="overflow-hidden">
-              <p className="text-sm font-bold truncate">{user.name}</p>
-              <p className="text-xs text-slate-500">Premium Plan</p>
-            </div>
+            <Pencil size={14} className="text-slate-400 group-hover:text-indigo-600 shrink-0" />
+          </button>
+          <div className="flex items-center justify-between gap-2 pt-1">
+            <button
+              type="button"
+              onClick={() => openProfileSettings('family')}
+              className="text-xs text-slate-600 font-bold hover:text-indigo-600 text-left"
+            >
+              Leave / Switch Family
+            </button>
+            <button type="button" onClick={logout} className="text-xs text-rose-500 font-bold hover:underline text-right">
+              Logout
+            </button>
           </div>
-          <button onClick={logout} className="text-xs text-rose-500 font-bold hover:underline text-left">Logout Session</button>
         </div>
       </aside>
 
@@ -2028,6 +2554,16 @@ export default function App() {
                 className={`p-2 text-slate-500 hover:text-slate-800 hover:bg-slate-100 rounded-xl transition-colors ${isSaving ? 'animate-spin text-indigo-600' : ''}`}
               >
                 <RefreshCcw size={18} />
+              </button>
+
+              <button
+                type="button"
+                aria-label="Open profile and family settings"
+                onClick={() => openProfileSettings('profile')}
+                className="w-8 h-8 rounded-full bg-indigo-50 hover:bg-indigo-100 border border-indigo-200 text-indigo-700 font-black text-xs flex items-center justify-center transition-colors shrink-0"
+                title={`${user.name} — Profile & Family Settings`}
+              >
+                {(user.name || 'U').charAt(0).toUpperCase()}
               </button>
             </div>
           </div>
@@ -2440,7 +2976,16 @@ export default function App() {
 
             {activeTab === 'rebalance' && (
               <motion.div key="rebalance" initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: -20 }}>
-                <RebalanceView stats={stats} fxRates={fxRates} />
+                <RebalanceView
+                  stats={stats}
+                  fxRates={fxRates}
+                  householdName={data.household.name}
+                  defaultEmail={user.email}
+                  threshold={data.household.settings?.accuracyThreshold ?? 95}
+                  emailStatus={emailStatus}
+                  onOpenEmailSettings={() => openProfileSettings('email')}
+                  onSendRebalanceEmail={handleSendRebalanceEmail}
+                />
               </motion.div>
             )}
 
@@ -2460,11 +3005,45 @@ export default function App() {
 
             {activeTab === 'accounts' && (
               <motion.div key="accounts" initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} className="max-w-4xl mx-auto space-y-6">
+                {/* Profile & Family Controls Card */}
+                <div className="bg-white p-4 md:p-6 rounded-xl border border-slate-200 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                  <div className="flex items-center gap-3.5 min-w-0">
+                    <div className="w-11 h-11 rounded-2xl bg-indigo-600 text-white font-black text-base flex items-center justify-center shrink-0">
+                      {(user.name || 'U')[0]?.toUpperCase()}
+                    </div>
+                    <div className="min-w-0">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <h3 className="text-sm sm:text-base font-black text-slate-900 truncate">{user.name}</h3>
+                        <span className="text-[10px] font-black uppercase px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-100">
+                          {data.household.name}
+                        </span>
+                      </div>
+                      <p className="text-xs text-slate-500 truncate">{user.email}</p>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={() => openProfileSettings('profile')}
+                      className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-slate-900 text-white text-xs font-bold hover:bg-slate-800 transition-all"
+                    >
+                      <Pencil size={13} /> Change Name
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => openProfileSettings('family')}
+                      className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl border border-rose-200 bg-rose-50/70 text-rose-700 text-xs font-bold hover:bg-rose-100 transition-all"
+                    >
+                      <LogOut size={13} /> Leave Family
+                    </button>
+                  </div>
+                </div>
+
                 <div className="bg-white p-4 md:p-8 rounded-xl border border-slate-200 shadow-sm">
                   <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 mb-8">
                     <div><h3 className="text-lg md:text-xl font-bold mb-1 text-slate-800">Connection Manager</h3><p className="text-slate-500 text-xs md:text-sm">Linked sources for your family portfolio</p></div>
                     <div className="flex flex-wrap gap-2 md:gap-3">
-                      <button onClick={() => setShowInviteModal(true)} className="flex items-center gap-2 bg-indigo-600 text-white px-3 md:px-4 py-2 rounded-lg font-bold text-xs md:text-sm hover:bg-indigo-700 transition-all shadow-sm">
+                      <button onClick={() => { setLastInviteResult(null); setShowInviteModal(true); }} className="flex items-center gap-2 bg-indigo-600 text-white px-3 md:px-4 py-2 rounded-lg font-bold text-xs md:text-sm hover:bg-indigo-700 transition-all shadow-sm">
                         <Users size={16} /> Invite Family
                       </button>
                       <button onClick={() => { setJoinCodeInput(pendingInviteCode || ''); setShowJoinByCodeModal(true); }} className="flex items-center gap-2 border border-emerald-200 text-emerald-700 bg-emerald-50/50 px-3 md:px-4 py-2 rounded-lg font-bold text-xs md:text-sm hover:bg-emerald-50 transition-all">
@@ -2527,6 +3106,8 @@ export default function App() {
                              accounts={data.holdings.filter(h => getHoldingOwnerId(h) === m.id).length}
                              isLast={idx === (data.household.membersData?.length || 0) - 1}
                              onRemove={removeMember}
+                             onRename={handleRenameMember}
+                             onLeaveSelf={() => openProfileSettings('family')}
                              currentUserId={user.id}
                            />
                         ))}
@@ -2619,37 +3200,49 @@ export default function App() {
                     </section>
 
                     <section className="pt-6 border-t border-slate-100">
-                      <div className="flex items-center justify-between mb-4">
-                        <h4 className="text-xs font-bold text-slate-400 uppercase tracking-widest">System Delivery Status</h4>
-                        <div className="flex gap-2">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+                        <h4 className="text-xs font-bold text-slate-400 uppercase tracking-widest">Outgoing Email Delivery (Invites &amp; Rebalance)</h4>
+                        <div className="flex flex-wrap gap-2">
+                          <button
+                            type="button"
+                            onClick={() => openProfileSettings('email')}
+                            className="text-[10px] font-bold text-white bg-indigo-600 hover:bg-indigo-700 px-2.5 py-1.5 rounded-lg transition-colors"
+                          >
+                            {emailStatus?.configured ? 'EMAIL SETTINGS' : 'CONNECT GMAIL / API KEY'}
+                          </button>
                           <button 
+                            type="button"
                             onClick={handleSendTestEmail}
-                            className="text-[10px] font-bold text-indigo-600 hover:text-indigo-700 bg-indigo-50 px-2 py-1 rounded-md transition-colors"
+                            className="text-[10px] font-bold text-indigo-600 hover:text-indigo-700 bg-indigo-50 px-2.5 py-1.5 rounded-lg transition-colors"
                           >
                             SEND TEST EMAIL
                           </button>
                           <button 
+                            type="button"
                             onClick={handleTriggerRebalanceCheck}
-                            className="text-[10px] font-bold text-rose-600 hover:text-rose-700 bg-rose-50 px-2 py-1 rounded-md transition-colors"
+                            className="text-[10px] font-bold text-rose-600 hover:text-rose-700 bg-rose-50 px-2.5 py-1.5 rounded-lg transition-colors"
                           >
-                            FORCE CHECK NOW
+                            EMAIL REBALANCE NOW
                           </button>
                         </div>
                       </div>
-                      <div className="bg-slate-50 rounded-xl p-4 space-y-3">
-                        <div className="flex items-center justify-between text-xs">
-                          <span className="text-slate-500">Email Gateway (Resend)</span>
-                          <span className={`font-bold ${process.env.NODE_ENV === 'production' ? 'text-emerald-600' : 'text-amber-600'}`}>
-                            {process.env.NODE_ENV === 'production' ? '● Connected' : '○ Testing Mode'}
-                          </span>
+                      <div className="bg-slate-50 rounded-xl p-4 space-y-2.5 border border-slate-100">
+                        <div className="flex items-center justify-between text-xs gap-2">
+                          <span className="text-slate-600 font-semibold">Outgoing Email Gateway</span>
+                          {emailStatus?.configured ? (
+                            <span className="font-bold text-emerald-600 truncate">
+                              ● Connected ({emailStatus.senderEmail} via {emailStatus.provider.toUpperCase()})
+                            </span>
+                          ) : (
+                            <span className="font-bold text-amber-600">
+                              ○ Not Authorized Yet
+                            </span>
+                          )}
                         </div>
-                        <div className="flex items-center justify-between text-xs">
-                          <span className="text-slate-500">Google OAuth (Gmail)</span>
-                          <span className="text-slate-400 font-medium">Ready for sync</span>
-                        </div>
-                        <p className="text-[10px] text-slate-400 italic mt-2">
-                          Note: All system emails are currently redirected to <strong>hgarg5072@gmail.com</strong> for testing. 
-                          To invite others, you must verify your domain at <a href="https://resend.com/domains" target="_blank" className="text-indigo-600 hover:underline">resend.com/domains</a>.
+                        <p className="text-[11px] text-slate-500 leading-relaxed">
+                          {emailStatus?.configured
+                            ? `Automatic Family Invitations and Rebalance / Zero-Sell SIP Reports are active and delivered directly from ${emailStatus.senderEmail}.`
+                            : 'Click "Connect Gmail / API Key" above once to authorize your Gmail (free, sends to any email address with no custom domain required) or add a Brevo/Resend API key.'}
                         </p>
                       </div>
                     </section>
@@ -2720,6 +3313,24 @@ export default function App() {
           onNavigateTab={(tab) => setActiveTab(tab)}
         />
 
+        <ProfileFamilyModal
+          isOpen={showProfileModal}
+          onClose={() => setShowProfileModal(false)}
+          initialSection={profileModalSection}
+          user={user}
+          household={data.household}
+          myHoldingsCount={data.holdings.filter((h) => getHoldingOwnerId(h) === user.id && !String(h.id || '').startsWith('placeholder-')).length}
+          emailStatus={emailStatus}
+          onSaveProfileName={handleUpdateProfileName}
+          onSaveHouseholdName={handleUpdateHouseholdName}
+          onLeaveFamily={handleLeaveFamily}
+          onJoinFamilyByCode={redeemInviteCode}
+          onAuthorizeGmailPopup={authorizeGmailViaPopup}
+          onConnectGoogleOffline={connectGoogleOfflineOAuth}
+          onSaveProviderConfig={handleSaveEmailProviderConfig}
+          onSendTestEmail={handleSendTestEmailTo}
+        />
+
         <AnimatePresence>
           {detailView && (
             <DetailViewModal 
@@ -2778,10 +3389,10 @@ export default function App() {
         <AnimatePresence>
           {showInviteModal && (
             <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm">
-              <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }} className="bg-white rounded-2xl w-full max-w-md overflow-hidden shadow-2xl">
+              <motion.div initial={{ opacity: 0, scale: 0.9 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 0.9 }} className="bg-white rounded-2xl w-full max-w-md max-h-[90vh] overflow-y-auto shadow-2xl">
                 <div className="p-6 border-b border-slate-100 flex justify-between items-center">
                   <h3 className="font-bold text-lg text-slate-800">Invite Family Member</h3>
-                  <button onClick={() => setShowInviteModal(false)} className="text-slate-400 hover:text-slate-600">✕</button>
+                  <button aria-label="Close Invite Modal" onClick={() => setShowInviteModal(false)} className="text-slate-400 hover:text-slate-600">✕</button>
                 </div>
                 <div className="p-6 space-y-5">
                   <div className="p-4 rounded-2xl bg-indigo-50/70 border border-indigo-100 space-y-3">
@@ -2817,28 +3428,84 @@ export default function App() {
 
                   <div className="relative">
                     <div className="absolute inset-0 flex items-center"><div className="w-full border-t border-slate-100"></div></div>
-                    <div className="relative flex justify-center text-[10px] uppercase"><span className="bg-white px-2 text-slate-400 font-bold tracking-widest">Or Pre-Approve by Email</span></div>
+                    <div className="relative flex justify-center text-[10px] uppercase"><span className="bg-white px-2 text-slate-400 font-bold tracking-widest">Or Send Email Invitation</span></div>
                   </div>
 
                   <div className="space-y-3">
-                    <div>
-                      <label className="block text-xs font-bold text-slate-400 uppercase mb-1.5">Member Email</label>
-                      <input 
-                        aria-label="Member Email"
-                        value={inviteEmail} 
-                        onChange={e => setInviteEmail(e.target.value)} 
-                        type="email" 
-                        className="w-full px-4 py-3 bg-slate-50 border border-slate-100 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-600/20" 
-                        placeholder="spouse@gmail.com" 
-                      />
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="font-bold text-slate-400 uppercase">Member Email</span>
+                      {emailStatus?.configured ? (
+                        <span className="font-bold text-emerald-600 truncate">● Sending via {emailStatus.senderEmail}</span>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => { setShowInviteModal(false); openProfileSettings('email'); }}
+                          className="font-bold text-indigo-600 hover:underline"
+                        >
+                          Connect Gmail for auto-send →
+                        </button>
+                      )}
                     </div>
+                    <input 
+                      aria-label="Member Email"
+                      value={inviteEmail} 
+                      onChange={e => setInviteEmail(e.target.value)} 
+                      type="email" 
+                      className="w-full px-4 py-3 bg-slate-50 border border-slate-100 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-indigo-600/20" 
+                      placeholder="spouse@gmail.com" 
+                    />
                     <button 
                       onClick={sendInvite} 
-                      disabled={isInviting || inviteSent || !inviteEmail.trim()}
+                      disabled={isInviting || !inviteEmail.trim()}
                       className={`w-full text-white rounded-xl py-3.5 text-sm font-bold shadow-sm transition-all flex items-center justify-center gap-2 disabled:opacity-50 ${inviteSent ? 'bg-emerald-600' : 'bg-slate-900 hover:bg-slate-800'}`}
                     >
-                      {isInviting ? <RefreshCcw className="animate-spin" size={18} /> : inviteSent ? <><Check size={18} /> Added to Pending Invites!</> : 'Pre-Approve Email Invite'}
+                      {isInviting ? (
+                        <RefreshCcw className="animate-spin" size={18} />
+                      ) : inviteSent ? (
+                        <><Check size={18} /> {lastInviteResult?.sent ? 'Email Sent!' : 'Pre-Approved!'}</>
+                      ) : (
+                        <><Send size={16} /> {emailStatus?.configured ? 'Send Email Invite' : 'Send / Prepare Email Invite'}</>
+                      )}
                     </button>
+
+                    {lastInviteResult && (
+                      <div className={`p-3.5 rounded-xl border text-xs space-y-2 ${
+                        lastInviteResult.sent
+                          ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                          : 'bg-amber-50 border-amber-200 text-amber-900'
+                      }`}>
+                        {lastInviteResult.sent ? (
+                          <p className="font-bold">
+                            Delivered invitation email to <strong>{lastInviteResult.email}</strong>!
+                          </p>
+                        ) : (
+                          <>
+                            <p className="font-semibold leading-relaxed">
+                              Pre-approved <strong>{lastInviteResult.email}</strong>! Automatic outgoing email isn&apos;t connected yet — send the pre-filled invite in 1 click or authorize Gmail:
+                            </p>
+                            <div className="flex flex-wrap gap-2 pt-0.5">
+                              {lastInviteResult.gmailComposeUrl && (
+                                <a
+                                  href={lastInviteResult.gmailComposeUrl}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-slate-900 text-white text-[11px] font-bold"
+                                >
+                                  Open Pre-Filled Gmail <ExternalLink size={12} />
+                                </a>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => { setShowInviteModal(false); openProfileSettings('email'); }}
+                                className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-white border border-amber-300 text-amber-900 text-[11px] font-bold"
+                              >
+                                Authorize Automatic Gmail
+                              </button>
+                            </div>
+                          </>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </div>
               </motion.div>
@@ -3140,9 +3807,39 @@ function StatCardModern({ label, value, subValue, trend, isSecondary, isAlert, t
   );
 }
 
-function RebalanceView({ stats, fxRates }: { stats: any, fxRates: Record<string, number> }) {
+function RebalanceView({
+  stats,
+  fxRates,
+  householdName,
+  defaultEmail,
+  threshold = 95,
+  emailStatus,
+  onOpenEmailSettings,
+  onSendRebalanceEmail
+}: {
+  stats: any;
+  fxRates: Record<string, number>;
+  householdName?: string;
+  defaultEmail?: string;
+  threshold?: number;
+  emailStatus?: EmailStatusInfo | null;
+  onOpenEmailSettings?: () => void;
+  onSendRebalanceEmail?: (params: {
+    toEmail: string;
+    mode: 'full' | 'sip';
+    freshInflowINR?: number;
+    clientReport: any;
+  }) => Promise<any>;
+}) {
   const [rebalanceMode, setRebalanceMode] = useState<'full' | 'sip'>('full');
   const [freshInflowINR, setFreshInflowINR] = useState<number>(150000);
+  const [recipientEmail, setRecipientEmail] = useState<string>(defaultEmail || '');
+  const [isEmailingPlan, setIsEmailingPlan] = useState(false);
+  const [emailPlanResult, setEmailPlanResult] = useState<{
+    sent: boolean;
+    message?: string;
+    gmailComposeUrl?: string;
+  } | null>(null);
 
   const accuracy = useMemo(() => {
     if (!stats) return 0;
@@ -3535,24 +4232,137 @@ function RebalanceView({ stats, fxRates }: { stats: any, fxRates: Record<string,
           )}
         </div>
         
-        <div className="px-4 sm:px-8 py-5 bg-slate-50 flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-t border-slate-100">
-          <div className="flex items-center gap-3">
-             <div className="p-2 bg-slate-200 rounded-lg shrink-0">
+        <div className="px-4 sm:px-8 py-5 bg-slate-50 space-y-4 border-t border-slate-100">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="p-2 bg-slate-200 rounded-lg shrink-0">
                 <ShieldCheck size={18} className="text-slate-600" />
-             </div>
-             <div>
-                <div className="text-xs sm:text-sm font-bold text-slate-700">Tax-Efficient Family Execution</div>
-                <div className="text-[10px] text-slate-400 uppercase font-bold tracking-widest mt-0.5">Download CSV order sheet for CAMS / Zerodha / Schwab</div>
-             </div>
+              </div>
+              <div>
+                <div className="text-xs sm:text-sm font-bold text-slate-700">Tax-Efficient Family Execution &amp; Email Dispatch</div>
+                <div className="text-[10px] text-slate-400 uppercase font-bold tracking-widest mt-0.5">
+                  Email formatted plan to yourself / spouse or export CSV orders
+                </div>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={exportOrdersCsv}
+              disabled={activeOrders.length === 0}
+              className="w-full sm:w-auto px-4 py-2.5 bg-slate-900 hover:bg-black disabled:opacity-40 text-white rounded-xl font-bold transition-all shadow-sm active:scale-95 text-xs uppercase tracking-wider flex items-center justify-center gap-2 shrink-0"
+            >
+              <Download size={14} /> Export CSV Orders
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={exportOrdersCsv}
-            disabled={activeOrders.length === 0}
-            className="w-full sm:w-auto px-5 py-3 bg-slate-900 hover:bg-black disabled:opacity-40 text-white rounded-xl font-bold transition-all shadow-lg active:scale-95 text-xs uppercase tracking-wider flex items-center justify-center gap-2"
-          >
-            <Download size={15} /> Export CSV Orders
-          </button>
+
+          {onSendRebalanceEmail && (
+            <div className="pt-3 border-t border-slate-200/70 space-y-2.5">
+              <div className="flex flex-col sm:flex-row gap-2.5">
+                <input
+                  type="email"
+                  value={recipientEmail}
+                  onChange={(e) => setRecipientEmail(e.target.value)}
+                  placeholder="Recipient email (e.g. you or spouse@gmail.com)"
+                  aria-label="Rebalance Report Recipient Email"
+                  className="flex-1 px-3.5 py-2.5 rounded-xl bg-white border border-slate-200 text-xs font-semibold text-slate-900 focus:outline-none focus:border-indigo-500"
+                />
+                <button
+                  type="button"
+                  disabled={isEmailingPlan || !recipientEmail.trim()}
+                  onClick={async () => {
+                    setIsEmailingPlan(true);
+                    setEmailPlanResult(null);
+                    try {
+                      const execSum =
+                        rebalanceMode === 'sip'
+                          ? `Routing ${formatCompactINR(freshInflowINR)} lifts alignment from ${accuracy.toFixed(1)}% to ${sipPlan.postAccuracy.toFixed(1)}% with Rs. 0 tax drag.`
+                          : typeof narrative === 'string'
+                          ? narrative
+                          : `${narrative.main} ${narrative.secondary}`;
+
+                      const res = await onSendRebalanceEmail({
+                        toEmail: recipientEmail.trim(),
+                        mode: rebalanceMode,
+                        freshInflowINR,
+                        clientReport: {
+                          householdName: householdName || 'Family Portfolio',
+                          totalValINR: stats.totalValINR,
+                          totalValUSD: stats.totalValUSD,
+                          accuracy: rebalanceMode === 'sip' ? sipPlan.postAccuracy : accuracy,
+                          threshold,
+                          actualEquityPct: stats.actualEquityPct,
+                          targetEquityPct: stats.targetEquityPct,
+                          indianEquityPctOfEq: stats.actualIndianEquityPctOfEquity,
+                          foreignEquityPctOfEq: stats.actualForeignEquityPctOfEquity,
+                          executiveSummary: execSum,
+                          orders: activeOrders.map((o: any) => ({
+                            type: o.type,
+                            title: o.title,
+                            category: o.category,
+                            amount: String(o.amount || '').replace(/₹/g, 'Rs. '),
+                            description: o.description
+                          }))
+                        }
+                      });
+                      setEmailPlanResult({
+                        sent: Boolean(res?.sent),
+                        message: res?.sent
+                          ? `Delivered ${rebalanceMode === 'sip' ? 'Zero-Sell SIP Plan' : 'Rebalance Plan'} to ${recipientEmail.trim()}!`
+                          : res?.error || 'Outgoing email sender is not authorized yet.',
+                        gmailComposeUrl: res?.gmailComposeUrl
+                      });
+                    } catch (err: any) {
+                      setEmailPlanResult({
+                        sent: false,
+                        message: err?.message || 'Failed to send rebalance email'
+                      });
+                    } finally {
+                      setIsEmailingPlan(false);
+                    }
+                  }}
+                  className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition-all shadow-sm shrink-0"
+                >
+                  {isEmailingPlan ? <RefreshCcw size={14} className="animate-spin" /> : <Mail size={14} />}
+                  Email Rebalance Plan
+                </button>
+              </div>
+
+              {emailPlanResult && (
+                <div
+                  className={`p-3 rounded-xl border text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 ${
+                    emailPlanResult.sent
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-800 font-bold'
+                      : 'bg-amber-50 border-amber-200 text-amber-900 font-semibold'
+                  }`}
+                >
+                  <span>{emailPlanResult.message}</span>
+                  {!emailPlanResult.sent && (
+                    <div className="flex flex-wrap gap-2 shrink-0">
+                      {emailPlanResult.gmailComposeUrl && (
+                        <a
+                          href={emailPlanResult.gmailComposeUrl}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-slate-900 text-white text-[11px] font-bold"
+                        >
+                          Open Pre-Filled Gmail <ExternalLink size={12} />
+                        </a>
+                      )}
+                      {onOpenEmailSettings && !emailStatus?.configured && (
+                        <button
+                          type="button"
+                          onClick={onOpenEmailSettings}
+                          className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-white border border-amber-300 text-amber-900 text-[11px] font-bold"
+                        >
+                          Connect Gmail Sender
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -4082,24 +4892,86 @@ function SyncOption({ title, desc, icon, onClick, badge, isLinked }: { title: st
   );
 }
 
- function MemberRow({ id, name, email, role, accounts, isLast, onRemove, currentUserId }: any) {
+function MemberRow({ id, name, email, role, accounts, isLast, onRemove, onRename, onLeaveSelf, currentUserId }: any) {
   const [showConfirm, setShowConfirm] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const [draftName, setDraftName] = useState(name || '');
+
+  useEffect(() => {
+    setDraftName(name || '');
+  }, [name]);
+
+  const canRename = Boolean(onRename) && (id === currentUserId || role === 'Tracked');
+
+  const saveEdit = async () => {
+    const clean = draftName.trim();
+    if (!clean || clean === name) {
+      setEditing(false);
+      return;
+    }
+    await onRename(id, clean);
+    setEditing(false);
+  };
 
   return (
     <div className={`flex flex-col sm:flex-row sm:items-center justify-between py-3.5 gap-3 ${!isLast ? 'border-b border-slate-50' : ''}`}>
       <div className="flex items-center gap-3 min-w-0 flex-1">
         <div className="w-8 h-8 shrink-0 rounded-full bg-slate-100 flex items-center justify-center text-slate-400 font-bold text-[10px] uppercase border border-slate-100">
-          {name.split(' ').map((n: string) => n[0]).join('')}
+          {(name || 'U').split(' ').map((n: string) => n[0]).join('')}
         </div>
-        <div className="min-w-0">
-          <div className="flex items-center gap-2">
-            <h5 className="text-[11px] font-bold text-slate-800 truncate">{name}</h5>
-            {id === currentUserId && <span className="text-[8px] bg-indigo-50 text-indigo-500 border border-indigo-100 px-1 rounded uppercase font-black">You</span>}
-          </div>
+        <div className="min-w-0 flex-1">
+          {editing ? (
+            <div className="flex items-center gap-1.5">
+              <input
+                type="text"
+                autoFocus
+                aria-label={`Rename ${name}`}
+                value={draftName}
+                onChange={(e) => setDraftName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') saveEdit();
+                  if (e.key === 'Escape') setEditing(false);
+                }}
+                className="px-2.5 py-1 text-xs font-bold text-slate-900 bg-slate-50 border border-indigo-300 rounded-lg focus:outline-none w-44 max-w-full"
+              />
+              <button
+                type="button"
+                aria-label="Save member name"
+                onClick={saveEdit}
+                className="p-1 text-emerald-600 hover:bg-emerald-50 rounded"
+              >
+                <Check size={14} />
+              </button>
+              <button
+                type="button"
+                aria-label="Cancel member rename"
+                onClick={() => setEditing(false)}
+                className="p-1 text-slate-400 hover:bg-slate-100 rounded"
+              >
+                <X size={14} />
+              </button>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2">
+              <h5 className="text-[11px] font-bold text-slate-800 truncate">{name}</h5>
+              {id === currentUserId && <span className="text-[8px] bg-indigo-50 text-indigo-500 border border-indigo-100 px-1 rounded uppercase font-black">You</span>}
+              {canRename && (
+                <button
+                  type="button"
+                  aria-label={`Edit name for ${name}`}
+                  onClick={() => setEditing(true)}
+                  className="p-1 text-slate-300 hover:text-indigo-600 rounded transition-colors"
+                  title="Edit Name"
+                >
+                  <Pencil size={12} />
+                </button>
+              )}
+            </div>
+          )}
           <p className="text-[10px] text-slate-400 truncate tracking-tight">{email}</p>
         </div>
       </div>
-      <div className="flex items-center justify-between sm:justify-end gap-4 shrink-0">
+      <div className="flex items-center justify-between sm:justify-end gap-3 sm:gap-4 shrink-0">
         {!showConfirm ? (
           <>
             <div className="text-right">
@@ -4107,9 +4979,19 @@ function SyncOption({ title, desc, icon, onClick, badge, isLinked }: { title: st
               <p className="text-[11px] font-bold text-indigo-600 leading-none">{accounts} Found</p>
             </div>
             <div className="px-2 py-0.5 bg-slate-100 rounded text-[9px] font-black uppercase text-slate-400 border border-slate-200">{role}</div>
-            {id !== currentUserId && (
+            {id === currentUserId && onLeaveSelf ? (
+              <button
+                type="button"
+                onClick={onLeaveSelf}
+                className="px-2.5 py-1 text-[10px] font-bold text-rose-600 bg-rose-50 hover:bg-rose-100 rounded-lg border border-rose-200 transition-all"
+                title="Leave Family"
+              >
+                Leave
+              </button>
+            ) : id !== currentUserId ? (
               <button 
                 type="button" 
+                aria-label={`Remove ${name} from family`}
                 onClick={(e) => {
                   e.stopPropagation();
                   setShowConfirm(true);
@@ -4119,7 +5001,7 @@ function SyncOption({ title, desc, icon, onClick, badge, isLinked }: { title: st
               >
                 <Trash size={15} />
               </button>
-            )}
+            ) : null}
           </>
         ) : (
           <div className="flex items-center gap-1.5 animate-in fade-in slide-in-from-right-2 duration-200">
