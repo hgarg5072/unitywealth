@@ -5600,7 +5600,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
                         ))}
 
                         <div className="flex gap-2 items-center mt-2">
-                           <AddTickerRow onAdd={(res) => addTickerToCat(idx, res.symbol)} householdId={householdId} />
+                           <AddTickerRow onAdd={(res) => addTickerToCat(idx, res.symbol)} householdId={householdId} foreignOnly />
                            {tickerSum !== 100 && cat.tickerWeights && cat.tickerWeights.length > 0 && (
                              <span className="text-[9px] font-black text-rose-500 uppercase animate-pulse">
                                Current Sum: {tickerSum.toFixed(1)}% (Must be 100%)
@@ -5815,7 +5815,7 @@ function TargetForm({ initialTargets, initialSettings, onSave, onSaveSettings, i
   );
 }
 
-function AddTickerRow({ onAdd, householdId }: { onAdd: (res: any) => void, householdId?: string }) {
+function AddTickerRow({ onAdd, householdId, foreignOnly = false }: { onAdd: (res: any) => void, householdId?: string, foreignOnly?: boolean }) {
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<any[]>([]);
   const [isOpen, setIsOpen] = useState(false);
@@ -5824,19 +5824,21 @@ function AddTickerRow({ onAdd, householdId }: { onAdd: (res: any) => void, house
 
   useEffect(() => {
     const timer = setTimeout(async () => {
-      if (query.length > 1) {
+      if (query.trim().length > 1) {
         setIsSearching(true);
         try {
           const hParam = householdId ? `&h=${householdId}` : '';
           const [tickerRes, mfRes] = await Promise.all([
-            fetch(`/api/tickers/search?q=${encodeURIComponent(query)}${hParam}`),
-            fetch(`/api/mf/search?q=${encodeURIComponent(query)}`)
+            fetch(`/api/tickers/search?q=${encodeURIComponent(query.trim())}${hParam}`),
+            foreignOnly ? Promise.resolve(null) : fetch(`/api/mf/search?q=${encodeURIComponent(query.trim())}`)
           ]);
           const tickerData = await tickerRes.json();
-          const mfData = await mfRes.json();
-          
-          // Combine and deduplicate if necessary, though symbols are different
-          setResults([...tickerData, ...mfData]);
+          const mfData = mfRes ? await mfRes.json() : [];
+          const filteredTickers = foreignOnly
+            ? (Array.isArray(tickerData) ? tickerData.filter((r: any) => !r.isIndia) : [])
+            : (Array.isArray(tickerData) ? tickerData : []);
+
+          setResults([...filteredTickers, ...(Array.isArray(mfData) ? mfData : [])]);
           setIsOpen(true);
         } catch (e) {
           console.error("Search failed", e);
@@ -5847,9 +5849,9 @@ function AddTickerRow({ onAdd, householdId }: { onAdd: (res: any) => void, house
         setResults([]);
         setIsOpen(false);
       }
-    }, 300);
+    }, 250);
     return () => clearTimeout(timer);
-  }, [query]);
+  }, [query, householdId, foreignOnly]);
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -5861,6 +5863,11 @@ function AddTickerRow({ onAdd, householdId }: { onAdd: (res: any) => void, house
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
 
+  const customTickerCandidate = query.trim().replace(/\s+etf$/i, '').trim().toUpperCase();
+  const canUseCustomTicker =
+    /^[A-Z0-9.-]{2,10}$/.test(customTickerCandidate) &&
+    !results.some((r) => String(r.symbol || '').toUpperCase() === customTickerCandidate);
+
   return (
     <div className="relative" ref={searchRef}>
       <div className="flex items-center gap-2">
@@ -5869,20 +5876,20 @@ function AddTickerRow({ onAdd, householdId }: { onAdd: (res: any) => void, house
             aria-label="Search Ticker or Mutual Fund"
             value={query} 
             onChange={e => setQuery(e.target.value)}
-            onFocus={() => query.length > 1 && setIsOpen(true)}
-            placeholder="Search Ticker or MF (e.g. Parag Parikh)"
-            className="text-[10px] bg-white border border-slate-200 rounded-lg px-3 py-2 font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 w-full sm:w-48 shadow-sm"
+            onFocus={() => query.trim().length > 1 && setIsOpen(true)}
+            placeholder={foreignOnly ? "Search US Ticker / ETF (e.g. DRAM, SMH, NVDA)" : "Search Ticker, ETF or MF (e.g. DRAM, Parag Parikh)"}
+            className="text-[11px] bg-white border border-slate-200 rounded-lg px-3 py-2 font-mono text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 w-full sm:w-64 shadow-sm"
           />
-          {isSearching && <RefreshCcw size={10} className="absolute right-2 top-2.5 animate-spin text-slate-400" />}
+          {isSearching && <RefreshCcw size={10} className="absolute right-2.5 top-2.5 animate-spin text-slate-400" />}
         </div>
       </div>
 
-              {isOpen && results.length > 0 && (
-        <div className="absolute z-50 mt-1 w-full sm:w-72 bg-white border border-slate-200 rounded-xl shadow-xl overflow-hidden max-h-60 overflow-y-auto animate-in fade-in slide-in-from-top-2 duration-200">
+      {isOpen && (results.length > 0 || (!isSearching && canUseCustomTicker)) && (
+        <div className="absolute z-50 mt-1 w-72 sm:w-80 bg-white border border-slate-200 rounded-xl shadow-xl overflow-hidden max-h-64 overflow-y-auto animate-in fade-in slide-in-from-top-2 duration-200">
           {results.map((r) => (
             <button
               type="button"
-              key={r.symbol}
+              key={`${r.symbol}-${r.exchDisp}`}
               onClick={() => {
                 onAdd(r);
                 setQuery('');
@@ -5892,21 +5899,35 @@ function AddTickerRow({ onAdd, householdId }: { onAdd: (res: any) => void, house
             >
               <div className="flex justify-between items-center">
                 <div className="flex items-center gap-2">
-                  <span className="text-[10px] font-black text-slate-900">{r.symbol}</span>
+                  <span className="text-[11px] font-black text-slate-900">{r.symbol}</span>
+                  {r.typeDisp === 'ETF' && <span className="text-[8px] bg-indigo-50 text-indigo-700 px-1 rounded-sm font-black uppercase">ETF</span>}
                   {r.isIndia && <span className="text-[7px] bg-orange-50 text-orange-600 px-1 rounded-sm font-black uppercase tracking-tighter">India</span>}
                 </div>
                 <span className="text-[8px] bg-slate-100 text-slate-500 px-1 rounded font-bold uppercase">{r.exchDisp}</span>
               </div>
               <div className="flex justify-between items-end">
-                <span className="text-[9px] text-slate-400 truncate font-semibold uppercase max-w-[180px]">{shortenAssetName(r.shortname)}</span>
+                <span className="text-[9px] text-slate-500 truncate font-semibold max-w-[190px]">{shortenAssetName(r.shortname)}</span>
                 {r.currentPrice > 0 && (
-                  <div className="text-[9px] font-black text-emerald-600 tabular-nums">
+                  <div className="text-[10px] font-black text-emerald-600 tabular-nums">
                     {r.isIndia ? '₹' : '$'}{r.currentPrice.toLocaleString('en-IN', { minimumFractionDigits: 2 })}
                   </div>
                 )}
               </div>
             </button>
           ))}
+          {!isSearching && canUseCustomTicker && (
+            <button
+              type="button"
+              onClick={() => {
+                onAdd({ symbol: customTickerCandidate, shortname: customTickerCandidate, exchDisp: 'US', typeDisp: 'ETF', currentPrice: 0, isIndia: false });
+                setQuery('');
+                setIsOpen(false);
+              }}
+              className="w-full px-4 py-2.5 text-left bg-slate-50 hover:bg-indigo-50 text-[10px] font-bold text-indigo-700 border-t border-slate-100"
+            >
+              + Use ticker &ldquo;{customTickerCandidate}&rdquo; directly
+            </button>
+          )}
         </div>
       )}
     </div>

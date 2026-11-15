@@ -2034,7 +2034,7 @@ async function startServer() {
       const res = await axios.post(
         'https://scanner.tradingview.com/america/scan',
         {
-          symbols: { tickers: [`NASDAQ:${clean}`, `NYSE:${clean}`, `AMEX:${clean}`] },
+          symbols: { tickers: [`NASDAQ:${clean}`, `NYSE:${clean}`, `AMEX:${clean}`, `CBOE:${clean}`, `OTC:${clean}`] },
           columns: ['close']
         },
         { timeout: 5000, headers: { 'Content-Type': 'application/json', 'User-Agent': YAHOO_HEADERS['User-Agent'] } }
@@ -2279,19 +2279,80 @@ async function startServer() {
     if (!q) return res.json([]);
     
     try {
+      const rawQuery = String(q).trim();
+      const wantsEtf = /\b(etf|etfs|etp|etn)\b/i.test(rawQuery);
+      const strippedQuery = rawQuery
+        .replace(/^(NSE|BSE|NASDAQ|NYSE|AMEX|CBOE):/i, '')
+        .replace(/\.(NS|BO|NSE|BSE|US)$/i, '')
+        .replace(/\b(etf|etfs|etp|etn|stock|stocks|share|shares)\b/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      const coreQuery = strippedQuery || rawQuery;
+      const queryTokens = coreQuery.split(/\s+/).filter(Boolean).slice(0, 3);
+      const upperCore = coreQuery.toUpperCase();
+
       const results: any[] = [];
       const FINNHUB_KEY = process.env.FINNHUB_API_KEY;
-      const cleanIndiaQuery = String(q).trim().replace(/^(NSE|BSE):/i, '').replace(/\.(NS|BO|NSE|BSE)$/i, '').trim();
 
-      // Run TradingView India Search (NSE/BSE with live price included!) + Finnhub US Search in parallel
-      const [indiaQuotes, finnhubQuotes] = await Promise.all([
+      // Run TradingView US (NASDAQ/NYSE/AMEX/CBOE incl. ETFs like DRAM) + TradingView India (NSE/BSE) + Finnhub in parallel
+      const [usTvQuotes, indiaQuotes, finnhubQuotes] = await Promise.all([
         (async () => {
-          if (!cleanIndiaQuery) return [];
+          if (queryTokens.length === 0) return [];
+          try {
+            const tvUsRes = await axios.post(
+              'https://scanner.tradingview.com/america/scan',
+              {
+                filter: queryTokens.map((tok) => ({
+                  left: 'name,description',
+                  operation: 'match',
+                  right: tok
+                })),
+                options: { lang: 'en' },
+                markets: ['america'],
+                columns: ['name', 'description', 'close', 'currency', 'exchange', 'type', 'subtype'],
+                sort: { sortBy: 'market_cap_basic', sortOrder: 'desc' },
+                range: [0, 12]
+              },
+              { timeout: 6000, headers: { 'Content-Type': 'application/json', 'User-Agent': YAHOO_HEADERS['User-Agent'] } }
+            );
+            return (tvUsRes.data?.data || [])
+              .filter((item: any) => {
+                const sym = String(item?.d?.[0] || '');
+                return sym && !sym.includes('/') && !sym.includes('.');
+              })
+              .map((item: any) => {
+                const [ticker, desc, close, , exch, assetType, subType] = item.d || [];
+                const price = typeof close === 'number' && close > 0 ? close : 0;
+                const sym = String(ticker).toUpperCase();
+                const isFund = assetType === 'fund' || String(subType || '').toLowerCase().includes('etf');
+                if (price > 0) {
+                  stockQuoteCache.set(sym, { price, ts: Date.now() });
+                }
+                return {
+                  symbol: sym,
+                  shortname: desc || sym,
+                  exchDisp: exch || 'US',
+                  typeDisp: isFund ? 'ETF' : 'EQUITY',
+                  currentPrice: price,
+                  isIndia: false
+                };
+              });
+          } catch (e: any) {
+            console.warn("TradingView US search failed:", e.message);
+            return [];
+          }
+        })(),
+        (async () => {
+          if (queryTokens.length === 0) return [];
           try {
             const tvRes = await axios.post(
               'https://scanner.tradingview.com/india/scan',
               {
-                filter: [{ left: 'name,description', operation: 'match', right: cleanIndiaQuery }],
+                filter: queryTokens.map((tok) => ({
+                  left: 'name,description',
+                  operation: 'match',
+                  right: tok
+                })),
                 options: { lang: 'en' },
                 markets: ['india'],
                 columns: ['name', 'description', 'close', 'currency', 'exchange', 'type'],
@@ -2323,20 +2384,20 @@ async function startServer() {
           }
         })(),
         (async () => {
-          if (!FINNHUB_KEY) return [];
+          if (!FINNHUB_KEY || !coreQuery) return [];
           try {
             const fRes = await axios.get(
-              `https://finnhub.io/api/v1/search?q=${encodeURIComponent(q as string)}&token=${FINNHUB_KEY}`,
+              `https://finnhub.io/api/v1/search?q=${encodeURIComponent(coreQuery)}&token=${FINNHUB_KEY}`,
               { timeout: 5000 }
             );
             return (fRes.data?.result || [])
-              .filter((quote: any) => ['Common Stock', 'ETF', 'REIT', 'ADR'].includes(quote.type) && !quote.symbol.includes('.'))
+              .filter((quote: any) => ['Common Stock', 'ETF', 'ETP', 'REIT', 'ADR'].includes(quote.type) && !quote.symbol.includes('.'))
               .slice(0, 8)
               .map((quote: any) => ({
                 symbol: toYahooSymbol(quote.symbol),
                 shortname: quote.description,
                 exchDisp: 'US',
-                typeDisp: quote.type,
+                typeDisp: quote.type === 'ETP' || quote.type === 'ETF' ? 'ETF' : quote.type,
                 currentPrice: 0,
                 isIndia: false
               }));
@@ -2347,16 +2408,36 @@ async function startServer() {
         })()
       ]);
 
-      results.push(...indiaQuotes, ...finnhubQuotes);
+      results.push(...usTvQuotes, ...indiaQuotes, ...finnhubQuotes);
 
-      // De-duplicate by symbol
+      // De-duplicate by symbol and rank exact/prefix/ETF/word-boundary matches first
       const seen = new Set<string>();
-      const uniqueResults = results.filter((item) => {
-        const key = item.symbol.toUpperCase();
-        if (seen.has(key)) return false;
+      const deduped = results.filter((item) => {
+        const key = String(item.symbol || '').toUpperCase();
+        if (!key || seen.has(key)) return false;
         seen.add(key);
         return true;
-      }).slice(0, 10);
+      });
+
+      const escapedWord = coreQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const wordBoundaryRe = escapedWord ? new RegExp(`\\b${escapedWord}\\b`, 'i') : null;
+
+      deduped.sort((a, b) => {
+        const score = (item: any) => {
+          const baseSym = String(item.symbol || '').toUpperCase().replace(/\.(NS|BO)$/, '');
+          const desc = String(item.shortname || '');
+          let s = 0;
+          if (baseSym === upperCore) s += 200;
+          else if (baseSym.startsWith(upperCore)) s += 80;
+          if (wordBoundaryRe && (wordBoundaryRe.test(baseSym) || wordBoundaryRe.test(desc))) s += 45;
+          if (wantsEtf && item.typeDisp === 'ETF') s += 60;
+          if (item.currentPrice > 0) s += 10;
+          return s;
+        };
+        return score(b) - score(a);
+      });
+
+      const uniqueResults = deduped.slice(0, 12);
 
       // Fetch prices for any search results that didn't already include a price (e.g. Finnhub US hits)
       const missingPriceSymbols = uniqueResults.filter((r: any) => !r.currentPrice).map((r: any) => r.symbol);
