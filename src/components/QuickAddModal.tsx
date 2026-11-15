@@ -232,7 +232,7 @@ export function QuickAddModal({
         <div className="p-5 border-b border-slate-100 flex items-center justify-between">
           <div>
             <h3 className="font-bold text-base sm:text-lg text-slate-900">Add or Import Investments</h3>
-            <p className="text-xs text-slate-500">Live stocks, mutual funds, EPF/FD presets, or multi-statement PDF/CSV</p>
+            <p className="text-xs text-slate-500">Live stocks, mutual funds, EPF/FD presets, or PDF / XLSX / CSV statements</p>
           </div>
           <button
             type="button"
@@ -291,11 +291,11 @@ export function QuickAddModal({
             <button
               type="button"
               onClick={() => setMode('upload')}
-              className={`py-2 px-2 rounded-lg text-xs font-bold flex items-center justify-center gap-1.5 transition-all ${
+              className={`py-2 px-2 rounded-lg text-[11px] sm:text-xs font-bold flex items-center justify-center gap-1 transition-all ${
                 mode === 'upload' ? 'bg-white text-indigo-600 shadow-xs' : 'text-slate-600'
               }`}
             >
-              <Upload size={13} /> PDF / CSV
+              <Upload size={13} /> PDF / XLSX / CSV
             </button>
           </div>
 
@@ -608,16 +608,16 @@ export function QuickAddModal({
                   <FileUp size={22} />
                 </div>
                 <div className="text-sm font-bold text-slate-900">
-                  Tap to choose or drop one or multiple PDF / CSV statements
+                  Tap to choose or drop PDF, Excel (.xlsx), or CSV statements
                 </div>
                 <p className="text-xs text-slate-500 mt-1 leading-relaxed">
-                  Supports CAMS / KFintech CAS PDF, Zerodha, INDmoney, Charles Schwab, IBKR & E*TRADE. Automatically links live AMFI NAVs & US stock quotes and updates your monthly wealth curve.
+                  Supports CAMS / KFintech CAS PDF, Zerodha XLSX/CSV, INDmoney, Charles Schwab, IBKR & E*TRADE. Automatically links live AMFI NAVs & US stock quotes and updates your monthly wealth curve.
                 </p>
                 <input
                   ref={batchFileRef}
                   type="file"
                   multiple
-                  accept=".pdf,.csv,.txt,.tsv"
+                  accept=".pdf,.csv,.xlsx,.xls,.ods,.txt,.tsv,application/pdf,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,application/vnd.oasis.opendocument.spreadsheet"
                   className="hidden"
                   onChange={async (e) => {
                     const files = e.target.files ? Array.from(e.target.files) : [];

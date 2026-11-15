@@ -637,19 +637,29 @@ export default function App() {
   const [selectedImportProvider, setSelectedImportProvider] = useState<string | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
 
-  const readFilePayload = (file: File): Promise<{ content: string; isPDF: boolean }> =>
+  const readFilePayload = (file: File): Promise<{ content: string; isPDF: boolean; isSpreadsheet: boolean }> =>
     new Promise((resolve, reject) => {
-      const isPDF = file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf');
+      const lowerName = (file.name || '').toLowerCase();
+      const lowerType = (file.type || '').toLowerCase();
+      const isPDF = lowerType === 'application/pdf' || lowerName.endsWith('.pdf');
+      const isSpreadsheet =
+        !isPDF &&
+        (lowerName.endsWith('.xlsx') ||
+          lowerName.endsWith('.xls') ||
+          lowerName.endsWith('.ods') ||
+          lowerType.includes('spreadsheet') ||
+          lowerType.includes('excel'));
       const reader = new FileReader();
       reader.onload = (ev) => {
         const raw = String(ev.target?.result || '');
         resolve({
-          content: isPDF ? (raw.split(',')[1] || '') : raw,
-          isPDF
+          content: (isPDF || isSpreadsheet) ? (raw.split(',')[1] || '') : raw,
+          isPDF,
+          isSpreadsheet
         });
       };
       reader.onerror = () => reject(new Error(`Failed to read ${file.name}`));
-      if (isPDF) reader.readAsDataURL(file);
+      if (isPDF || isSpreadsheet) reader.readAsDataURL(file);
       else reader.readAsText(file);
     });
 
@@ -717,13 +727,14 @@ export default function App() {
       }
 
       for (const file of fileArray) {
-        const { content, isPDF } = await readFilePayload(file);
+        const { content, isPDF, isSpreadsheet } = await readFilePayload(file);
         const res = await fetch('/api/gemini/extract', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             content,
             isPDF,
+            isSpreadsheet,
             fileName: file.name,
             providerHint: providerHint || undefined
           })
@@ -2519,7 +2530,7 @@ export default function App() {
                 className="hidden sm:inline-flex items-center gap-1.5 px-3 py-2 bg-white border border-slate-200 text-slate-700 rounded-xl text-xs font-bold hover:bg-slate-50 transition-all shadow-2xs disabled:opacity-50"
               >
                 {isParsing ? <RefreshCcw size={14} className="animate-spin text-indigo-500" /> : <FileUp size={14} className="text-indigo-600" />}
-                <span>{isParsing ? 'Parsing...' : 'Import PDF / CSV'}</span>
+                <span>{isParsing ? 'Parsing...' : 'Import PDF / XLSX / CSV'}</span>
               </button>
 
               <button
@@ -2606,7 +2617,7 @@ export default function App() {
                 onClick={() => openQuickAdd('upload')}
                 className="sm:hidden px-2.5 py-1.5 rounded-lg text-xs font-bold whitespace-nowrap shrink-0 bg-indigo-50 text-indigo-700 border border-indigo-100 flex items-center gap-1"
               >
-                <FileUp size={12} /> Import PDF/CSV
+                <FileUp size={12} /> Import PDF/XLSX/CSV
               </button>
             </div>
 
@@ -3119,25 +3130,25 @@ export default function App() {
                     <section>
                       <div className="flex items-center justify-between mb-3">
                         <h4 className="text-xs font-bold text-slate-400 uppercase tracking-widest">India Accounts (Mutual Funds & Equities)</h4>
-                        <span className="text-[10px] text-slate-400 font-semibold">Click any broker to upload PDF or CSV</span>
+                        <span className="text-[10px] text-slate-400 font-semibold">Click any broker to upload PDF, XLSX or CSV</span>
                       </div>
                       {[
                         {
                           provider: 'CAMS',
                           name: 'CAMS / KFintech / MFCentral CAS',
-                          hint: 'Upload unlocked CAS Holdings Valuation PDF (not Capital Gains) — auto-links ISINs to live AMFI NAVs',
+                          hint: 'Upload unlocked CAS Holdings Valuation PDF or XLSX (not Capital Gains) — auto-links ISINs to live AMFI NAVs',
                           match: (h: Holding) => h.provider === 'CAMS' || h.provider === 'KFintech' || (h.source === 'PDF' && h.currency === 'INR' && h.assetClass !== 'Equity')
                         },
                         {
                           provider: 'Zerodha',
                           name: 'Zerodha (Kite / Console / Coin)',
-                          hint: 'Console → Portfolio → Holdings → Download CSV or PDF — auto-links NSE/BSE stocks & Coin MFs',
+                          hint: 'Console → Portfolio → Holdings → Download XLSX, CSV or PDF — auto-links NSE/BSE stocks & Coin MFs',
                           match: (h: Holding) => h.provider === 'Zerodha'
                         },
                         {
                           provider: 'INDmoney',
                           name: 'INDmoney (US Stocks & India Portfolio)',
-                          hint: 'Upload INDmoney US Stocks (DriveWealth/Alpaca) or Indian Portfolio PDF / CSV',
+                          hint: 'Upload INDmoney US Stocks (DriveWealth/Alpaca) or Indian Portfolio PDF / XLSX / CSV',
                           match: (h: Holding) => h.provider === 'INDmoney'
                         }
                       ].map((src) => {
@@ -3151,7 +3162,7 @@ export default function App() {
                             name={src.name}
                             user={activeMemberName}
                             hint={src.hint}
-                            status={count > 0 ? "Connected" : "Upload PDF/CSV"}
+                            status={count > 0 ? "Connected" : "Upload PDF/XLSX/CSV"}
                             lastSync={count > 0 ? `${count} active ${count === 1 ? 'holding' : 'holdings'}` : undefined}
                             onClick={() => triggerUpload(activeMemberId, src.provider)}
                           />
@@ -3168,17 +3179,17 @@ export default function App() {
                         {
                           provider: 'Charles Schwab',
                           name: 'Charles Schwab',
-                          hint: 'Accounts → Positions → Export CSV, or upload Monthly Brokerage Statement PDF'
+                          hint: 'Accounts → Positions → Export CSV / XLSX, or upload Monthly Brokerage Statement PDF'
                         },
                         {
                           provider: 'IBKR',
                           name: 'Interactive Brokers (IBKR)',
-                          hint: 'Performance & Reports → Statements → Activity / Open Positions CSV or PDF'
+                          hint: 'Performance & Reports → Statements → Activity / Open Positions CSV, XLSX or PDF'
                         },
                         {
                           provider: 'E*TRADE',
                           name: 'E*TRADE (Morgan Stanley)',
-                          hint: 'Accounts → Portfolios → Download CSV, or upload Brokerage / Vested RSU PDF'
+                          hint: 'Accounts → Portfolios → Download XLSX / CSV, or upload Brokerage / Vested RSU PDF'
                         }
                       ].map((src) => {
                         const activeMemberId = dashboardView !== 'combined' ? dashboardView : user.id;
@@ -3191,7 +3202,7 @@ export default function App() {
                             name={src.name}
                             user={activeMemberName}
                             hint={src.hint}
-                            status={count > 0 ? "Connected" : "Upload CSV/PDF"}
+                            status={count > 0 ? "Connected" : "Upload XLSX/CSV/PDF"}
                             lastSync={count > 0 ? `${count} active ${count === 1 ? 'position' : 'positions'}` : undefined}
                             onClick={() => triggerUpload(activeMemberId, src.provider)}
                           />
@@ -3260,7 +3271,7 @@ export default function App() {
           ref={fileInputRef} 
           onChange={handleFileUpload} 
           className="hidden" 
-          accept="application/pdf,text/csv,text/tab-separated-values,.pdf,.csv,.tsv,.txt" 
+          accept="application/pdf,text/csv,text/tab-separated-values,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,application/vnd.oasis.opendocument.spreadsheet,.pdf,.csv,.xlsx,.xls,.ods,.tsv,.txt" 
         />
 
         {/* Mobile Bottom Tab Navigation Bar (< lg) */}
@@ -3712,8 +3723,8 @@ export default function App() {
                 </div>
                 <div className="p-6 space-y-3">
                   <SyncOption 
-                    title="Import Statement (PDF / CSV)" 
-                    desc="Supports CAMS CAS, Zerodha, INDmoney, Schwab, IBKR & E*TRADE" 
+                    title="Import Statement (PDF / XLSX / CSV)" 
+                    desc="Supports CAMS CAS, Zerodha XLSX/CSV, INDmoney, Schwab, IBKR & E*TRADE" 
                     icon={<FileText className="text-violet-600" />} 
                     onClick={() => triggerUpload(dashboardView !== 'combined' ? dashboardView : (data.household.membersData?.[0]?.id || user.id))}
                     badge="Multi-Broker"

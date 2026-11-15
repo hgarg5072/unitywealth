@@ -10,6 +10,7 @@ import axios from "axios";
 import { Resend } from "resend";
 import { OAuth2Client } from "google-auth-library";
 import { parseStringPromise } from 'xml2js';
+import * as XLSX from "xlsx";
 import https from "https";
 import crypto from "crypto";
 import { initializeApp, getApps, cert } from "firebase-admin/app";
@@ -3170,11 +3171,71 @@ async function startServer() {
     }
   });
 
+  function parseSpreadsheetBase64ToText(base64Content: string, fileName?: string): string {
+    const cleanB64 = String(base64Content || "").includes(",")
+      ? String(base64Content).split(",").pop() || ""
+      : String(base64Content || "");
+    const buf = Buffer.from(cleanB64, "base64");
+    if (buf.length === 0) {
+      const err: any = new Error("Empty spreadsheet file received.");
+      err.statusCode = 400;
+      throw err;
+    }
+
+    // Detect password-encrypted Office Open XML (.xlsx) wrapped in an OLE Compound File container
+    if (
+      buf.length >= 8 &&
+      buf[0] === 0xd0 &&
+      buf[1] === 0xcf &&
+      buf[2] === 0x11 &&
+      buf[3] === 0xe0 &&
+      buf.toString("latin1").includes("EncryptedPackage")
+    ) {
+      const err: any = new Error(
+        "This Excel (.xlsx) file is password-protected. Please open it, save an unlocked .xlsx or .csv copy, and upload again."
+      );
+      err.statusCode = 400;
+      throw err;
+    }
+
+    const xlsxLib: any = (XLSX as any).read ? XLSX : (XLSX as any).default;
+    const workbook = xlsxLib.read(buf, { type: "buffer", raw: false, cellDates: true });
+    const sheetNames: string[] = Array.isArray(workbook?.SheetNames) ? workbook.SheetNames : [];
+    const sections: string[] = [];
+
+    for (const sheetName of sheetNames) {
+      const sheet = workbook.Sheets?.[sheetName];
+      if (!sheet) continue;
+      const rawCsv: string = xlsxLib.utils.sheet_to_csv(sheet, { blankrows: false });
+      const cleanedLines = rawCsv
+        .split(/\r?\n/)
+        .map((line: string) => line.replace(/,+$/g, "").trim())
+        .filter((line: string) => line.length > 0 && /[^,\s"]/.test(line));
+      if (cleanedLines.length > 0) {
+        sections.push(`=== Excel Worksheet: ${sheetName} ===\n${cleanedLines.join("\n")}`);
+      }
+    }
+
+    if (sections.length === 0) {
+      const err: any = new Error(
+        `No non-empty data rows were found in ${fileName || "the uploaded Excel workbook"}.`
+      );
+      err.statusCode = 400;
+      throw err;
+    }
+
+    return sections.join("\n\n");
+  }
+
   app.post("/api/gemini/extract", async (req, res) => {
-    const { content, isPDF, fileName, providerHint } = req.body;
+    const { content, isPDF, isSpreadsheet, fileName, providerHint } = req.body;
     if (!content) {
       return res.status(400).json({ error: "No file content received." });
     }
+
+    const treatAsSpreadsheet =
+      !isPDF &&
+      (Boolean(isSpreadsheet) || /\.(xlsx|xls|ods)$/i.test(String(fileName || "")));
 
     // Pre-check if PDF is password-encrypted
     let looksEncryptedPdf = false;
@@ -3191,16 +3252,24 @@ async function startServer() {
     }
 
     try {
+      let resolvedTextContent = "";
+      if (treatAsSpreadsheet) {
+        resolvedTextContent = parseSpreadsheetBase64ToText(String(content), fileName);
+      } else if (!isPDF) {
+        resolvedTextContent = String(content);
+      }
+
       const hintLine = providerHint ? `\nUser selected account/broker hint: "${providerHint}".` : "";
       const fileLine = fileName ? `\nUploaded filename: "${fileName}".` : "";
 
-      const extractionInstructions = `You are a precision financial statement parser supporting Indian and US brokerages:
-- CAMS / KFintech / MFCentral Consolidated Account Statement (CAS) PDFs
-- Zerodha Console / Kite / Coin Holdings CSVs & PDFs
-- INDmoney US Stocks (DriveWealth/Alpaca) & Indian Portfolio PDFs/CSVs
-- Charles Schwab Positions CSVs & Brokerage Statement PDFs
-- Interactive Brokers (IBKR) Activity Statement / Open Positions CSVs & PDFs
-- E*TRADE (Morgan Stanley) Portfolio Download CSVs & RSU/ESPP/Brokerage PDFs${hintLine}${fileLine}
+      const extractionInstructions = `You are a precision financial statement parser supporting Indian and US brokerages across PDF, CSV, and Excel (.xlsx / .xls) workbooks:
+- CAMS / KFintech / MFCentral Consolidated Account Statement (CAS) PDFs & Excel exports
+- Zerodha Console / Kite / Coin Holdings XLSX, CSVs & PDFs
+- INDmoney US Stocks (DriveWealth/Alpaca) & Indian Portfolio XLSX, CSVs & PDFs
+- Charles Schwab Positions CSVs, XLSX & Brokerage Statement PDFs
+- Interactive Brokers (IBKR) Activity Statement / Open Positions CSVs, XLSX & PDFs
+- E*TRADE (Morgan Stanley) Portfolio Download XLSX, CSVs & RSU/ESPP/Brokerage PDFs
+- Custom Family Wealth / Broker Excel (.xlsx / .xls) & CSV spreadsheets${hintLine}${fileLine}
 
 Return ONLY a valid JSON object matching this exact structure:
 {
@@ -3222,13 +3291,16 @@ Return ONLY a valid JSON object matching this exact structure:
   ]
 }
 
-CRITICAL STATEMENT TYPE RULES (DO NOT VIOLATE):
-1. Check the document title and table columns FIRST.
-2. If the file is a "Capital Gain / Loss Statement", "Tax P&L", "Realized Gain/Loss", or "Redemption Statement" that ONLY lists sold/redeemed/switched-out tax lots WITHOUT current open/closing unit balances (for example, CAMS Capital Gain / Loss Statement with Redemption rows, Purchase Date, Indexed Cost, Short Term / Long Term gain), you MUST set:
+CRITICAL STATEMENT TYPE & EXCEL WORKBOOK RULES (DO NOT VIOLATE):
+1. Check the document title, worksheet names, and table columns FIRST.
+2. If the file is a "Capital Gain / Loss Statement", "Tax P&L", "Realized Gain/Loss", or "Redemption Statement" that ONLY lists sold/redeemed/switched-out tax lots WITHOUT current open/closing unit balances (for example, CAMS Capital Gain / Loss Statement or Zerodha Tax P&L XLSX with only realized trades), you MUST set:
    "statementType": "capital_gains_only",
    "holdings": []
    NEVER treat redeemed/sold units as active portfolio holdings!
-3. If the file has BOTH historical transactions AND a "Closing Unit Balance" / "Open Positions" / "Ending Balance" column or summary (e.g. Detailed CAMS CAS or IBKR Activity Statement), set "statementType": "holdings" and extract ONLY the current open/closing balance for each asset where units > 0. Ignore zero-balance folios and closed positions.
+3. If the file has BOTH historical transactions AND a "Closing Unit Balance" / "Open Positions" / "Ending Balance" column or summary, set "statementType": "holdings" and extract ONLY the current open/closing balance for each asset where units > 0. Ignore zero-balance folios and closed positions.
+4. For Excel (.xlsx / .xls) workbooks containing "=== Excel Worksheet: <Name> ===" sections:
+   - Skip metadata/header preamble rows above the actual column header row (e.g. Client ID, Unrealized P&L summary, disclaimers).
+   - Extract active holdings across separate asset worksheets (e.g. "Equity" and "Mutual Funds"), but do NOT double-count an overview/combined summary sheet if individual sheets already list the same positions.
 
 BROKER, TICKER & CURRENCY RULES:
 - CAMS / KFintech / MFCentral CAS:
@@ -3236,9 +3308,10 @@ BROKER, TICKER & CURRENCY RULES:
   - currency: "INR".
   - Extract the 12-char "INF..." ISIN into "isin" whenever shown!
   - assetClass: MUST be "Debt" if scheme name contains "Arbitrage", "Liquid", "Money Market", "Overnight", "Ultra Short", "Low Duration", "Short Term", "Short Duration", "Corporate Bond", "Gilt", "Banking and PSU", "Banking & PSU", "Dynamic Bond", "Floater", or "Debt"; otherwise "Mutual Fund".
-- Zerodha:
+- Zerodha (XLSX / CSV / PDF):
   - provider: "Zerodha", currency: "INR".
-  - For Indian NSE/BSE stocks & ETFs (e.g. RELIANCE, INFY, TCS, HDFCBANK, NIFTYBEES, GOLDBEES), append ".NS" to ticker (e.g. "RELIANCE.NS") and set assetClass to "Equity" (except LIQUIDBEES / LIQUIDCASE / GILT / BHARATBOND -> "Debt"). For Coin Mutual Funds, set assetClass to "Mutual Fund" (or "Debt" if Arbitrage/Debt).
+  - In Zerodha Console Holdings XLSX/CSV ("Quantity Available", "Quantity Discrepant", "Quantity Long Term", "Quantity Pledged (Margin)", "Quantity Pledged (Loan)", "Previous Closing Price"): note that "Quantity Long Term" is ALREADY a subset of "Quantity Available" — NEVER add "Quantity Long Term" on top of "Quantity Available"! Total units = Quantity Available + Quantity Discrepant + Quantity Pledged (Margin) + Quantity Pledged (Loan).
+  - For Indian NSE/BSE stocks & ETFs (e.g. RELIANCE, INFY, TCS, HDFCBANK, NIFTYBEES, GOLDBEES), append ".NS" to ticker (e.g. "RELIANCE.NS") and set assetClass to "Equity" (except LIQUIDBEES / LIQUIDCASE / GILT / BHARATBOND -> "Debt"). For Coin Mutual Funds (e.g. INF... ISINs or Mutual Funds worksheet), set assetClass to "Mutual Fund" (or "Debt" if Arbitrage/Debt).
 - INDmoney:
   - provider: "INDmoney".
   - For US Stocks/ETFs (DriveWealth/Alpaca statements or US stock holdings like AAPL, NVDA, MSFT, GOOGL, META, AMZN, TSLA, QCOM, VOO, QQQ, including fractional shares like 0.4521), set currency to "USD", assetClass to "Equity", and ticker to the clean US symbol (e.g. "NVDA"). For Indian MFs/stocks in INDmoney, use "INR".
@@ -3263,7 +3336,7 @@ BROKER, TICKER & CURRENCY RULES:
           }
         });
       } else {
-        promptParts[0].text += `\n\nFile Content:\n${String(content).slice(0, 350000)}`;
+        promptParts[0].text += `\n\nFile Content:\n${resolvedTextContent.slice(0, 350000)}`;
       }
 
       const text = await callGeminiJSON(promptParts);
@@ -3405,7 +3478,8 @@ BROKER, TICKER & CURRENCY RULES:
           error: "This PDF is password-protected (encrypted). Please unlock or 'Print to PDF' first (CAMS/CAS password is usually PAN or DDMMYYYY) and upload again."
         });
       }
-      res.status(500).json({ error: "Failed to extract data: " + e.message });
+      const errStatus = Number(e?.statusCode) || 500;
+      res.status(errStatus).json({ error: errStatus === 400 ? e.message : "Failed to extract data: " + e.message });
     }
   });
 
