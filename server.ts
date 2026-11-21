@@ -27,6 +27,8 @@ import {
   saveRealEstatePg,
   getTaxPlanningPg,
   saveTaxPlanningPg,
+  getRewardsHubPg,
+  saveRewardsHubPg,
   addNotificationPg,
   getNotificationsPg,
   markNotificationsReadPg,
@@ -1330,6 +1332,36 @@ async function startServer() {
     } catch (e: any) {
       const code = e.statusCode || 500;
       res.status(code).json({ error: e.message || "Failed to save tax & RSU planning records" });
+    }
+  });
+
+  // --- Dedicated PostgreSQL Credit Cards & Hotel/Airline Miles Persistence ---
+  app.get("/api/rewards/:householdId", async (req, res) => {
+    try {
+      const { householdId } = req.params;
+      await verifyCallerHouseholdAccess(req, householdId);
+      const bundle = await getRewardsHubPg(householdId);
+      res.json(bundle);
+    } catch (e: any) {
+      const code = e.statusCode || 500;
+      res.status(code).json({ error: e.message || "Failed to load credit cards & miles" });
+    }
+  });
+
+  app.post("/api/rewards/:householdId", async (req, res) => {
+    try {
+      const { householdId } = req.params;
+      await verifyCallerHouseholdAccess(req, householdId);
+      const { creditCards, loyaltyPrograms, activities } = req.body || {};
+      const saved = await saveRewardsHubPg(householdId, {
+        ...(Array.isArray(creditCards) ? { creditCards } : {}),
+        ...(Array.isArray(loyaltyPrograms) ? { loyaltyPrograms } : {}),
+        ...(Array.isArray(activities) ? { activities } : {})
+      });
+      res.json({ success: true, ...saved });
+    } catch (e: any) {
+      const code = e.statusCode || 500;
+      res.status(code).json({ error: e.message || "Failed to save credit cards & miles" });
     }
   });
 

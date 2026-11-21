@@ -9,7 +9,11 @@ import {
   HouseholdTaxPlanningBundle,
   TaxLot,
   RsuGrant,
-  TaxProfileSettings
+  TaxProfileSettings,
+  HouseholdRewardsBundle,
+  CreditCardAccount,
+  LoyaltyProgramAccount,
+  PointsActivityEntry
 } from "../types";
 import { LRUCache } from "../shared/lruCache";
 import { FX_FALLBACK_RATE } from "../shared/formatters";
@@ -44,6 +48,7 @@ const fallbackNotifications = new Map<string, NotificationRecord[]>();
 const fallbackStateKeys = new Map<string, any>();
 const fallbackRealEstate = new Map<string, RealEstateProperty[]>();
 const fallbackTaxPlanning = new Map<string, HouseholdTaxPlanningBundle>();
+const fallbackRewardsHub = new Map<string, HouseholdRewardsBundle>();
 
 // 60-second read cache for uw_app_state (avoids repeated SELECTs on /api/health & /api/email/status)
 const appStateReadCache = new LRUCache<string, any>(256, 60_000);
@@ -178,6 +183,14 @@ export async function initPostgresStore(): Promise<{
         tax_lots JSONB NOT NULL DEFAULT '[]'::jsonb,
         rsu_grants JSONB NOT NULL DEFAULT '[]'::jsonb,
         tax_profile JSONB NOT NULL DEFAULT '{}'::jsonb,
+        updated_at BIGINT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS uw_rewards_hub (
+        household_id TEXT PRIMARY KEY,
+        credit_cards JSONB NOT NULL DEFAULT '[]'::jsonb,
+        loyalty_programs JSONB NOT NULL DEFAULT '[]'::jsonb,
+        activities JSONB NOT NULL DEFAULT '[]'::jsonb,
         updated_at BIGINT NOT NULL
       );
 
@@ -581,6 +594,85 @@ export async function saveTaxPlanningPg(
       JSON.stringify(merged.taxLots),
       JSON.stringify(merged.rsuGrants),
       JSON.stringify(merged.taxProfile),
+      merged.updatedAt
+    ]
+  );
+
+  return merged;
+}
+
+export async function getRewardsHubPg(householdId: string): Promise<HouseholdRewardsBundle> {
+  if (!householdId) {
+    return { creditCards: [], loyaltyPrograms: [], activities: [] };
+  }
+  if (!pgReady || !pool) {
+    return (
+      fallbackRewardsHub.get(householdId) || {
+        creditCards: [],
+        loyaltyPrograms: [],
+        activities: []
+      }
+    );
+  }
+  try {
+    const res = await pool.query(
+      "SELECT credit_cards, loyalty_programs, activities, updated_at FROM uw_rewards_hub WHERE household_id = $1 LIMIT 1",
+      [householdId]
+    );
+    if (res.rows.length > 0) {
+      const row = res.rows[0];
+      return {
+        creditCards: Array.isArray(row.credit_cards) ? (row.credit_cards as CreditCardAccount[]) : [],
+        loyaltyPrograms: Array.isArray(row.loyalty_programs)
+          ? (row.loyalty_programs as LoyaltyProgramAccount[])
+          : [],
+        activities: Array.isArray(row.activities) ? (row.activities as PointsActivityEntry[]) : [],
+        updatedAt: Number(row.updated_at) || Date.now()
+      };
+    }
+  } catch (err: any) {
+    console.warn("[Postgres] getRewardsHubPg warning:", err.message);
+  }
+  return { creditCards: [], loyaltyPrograms: [], activities: [] };
+}
+
+export async function saveRewardsHubPg(
+  householdId: string,
+  patch: Partial<HouseholdRewardsBundle>
+): Promise<HouseholdRewardsBundle> {
+  const existing = await getRewardsHubPg(householdId);
+  const merged: HouseholdRewardsBundle = {
+    creditCards: Array.isArray(patch.creditCards) ? patch.creditCards : existing.creditCards,
+    loyaltyPrograms: Array.isArray(patch.loyaltyPrograms)
+      ? patch.loyaltyPrograms
+      : existing.loyaltyPrograms,
+    activities: Array.isArray(patch.activities)
+      ? patch.activities.slice(0, 200)
+      : existing.activities,
+    updatedAt: Date.now()
+  };
+
+  if (!householdId) return merged;
+
+  if (!pgReady || !pool) {
+    fallbackRewardsHub.set(householdId, merged);
+    return merged;
+  }
+
+  await pool.query(
+    `INSERT INTO uw_rewards_hub (household_id, credit_cards, loyalty_programs, activities, updated_at)
+     VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, $5)
+     ON CONFLICT (household_id)
+     DO UPDATE SET
+       credit_cards = EXCLUDED.credit_cards,
+       loyalty_programs = EXCLUDED.loyalty_programs,
+       activities = EXCLUDED.activities,
+       updated_at = EXCLUDED.updated_at`,
+    [
+      householdId,
+      JSON.stringify(merged.creditCards),
+      JSON.stringify(merged.loyaltyPrograms),
+      JSON.stringify(merged.activities),
       merged.updatedAt
     ]
   );

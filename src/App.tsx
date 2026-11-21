@@ -9,6 +9,7 @@ import {
   Bell,
   Check,
   Copy,
+  CreditCard,
   ExternalLink,
   FileText,
   FileUp,
@@ -67,6 +68,7 @@ import {
   DashboardData,
   EmailStatusPublic,
   Holding,
+  HouseholdRewardsBundle,
   Invite,
   NotificationRecord,
   PortfolioTargets,
@@ -103,6 +105,7 @@ import {
   normalizeInviteCode
 } from './shared/formatters';
 import { DEFAULT_PORTFOLIO_TARGETS, computePortfolioStats } from './shared/portfolioMath';
+import { EMPTY_REWARDS_BUNDLE, computeRewardsHubSummary } from './shared/rewardsMath';
 
 // Lazy-loaded heavy tabs & drawers for fast initial Dashboard bundle paint
 const WealthJourneyView = lazy(() =>
@@ -110,6 +113,9 @@ const WealthJourneyView = lazy(() =>
 );
 const RealEstateView = lazy(() =>
   import('./components/RealEstateView').then((m) => ({ default: m.RealEstateView }))
+);
+const CardsMilesView = lazy(() =>
+  import('./components/CardsMilesView').then((m) => ({ default: m.CardsMilesView }))
 );
 const RebalanceView = lazy(() => import('./components/views/RebalanceView'));
 const TargetManagerView = lazy(() => import('./components/views/TargetManagerView'));
@@ -148,10 +154,11 @@ export default function App() {
   const [holdingsList, setHoldingsList] = useState<Holding[] | null>(null);
   const [fxRates, setFxRates] = useState<Record<string, number>>({ INR: FX_FALLBACK_RATE, USD: 1.0 });
   const [activeTab, setActiveTab] = useState<
-    'dashboard' | 'wealth' | 'targets' | 'accounts' | 'liveMarkets' | 'rebalance' | 'realEstate'
+    'dashboard' | 'wealth' | 'targets' | 'accounts' | 'liveMarkets' | 'rebalance' | 'realEstate' | 'cardsMiles'
   >('dashboard');
   const [dashboardView, setDashboardView] = useState<'combined' | string>('combined');
   const [realEstateProperties, setRealEstateProperties] = useState<RealEstateProperty[] | null>(null);
+  const [rewardsBundle, setRewardsBundle] = useState<HouseholdRewardsBundle>(EMPTY_REWARDS_BUNDLE);
   const [taxLots, setTaxLots] = useState<TaxLot[]>([]);
   const [rsuGrants, setRsuGrants] = useState<RsuGrant[]>([]);
   const [taxProfile, setTaxProfile] = useState<TaxProfileSettings>(DEFAULT_TAX_PROFILE);
@@ -2098,6 +2105,7 @@ export default function App() {
       setTaxLots([]);
       setRsuGrants([]);
       setTaxProfile(DEFAULT_TAX_PROFILE);
+      setRewardsBundle(EMPTY_REWARDS_BUNDLE);
       return;
     }
     let active = true;
@@ -2105,11 +2113,12 @@ export default function App() {
       try {
         const idToken = await auth.currentUser!.getIdToken();
         const headers = { Authorization: `Bearer ${idToken}` };
-        const [histRes, notifRes, reRes, taxRes] = await Promise.all([
+        const [histRes, notifRes, reRes, taxRes, rewRes] = await Promise.all([
           fetch(`/api/wealth-history/${user.householdId}`, { headers }),
           fetch(`/api/notifications/${user.householdId}`, { headers }),
           fetch(`/api/real-estate/${user.householdId}`, { headers }),
-          fetch(`/api/tax-planning/${user.householdId}`, { headers })
+          fetch(`/api/tax-planning/${user.householdId}`, { headers }),
+          fetch(`/api/rewards/${user.householdId}`, { headers })
         ]);
         if (histRes.ok && active) {
           const hj = await histRes.json();
@@ -2132,6 +2141,15 @@ export default function App() {
           if (tj.taxProfile && typeof tj.taxProfile === 'object') {
             setTaxProfile({ ...DEFAULT_TAX_PROFILE, ...tj.taxProfile });
           }
+        }
+        if (rewRes.ok && active) {
+          const rw = await rewRes.json();
+          setRewardsBundle({
+            creditCards: Array.isArray(rw.creditCards) ? rw.creditCards : [],
+            loyaltyPrograms: Array.isArray(rw.loyaltyPrograms) ? rw.loyaltyPrograms : [],
+            activities: Array.isArray(rw.activities) ? rw.activities : [],
+            updatedAt: rw.updatedAt
+          });
         }
       } catch (err) {
         console.warn('Persisted wealth/notification fetch warning:', err);
@@ -2239,6 +2257,46 @@ export default function App() {
       body: JSON.stringify({ taxProfile: nextProfile })
     });
   };
+
+  const handleSaveRewardsBundle = async (patch: Partial<HouseholdRewardsBundle>) => {
+    if (!user?.householdId || !auth.currentUser) return;
+    const optimistic: HouseholdRewardsBundle = {
+      creditCards: Array.isArray(patch.creditCards) ? patch.creditCards : rewardsBundle.creditCards,
+      loyaltyPrograms: Array.isArray(patch.loyaltyPrograms)
+        ? patch.loyaltyPrograms
+        : rewardsBundle.loyaltyPrograms,
+      activities: Array.isArray(patch.activities) ? patch.activities : rewardsBundle.activities,
+      updatedAt: Date.now()
+    };
+    setRewardsBundle(optimistic);
+    const idToken = await auth.currentUser.getIdToken();
+    const res = await fetch(`/api/rewards/${user.householdId}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${idToken}`
+      },
+      body: JSON.stringify(patch)
+    });
+    if (!res.ok) {
+      const errJson = await res.json().catch(() => ({}));
+      throw new Error(errJson.error || 'Failed to save Cards & Miles');
+    }
+    const saved = await res.json();
+    if (saved && Array.isArray(saved.creditCards)) {
+      setRewardsBundle({
+        creditCards: saved.creditCards,
+        loyaltyPrograms: Array.isArray(saved.loyaltyPrograms) ? saved.loyaltyPrograms : optimistic.loyaltyPrograms,
+        activities: Array.isArray(saved.activities) ? saved.activities : optimistic.activities,
+        updatedAt: saved.updatedAt
+      });
+    }
+  };
+
+  const rewardsSummary = useMemo(
+    () => computeRewardsHubSummary(rewardsBundle, memberOptions),
+    [rewardsBundle, memberOptions]
+  );
 
   const handleConfirmTrancheVested = async (ev: UpcomingVestEvent) => {
     if (!user?.householdId || !auth.currentUser || !data) return;
@@ -2397,6 +2455,7 @@ export default function App() {
       taxLots,
       rsuGrants,
       taxProfile,
+      rewardsHub: rewardsBundle,
       wealthSnapshots
     };
     const blob = new Blob([JSON.stringify(exportPayload, null, 2)], {
@@ -2467,6 +2526,13 @@ export default function App() {
       }
       if (backup?.taxProfile && typeof backup.taxProfile === 'object') {
         await handleSaveTaxProfile({ ...DEFAULT_TAX_PROFILE, ...backup.taxProfile });
+      }
+      if (backup?.rewardsHub && typeof backup.rewardsHub === 'object') {
+        await handleSaveRewardsBundle({
+          ...(Array.isArray(backup.rewardsHub.creditCards) ? { creditCards: backup.rewardsHub.creditCards } : {}),
+          ...(Array.isArray(backup.rewardsHub.loyaltyPrograms) ? { loyaltyPrograms: backup.rewardsHub.loyaltyPrograms } : {}),
+          ...(Array.isArray(backup.rewardsHub.activities) ? { activities: backup.rewardsHub.activities } : {})
+        });
       }
 
       setNotification({
@@ -2835,6 +2901,19 @@ export default function App() {
       });
     }
 
+    if (rewardsSummary.alerts.length > 0) {
+      rewardsSummary.alerts.slice(0, 3).forEach((al) => {
+        alerts.push({
+          id: `rew_${al.id}`,
+          severity: al.severity,
+          title: al.title,
+          message: al.message,
+          actionLabel: 'Open Cards & Miles',
+          onAction: () => setActiveTab('cardsMiles')
+        });
+      });
+    }
+
     return alerts;
   }, [
     householdStats,
@@ -2843,7 +2922,8 @@ export default function App() {
     taxLots,
     taxProfile,
     memberOptions,
-    fxRates.INR
+    fxRates.INR,
+    rewardsSummary.alerts
   ]);
 
   const unreadAlertBadgeCount = useMemo(
@@ -2993,6 +3073,20 @@ export default function App() {
                 realEstateTotals.totalEquityINR > 0
                   ? formatCompactINR(realEstateTotals.totalEquityINR)
                   : undefined
+              }
+            />
+            <SidebarBtn
+              active={activeTab === 'cardsMiles'}
+              onClick={() => {
+                setActiveTab('cardsMiles');
+                setIsMenuOpen(false);
+              }}
+              icon={<CreditCard size={18} />}
+              label="Cards & Miles"
+              badge={
+                rewardsSummary.totalRewardsWealthINR > 0
+                  ? formatCompactINR(rewardsSummary.totalRewardsWealthINR)
+                  : 'NEW'
               }
             />
             <SidebarBtn
@@ -3811,6 +3905,24 @@ export default function App() {
                       properties={effectiveRealEstateList}
                       onSaveProperties={handleSaveRealEstateProperties}
                       onImportSheet={handleImportRealEstateSheet}
+                    />
+                  </motion.div>
+                )}
+
+                {activeTab === 'cardsMiles' && (
+                  <motion.div
+                    key="cardsMiles"
+                    initial={{ opacity: 0, y: 16 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    exit={{ opacity: 0, y: -16 }}
+                  >
+                    <CardsMilesView
+                      householdId={user.householdId || ''}
+                      members={memberOptions}
+                      defaultOwnerId={dashboardView !== 'combined' ? dashboardView : user.id}
+                      bundle={rewardsBundle}
+                      realEstateProperties={effectiveRealEstateList}
+                      onSaveBundle={handleSaveRewardsBundle}
                     />
                   </motion.div>
                 )}
