@@ -197,6 +197,20 @@ export interface WealthSnapshotRecord {
   note?: string;
 }
 
+export interface DailyWealthRecord {
+  householdId: string;
+  dateKey: string; // YYYY-MM-DD (IST)
+  totalNetWorthINR: number;
+  equityINR: number;
+  debtINR: number;
+  indianEquityINR: number;
+  foreignEquityINR: number;
+  realEstateEquityINR: number;
+  fxRateINR: number;
+  memberBreakdown: MemberSnapshotBreakdown[];
+  updatedAt: number;
+}
+
 export interface NotificationRecord {
   id: string;
   householdId: string;

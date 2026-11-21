@@ -65,6 +65,7 @@ import {
 import {
   AssetClass,
   Currency,
+  DailyWealthRecord,
   DashboardData,
   EmailStatusPublic,
   Holding,
@@ -169,6 +170,8 @@ export default function App() {
   const [showSyncModal, setShowSyncModal] = useState(false);
   const [showJoinByCodeModal, setShowJoinByCodeModal] = useState(false);
   const [wealthSnapshots, setWealthSnapshots] = useState<WealthSnapshotRecord[]>([]);
+  const [dailyWealth, setDailyWealth] = useState<DailyWealthRecord[]>([]);
+  const lastDailyUpsertSigRef = useRef<string>('');
   const [isRecordingSnapshot, setIsRecordingSnapshot] = useState(false);
   const [appNotifications, setAppNotifications] = useState<NotificationRecord[]>([]);
   const [showNotifications, setShowNotifications] = useState(false);
@@ -2106,6 +2109,7 @@ export default function App() {
       setRsuGrants([]);
       setTaxProfile(DEFAULT_TAX_PROFILE);
       setRewardsBundle(EMPTY_REWARDS_BUNDLE);
+      setDailyWealth([]);
       return;
     }
     let active = true;
@@ -2113,12 +2117,13 @@ export default function App() {
       try {
         const idToken = await auth.currentUser!.getIdToken();
         const headers = { Authorization: `Bearer ${idToken}` };
-        const [histRes, notifRes, reRes, taxRes, rewRes] = await Promise.all([
+        const [histRes, notifRes, reRes, taxRes, rewRes, dailyRes] = await Promise.all([
           fetch(`/api/wealth-history/${user.householdId}`, { headers }),
           fetch(`/api/notifications/${user.householdId}`, { headers }),
           fetch(`/api/real-estate/${user.householdId}`, { headers }),
           fetch(`/api/tax-planning/${user.householdId}`, { headers }),
-          fetch(`/api/rewards/${user.householdId}`, { headers })
+          fetch(`/api/rewards/${user.householdId}`, { headers }),
+          fetch(`/api/wealth-daily/${user.householdId}`, { headers })
         ]);
         if (histRes.ok && active) {
           const hj = await histRes.json();
@@ -2150,6 +2155,10 @@ export default function App() {
             activities: Array.isArray(rw.activities) ? rw.activities : [],
             updatedAt: rw.updatedAt
           });
+        }
+        if (dailyRes.ok && active) {
+          const dj = await dailyRes.json();
+          if (Array.isArray(dj.records)) setDailyWealth(dj.records);
         }
       } catch (err) {
         console.warn('Persisted wealth/notification fetch warning:', err);
@@ -2560,6 +2569,104 @@ export default function App() {
     await deleteDoc(doc(db, 'holdings', id));
     setNotification({ message: 'Holding deleted', type: 'success' });
   };
+
+  // Automatic Daily Wealth Capture (upserts today's IST YYYY-MM-DD valuation + refreshes unattended pricing manifest)
+  useEffect(() => {
+    if (!user?.householdId || !auth.currentUser || !householdStats || !(householdStats.totalValINR > 0)) return;
+    const nowIst = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+    const todayIstKey = nowIst.toISOString().slice(0, 10);
+    const sig = `${user.householdId}|${todayIstKey}|${Math.round(householdStats.totalValINR / 100)}|${Math.round(realEstateTotals.totalEquityINR / 100)}`;
+    if (lastDailyUpsertSigRef.current === sig) return;
+    lastDailyUpsertSigRef.current = sig;
+
+    const timer = setTimeout(async () => {
+      try {
+        if (!auth.currentUser || !user?.householdId) return;
+        const idToken = await auth.currentUser.getIdToken();
+        const rate = fxRates.INR || FX_FALLBACK_RATE;
+        const byMember = new Map<string, { id: string; name: string; valueINR: number; indianEquityINR: number; foreignEquityINR: number; debtINR: number; realEstateEquityINR: number }>();
+        memberOptions.forEach((m) => {
+          byMember.set(m.id, {
+            id: m.id,
+            name: m.name,
+            valueINR: 0,
+            indianEquityINR: 0,
+            foreignEquityINR: 0,
+            debtINR: 0,
+            realEstateEquityINR: Math.round(realEstateTotals.byMemberEquityINR[m.id] || 0)
+          });
+        });
+        (householdStats.holdings || []).forEach((h: any) => {
+          const ownerId = getHoldingOwnerId(h, user.id);
+          const entry = byMember.get(ownerId);
+          if (!entry) return;
+          const v = Number(h.valINR) || 0;
+          entry.valueINR += v;
+          if (h.isDebt) entry.debtINR += v;
+          else if (h.isForeign) entry.foreignEquityINR += v;
+          else entry.indianEquityINR += v;
+        });
+
+        const payload = {
+          dateKey: todayIstKey,
+          totalNetWorthINR: Math.round(householdStats.totalValINR),
+          equityINR: Math.round((householdStats.indianEquityValINR || 0) + (householdStats.foreignEquityValINR || 0)),
+          debtINR: Math.round(householdStats.debtValINR || 0),
+          indianEquityINR: Math.round(householdStats.indianEquityValINR || 0),
+          foreignEquityINR: Math.round(householdStats.foreignEquityValINR || 0),
+          realEstateEquityINR: Math.round(realEstateTotals.totalEquityINR || 0),
+          realEstateByMember: realEstateTotals.byMemberEquityINR,
+          fxRateINR: rate,
+          members: memberOptions,
+          memberBreakdown: Array.from(byMember.values()).map((x) => ({
+            ...x,
+            valueINR: Math.round(x.valueINR),
+            indianEquityINR: Math.round(x.indianEquityINR),
+            foreignEquityINR: Math.round(x.foreignEquityINR),
+            debtINR: Math.round(x.debtINR)
+          })),
+          pricingManifest: (householdStats.holdings || []).map((h: any) => ({
+            ticker: h.ticker,
+            quantity: Number(h.quantity) || 0,
+            currentPrice: Number(h.currentPrice) || 0,
+            currency: h.currency === 'USD' ? 'USD' : 'INR',
+            assetClass: h.isDebt ? 'Debt' : h.assetClass || 'Equity',
+            ownerId: getHoldingOwnerId(h, user.id)
+          }))
+        };
+
+        const res = await fetch(`/api/wealth-daily/${user.householdId}`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${idToken}`
+          },
+          body: JSON.stringify(payload)
+        });
+        if (res.ok) {
+          const json = await res.json();
+          if (json?.record?.dateKey) {
+            setDailyWealth((prev) => {
+              const filtered = prev.filter((r) => r.dateKey !== json.record.dateKey);
+              return [...filtered, json.record].sort((a, b) => a.dateKey.localeCompare(b.dateKey));
+            });
+          }
+        }
+      } catch {
+        // non-fatal
+      }
+    }, 2500);
+
+    return () => clearTimeout(timer);
+  }, [
+    user?.householdId,
+    householdStats?.totalValINR,
+    householdStats?.indianEquityValINR,
+    householdStats?.foreignEquityValINR,
+    householdStats?.debtValINR,
+    realEstateTotals.totalEquityINR,
+    fxRates.INR
+  ]);
 
   const recordWealthSnapshot = async (sourceLabel = 'manual_snapshot', showFeedback = false) => {
     if (
@@ -3869,6 +3976,7 @@ export default function App() {
                   >
                     <WealthJourneyView
                       snapshots={wealthSnapshots}
+                      dailyRecords={dailyWealth}
                       stats={householdStats}
                       holdings={householdStats?.holdings || data.holdings}
                       targets={data.household.targets}

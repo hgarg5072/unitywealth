@@ -29,6 +29,9 @@ import {
   saveTaxPlanningPg,
   getRewardsHubPg,
   saveRewardsHubPg,
+  getDailyWealthPg,
+  upsertDailyWealthPg,
+  listStateKeysByPrefixPg,
   addNotificationPg,
   getNotificationsPg,
   markNotificationsReadPg,
@@ -1365,6 +1368,68 @@ async function startServer() {
     }
   });
 
+  // --- Dedicated PostgreSQL Daily Wealth Tracking (365 rows/yr/household, ~110 KB/yr) ---
+  function getTodayIstDateKey(): string {
+    const nowIst = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+    return nowIst.toISOString().slice(0, 10);
+  }
+
+  app.get("/api/wealth-daily/:householdId", async (req, res) => {
+    try {
+      const { householdId } = req.params;
+      await verifyCallerHouseholdAccess(req, householdId);
+      const days = Math.min(1825, Math.max(7, Number(req.query.days) || 400));
+      const records = await getDailyWealthPg(householdId, days);
+      res.json({ records });
+    } catch (e: any) {
+      const code = e.statusCode || 500;
+      res.status(code).json({ error: e.message || "Failed to load daily wealth history" });
+    }
+  });
+
+  app.post("/api/wealth-daily/:householdId", async (req, res) => {
+    try {
+      const { householdId } = req.params;
+      await verifyCallerHouseholdAccess(req, householdId);
+      const body = req.body || {};
+      const dateKey =
+        typeof body.dateKey === "string" && /^\d{4}-\d{2}-\d{2}$/.test(body.dateKey)
+          ? body.dateKey
+          : getTodayIstDateKey();
+
+      const saved = await upsertDailyWealthPg({
+        householdId,
+        dateKey,
+        totalNetWorthINR: Number(body.totalNetWorthINR) || 0,
+        equityINR: Number(body.equityINR) || 0,
+        debtINR: Number(body.debtINR) || 0,
+        indianEquityINR: Number(body.indianEquityINR) || 0,
+        foreignEquityINR: Number(body.foreignEquityINR) || 0,
+        realEstateEquityINR: Number(body.realEstateEquityINR) || 0,
+        fxRateINR: Number(body.fxRateINR) || FX_FALLBACK_RATE,
+        memberBreakdown: Array.isArray(body.memberBreakdown) ? body.memberBreakdown : [],
+        updatedAt: Date.now()
+      });
+
+      // Optionally persist lightweight pricing manifest so server can auto-update daily wealth even on days app isn't opened
+      if (Array.isArray(body.pricingManifest) && body.pricingManifest.length > 0) {
+        saveAppStatePg(`daily_manifest:${householdId}`, {
+          householdId,
+          realEstateEquityINR: Number(body.realEstateEquityINR) || 0,
+          realEstateByMember: body.realEstateByMember || {},
+          members: Array.isArray(body.members) ? body.members : [],
+          holdings: body.pricingManifest.slice(0, 300),
+          updatedAt: Date.now()
+        }).catch(() => {});
+      }
+
+      res.json({ success: true, record: saved });
+    } catch (e: any) {
+      const code = e.statusCode || 500;
+      res.status(code).json({ error: e.message || "Failed to save daily wealth record" });
+    }
+  });
+
   app.post("/api/ai/wealth-copilot", async (req, res) => {
     try {
       const { householdId, question, contextSummary } = req.body || {};
@@ -1655,13 +1720,130 @@ Return ONLY a valid JSON object matching this exact schema:
     return out;
   }
 
+  // Live India 24-Carat (999) Gold price engine (COMEX GC=F / TVC:GOLD * USD/INR / 31.1034768 * 1.0918 customs+GST)
+  const TROY_OZ_GRAMS = 31.1034768;
+  const INDIA_GOLD_LANDED_FACTOR = 1.06 * 1.03; // 6% India Customs/AIDC + 3% GST (~IBJA 24K retail rate)
+  let gold24kCache: {
+    perGramINR: number;
+    per10GramINR: number;
+    changePct: number;
+    spotUsdPerOz: number;
+    usdInr: number;
+    source: string;
+    ts: number;
+  } | null = null;
+
+  async function getIndia24kGoldPrice() {
+    const now = Date.now();
+    if (gold24kCache && now - gold24kCache.ts < 5 * 60 * 1000) {
+      return gold24kCache;
+    }
+    const usdInr = await getUsdInrRate();
+    let spotUsdPerOz = 0;
+    let changePct = 0;
+    let source = "COMEX";
+
+    // 1. Primary: TradingView TVC:GOLD (fast, single POST, includes daily % change)
+    try {
+      const tvRes = await axios.post(
+        "https://scanner.tradingview.com/cfd/scan",
+        { symbols: { tickers: ["TVC:GOLD"] }, columns: ["close", "change"] },
+        { timeout: 5000, headers: { "Content-Type": "application/json", "User-Agent": YAHOO_HEADERS["User-Agent"] } }
+      );
+      const row = tvRes.data?.data?.[0];
+      if (typeof row?.d?.[0] === "number" && row.d[0] > 1000) {
+        spotUsdPerOz = Number(row.d[0]);
+        changePct = typeof row.d[1] === "number" ? Number(row.d[1]) : 0;
+        source = "Spot XAU/USD";
+      }
+    } catch {
+      // fall through to Yahoo GC=F
+    }
+
+    // 2. Fallback: Yahoo Finance COMEX Gold Futures (GC=F)
+    if (!spotUsdPerOz) {
+      try {
+        const yRes = await axios.get("https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1d&range=5d", {
+          headers: YAHOO_HEADERS,
+          timeout: 5000
+        });
+        const meta = yRes.data?.chart?.result?.[0]?.meta;
+        const p = Number(meta?.regularMarketPrice || 0);
+        const prev = Number(meta?.chartPreviousClose || meta?.previousClose || 0);
+        if (p > 1000) {
+          spotUsdPerOz = p;
+          changePct = prev > 0 ? Number((((p - prev) / prev) * 100).toFixed(2)) : 0;
+          source = "COMEX GC=F";
+        }
+      } catch {
+        // fall through to cache
+      }
+    }
+
+    if (spotUsdPerOz > 0) {
+      const perGramINR = Number(((spotUsdPerOz / TROY_OZ_GRAMS) * usdInr * INDIA_GOLD_LANDED_FACTOR).toFixed(2));
+      const per10GramINR = Math.round(perGramINR * 10);
+      gold24kCache = {
+        perGramINR,
+        per10GramINR,
+        changePct: Number(changePct.toFixed(2)),
+        spotUsdPerOz: Number(spotUsdPerOz.toFixed(2)),
+        usdInr: Number(usdInr.toFixed(2)),
+        source,
+        ts: now
+      };
+      return gold24kCache;
+    }
+
+    if (gold24kCache) return gold24kCache;
+    // Safe fallback if all upstream feeds temporarily fail
+    return {
+      perGramINR: 7850,
+      per10GramINR: 78500,
+      changePct: 0,
+      spotUsdPerOz: 2650,
+      usdInr,
+      source: "Estimated",
+      ts: now
+    };
+  }
+
+  app.get("/api/gold-24k", async (_req, res) => {
+    try {
+      const g = await getIndia24kGoldPrice();
+      res.json({
+        symbol: "GOLD24K.IN",
+        perGramINR: g.perGramINR,
+        per10GramINR: g.per10GramINR,
+        changePct: g.changePct,
+        spotUsdPerOz: g.spotUsdPerOz,
+        usdInr: g.usdInr,
+        source: g.source,
+        updatedAt: g.ts
+      });
+    } catch {
+      res.status(500).json({ error: "Failed to fetch live 24K gold price" });
+    }
+  });
+
   async function fetchLiveStockPrices(symbols: string[]) {
     if (symbols.length === 0) return {};
 
     const priceMap: Record<string, number> = {};
     const uncached: string[] = [];
 
+    // Resolve live India 24K Gold per-gram symbols directly
+    const goldSymbols = symbols.filter((s) => /^(GOLD24K\.IN|GOLD-24K|GOLD24K)$/i.test(s.trim()));
+    if (goldSymbols.length > 0) {
+      const g = await getIndia24kGoldPrice();
+      for (const gs of goldSymbols) {
+        priceMap[gs] = g.perGramINR;
+        stockQuoteCache.set(gs.toUpperCase(), g.perGramINR);
+      }
+    }
+
     for (const sym of symbols) {
+      if (priceMap[sym] && priceMap[sym] > 0) continue;
       const cachedPrice = stockQuoteCache.get(sym.toUpperCase());
       if (cachedPrice && cachedPrice > 0) {
         priceMap[sym] = cachedPrice;
@@ -1854,14 +2036,16 @@ Return ONLY a valid JSON object matching this exact schema:
       const sensex = tvMap.get("BSE:SENSEX");
       const spy = tvMap.get("AMEX:SPY");
       const qqq = tvMap.get("NASDAQ:QQQ");
-      const gld = tvMap.get("AMEX:GLD");
+      const gold24k = await getIndia24kGoldPrice().catch(() => null);
 
       const benchmarks = [
         nifty ? { id: "nifty50", label: "NIFTY 50", value: nifty.price, changePct: nifty.changePct, prefix: "" } : null,
         sensex ? { id: "sensex", label: "SENSEX", value: sensex.price, changePct: sensex.changePct, prefix: "" } : null,
         spy ? { id: "sp500", label: "S&P 500 (SPY)", value: spy.price, changePct: spy.changePct, prefix: "$" } : null,
         qqq ? { id: "nasdaq", label: "NASDAQ (QQQ)", value: qqq.price, changePct: qqq.changePct, prefix: "$" } : null,
-        gld ? { id: "gold", label: "GOLD ETF", value: gld.price, changePct: gld.changePct, prefix: "$" } : null,
+        gold24k
+          ? { id: "gold24k", label: "24K GOLD (10g)", value: gold24k.per10GramINR, changePct: gold24k.changePct, prefix: "₹" }
+          : null,
         { id: "usdinr", label: "USD / INR", value: usdInr, changePct: 0, prefix: "₹" }
       ].filter(Boolean);
 
@@ -2121,6 +2305,52 @@ Return ONLY a valid JSON object matching this exact schema:
     const minTsMs = Date.now() - windowDays * 24 * 60 * 60 * 1000;
 
     try {
+      // Live India 24K Gold history (COMEX GC=F converted to India 24K ₹/gram)
+      if (/^(GOLD24K\.IN|GOLD-24K|GOLD24K)$/i.test(rawSymbol)) {
+        const yRange = rangeKey === "6M" ? "6mo" : rangeKey === "1Y" ? "1y" : rangeKey === "3Y" ? "3y" : "5y";
+        const yInterval = rangeKey === "6M" || rangeKey === "1Y" ? "1d" : "1wk";
+        const usdInr = await getUsdInrRate();
+        try {
+          const yRes = await axios.get(
+            `https://query1.finance.yahoo.com/v8/finance/chart/GC%3DF?interval=${yInterval}&range=${yRange}`,
+            { headers: YAHOO_HEADERS, timeout: 7000 }
+          );
+          const result = yRes.data?.chart?.result?.[0];
+          const timestamps: number[] = result?.timestamp || [];
+          const closes: (number | null)[] = result?.indicators?.quote?.[0]?.close || [];
+          const pts: { date: string; label: string; price: number }[] = [];
+          for (let i = 0; i < timestamps.length; i++) {
+            const c = closes[i];
+            if (typeof c === "number" && c > 0 && timestamps[i]) {
+              const iso = new Date(timestamps[i] * 1000).toISOString().slice(0, 10);
+              const perGramINR = Number(((c / TROY_OZ_GRAMS) * usdInr * INDIA_GOLD_LANDED_FACTOR).toFixed(2));
+              pts.push({
+                date: iso,
+                label: formatShortHistoryLabel(iso, rangeKey),
+                price: perGramINR
+              });
+            }
+          }
+          if (pts.length >= 2) {
+            const sampled = downsamplePoints(pts, 52);
+            const first = sampled[0].price;
+            const last = sampled[sampled.length - 1].price;
+            const payload = {
+              symbol: rawSymbol,
+              source: "COMEX 24K India",
+              currency: "INR",
+              range: rangeKey,
+              changePct: first > 0 ? Number((((last - first) / first) * 100).toFixed(2)) : 0,
+              points: sampled
+            };
+            assetHistoryCache.set(cacheKey, payload);
+            return res.json(payload);
+          }
+        } catch {
+          // fall through
+        }
+      }
+
       let schemeCode = /^\d{5,6}$/.test(rawSymbol) ? rawSymbol : "";
       if (!schemeCode && (rawName || rawSymbol)) {
         const isExplicitStock =
@@ -3211,6 +3441,95 @@ BROKER, TICKER & CURRENCY RULES:
         );
       });
     }, 4 * 60 * 60 * 1000);
+
+    // Unattended Daily Wealth Capture (runs every 6 hours, upserting today's IST YYYY-MM-DD valuation using live quotes)
+    const runUnattendedDailyWealthCapture = async () => {
+      try {
+        const manifests = await listStateKeysByPrefixPg("daily_manifest:");
+        if (manifests.length === 0) return;
+        const usdInr = await getUsdInrRate();
+        const amfiIndex = await getAmfiIndex();
+        const todayIst = getTodayIstDateKey();
+
+        for (const item of manifests) {
+          const m = item.payload;
+          if (!m?.householdId || !Array.isArray(m.holdings) || m.holdings.length === 0) continue;
+
+          const stockSyms = Array.from(
+            new Set<string>(
+              m.holdings
+                .filter((h: any) => h.ticker && !/^\d{5,6}$/.test(String(h.ticker)) && !/^(MANUAL|EPF-PPF|BANK-FD|NPS-CORPUS|CASH-INR|US-CASH)$/i.test(String(h.ticker)))
+                .map((h: any) => String(h.ticker))
+            )
+          );
+          const livePrices = stockSyms.length > 0 ? await fetchLiveStockPrices(stockSyms) : {};
+
+          let indianEq = 0;
+          let foreignEq = 0;
+          let debt = 0;
+          const byMember = new Map<string, { id: string; name: string; valueINR: number; realEstateEquityINR: number }>();
+          for (const mem of m.members || []) {
+            byMember.set(mem.id, {
+              id: mem.id,
+              name: mem.name,
+              valueINR: 0,
+              realEstateEquityINR: Number(m.realEstateByMember?.[mem.id] || 0)
+            });
+          }
+
+          for (const h of m.holdings) {
+            const qty = Number(h.quantity) || 0;
+            if (qty <= 0) continue;
+            const ticker = String(h.ticker || "");
+            let price = Number(h.currentPrice) || 0;
+            if (/^\d{5,6}$/.test(ticker)) {
+              const mf = amfiIndex.byCode.get(ticker);
+              if (mf && mf.currentPrice > 0) price = mf.currentPrice;
+            } else if (livePrices[ticker] && livePrices[ticker] > 0) {
+              price = livePrices[ticker];
+            }
+            const valINR = h.currency === "USD" ? qty * price * usdInr : qty * price;
+            if (h.assetClass === "Debt") {
+              debt += valINR;
+            } else if (h.currency === "USD") {
+              foreignEq += valINR;
+            } else {
+              indianEq += valINR;
+            }
+            const owner = byMember.get(h.ownerId);
+            if (owner) owner.valueINR += valINR;
+          }
+
+          const equityINR = indianEq + foreignEq;
+          const totalNetWorthINR = equityINR + debt;
+          if (totalNetWorthINR <= 0) continue;
+
+          await upsertDailyWealthPg({
+            householdId: m.householdId,
+            dateKey: todayIst,
+            totalNetWorthINR,
+            equityINR,
+            debtINR: debt,
+            indianEquityINR: indianEq,
+            foreignEquityINR: foreignEq,
+            realEstateEquityINR: Number(m.realEstateEquityINR) || 0,
+            fxRateINR: usdInr,
+            memberBreakdown: Array.from(byMember.values()).map((x) => ({
+              id: x.id,
+              name: x.name,
+              valueINR: Math.round(x.valueINR),
+              realEstateEquityINR: Math.round(x.realEstateEquityINR)
+            })),
+            updatedAt: Date.now()
+          });
+        }
+      } catch (err: any) {
+        console.warn("[DailyWealth] Unattended capture warning:", err.message);
+      }
+    };
+
+    setTimeout(() => runUnattendedDailyWealthCapture(), 45_000);
+    setInterval(() => runUnattendedDailyWealthCapture(), 6 * 60 * 60 * 1000);
   });
 }
 

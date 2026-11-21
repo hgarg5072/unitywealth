@@ -43,6 +43,7 @@ import type {
   HoldingSnapshotBreakdown,
   RebalanceSnapshotMeta,
   WealthSnapshotRecord,
+  DailyWealthRecord,
   TaxLot,
   RsuGrant
 } from '../types';
@@ -199,10 +200,16 @@ function cleanDisplayAssetName(raw: string, ticker?: string): string {
 }
 
 function formatMonthLabel(ym: string): string {
-  const [y, m] = (ym || '').split('-');
+  const parts = (ym || '').split('-');
   const names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+  const y = parts[0];
+  const m = parts[1];
+  const d = parts[2];
   const idx = parseInt(m, 10) - 1;
   if (!y || isNaN(idx) || idx < 0 || idx > 11) return ym;
+  if (d) {
+    return `${parseInt(d, 10)} ${names[idx]}`;
+  }
   return `${names[idx]} '${y.slice(-2)}`;
 }
 
@@ -214,6 +221,7 @@ type ChartLens = 'netWorth' | 'equityDebt' | 'indiaForeign' | 'rebalance' | 'sto
 
 interface Props {
   snapshots: WealthSnapshotItem[];
+  dailyRecords?: DailyWealthRecord[];
   stats: any;
   holdings?: any[];
   targets?: {
@@ -249,6 +257,7 @@ interface Props {
 
 export function WealthJourneyView({
   snapshots,
+  dailyRecords = [],
   stats,
   holdings = [],
   targets,
@@ -275,9 +284,11 @@ export function WealthJourneyView({
     if (onScopeChange) onScopeChange(next);
   };
   const [lens, setLens] = useState<ChartLens>('netWorth');
+  const [cadence, setCadence] = useState<'monthly' | 'daily'>('monthly');
   const [unitMode, setUnitMode] = useState<'value' | 'pct'>('value');
   const [currency, setCurrency] = useState<'INR' | 'USD'>('INR');
   const [range, setRange] = useState<'6M' | '1Y' | '3Y' | 'ALL'>('1Y');
+  const [dailyRange, setDailyRange] = useState<'7D' | '30D' | '90D' | '1Y' | 'ALL'>('30D');
 
   // Stock / Fund Explorer State
   const [selectedAssetKey, setSelectedAssetKey] = useState<string>('');
@@ -550,12 +561,70 @@ export function WealthJourneyView({
       });
     }
 
+    if (cadence === 'daily') {
+      const dayMap = new Map<string, WealthSnapshotItem>();
+      (dailyRecords || []).forEach((d) => {
+        if (!d?.dateKey) return;
+        const eq = (d.indianEquityINR || 0) + (d.foreignEquityINR || 0);
+        const tot = d.totalNetWorthINR || eq + (d.debtINR || 0);
+        const actualEqPct = tot > 0 ? (eq / tot) * 100 : 0;
+        const actualIndOfEqPct = eq > 0 ? ((d.indianEquityINR || 0) / eq) * 100 : 0;
+        const alignPct = Math.max(0, 100 - Math.abs(actualEqPct - targetEqPct));
+        dayMap.set(d.dateKey, {
+          householdId: d.householdId || '',
+          snapshotMonth: d.dateKey,
+          recordedAt: d.updatedAt || Date.now(),
+          totalINR: tot,
+          totalUSD: tot / (d.fxRateINR || safeFx),
+          indianEquityINR: d.indianEquityINR || 0,
+          foreignEquityINR: d.foreignEquityINR || 0,
+          debtINR: d.debtINR || 0,
+          realEstateEquityINR: d.realEstateEquityINR ?? realEstateEquityINR,
+          fxRate: d.fxRateINR || safeFx,
+          holdingsCount: holdings.length,
+          memberBreakdown: d.memberBreakdown || [],
+          providerBreakdown: {},
+          rebalanceMeta: {
+            actualEquityPct: Number(actualEqPct.toFixed(1)),
+            targetEquityPct: Number(targetEqPct.toFixed(1)),
+            actualIndianOfEqPct: Number(actualIndOfEqPct.toFixed(1)),
+            targetIndianOfEqPct: Number(targetIndOfEqPct.toFixed(1)),
+            alignmentPct: Number(alignPct.toFixed(1))
+          },
+          source: 'daily',
+          note: `Daily valuation (${d.dateKey})`
+        });
+      });
+
+      // Always upsert today's live IST point so Daily chart reflects live prices immediately
+      const liveToday = map.get(currentYm);
+      if (liveToday) {
+        const nowIst = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+        const todayIstKey = nowIst.toISOString().slice(0, 10);
+        dayMap.set(todayIstKey, {
+          ...liveToday,
+          snapshotMonth: todayIstKey,
+          source: 'live',
+          note: 'Live today'
+        });
+      }
+
+      const sortedDays = Array.from(dayMap.values()).sort((a, b) =>
+        a.snapshotMonth.localeCompare(b.snapshotMonth)
+      );
+      if (dailyRange === '7D') return sortedDays.slice(-7);
+      if (dailyRange === '30D') return sortedDays.slice(-30);
+      if (dailyRange === '90D') return sortedDays.slice(-90);
+      if (dailyRange === '1Y') return sortedDays.slice(-365);
+      return sortedDays;
+    }
+
     const sorted = Array.from(map.values()).sort((a, b) => a.snapshotMonth.localeCompare(b.snapshotMonth));
     if (range === '6M') return sorted.slice(-6);
     if (range === '1Y') return sorted.slice(-12);
     if (range === '3Y') return sorted.slice(-36);
     return sorted;
-  }, [snapshots, stats, holdings, members, safeFx, range, targetEqPct, targetIndOfEqPct, realEstateEquityINR]);
+  }, [snapshots, dailyRecords, cadence, dailyRange, stats, holdings, members, safeFx, range, targetEqPct, targetIndOfEqPct, realEstateEquityINR]);
 
   // Project series through the selected scope ('family' vs individual member)
   const scopedSeries = useMemo(() => {
@@ -1066,21 +1135,62 @@ export function WealthJourneyView({
               </div>
             )}
 
-            {/* Time Horizon Switcher */}
-            <div className="flex bg-slate-100 p-1 rounded-xl">
-              {(['6M', '1Y', '3Y', 'ALL'] as const).map((r) => (
+            {/* Cadence Switcher: Monthly vs Daily */}
+            {lens !== 'stockFund' && (
+              <div className="flex bg-slate-100 p-1 rounded-xl">
                 <button
-                  key={r}
                   type="button"
-                  onClick={() => setRange(r)}
+                  onClick={() => setCadence('monthly')}
                   className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all ${
-                    range === r ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'
+                    cadence === 'monthly' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500'
                   }`}
                 >
-                  {r}
+                  Monthly
                 </button>
-              ))}
-            </div>
+                <button
+                  type="button"
+                  onClick={() => setCadence('daily')}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all ${
+                    cadence === 'daily' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-500'
+                  }`}
+                >
+                  Daily{dailyRecords.length > 0 ? ` (${dailyRecords.length}d)` : ''}
+                </button>
+              </div>
+            )}
+
+            {/* Time Horizon Switcher */}
+            {cadence === 'daily' && lens !== 'stockFund' ? (
+              <div className="flex bg-slate-100 p-1 rounded-xl">
+                {(['7D', '30D', '90D', '1Y', 'ALL'] as const).map((r) => (
+                  <button
+                    key={r}
+                    type="button"
+                    onClick={() => setDailyRange(r)}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all ${
+                      dailyRange === r ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'
+                    }`}
+                  >
+                    {r}
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="flex bg-slate-100 p-1 rounded-xl">
+                {(['6M', '1Y', '3Y', 'ALL'] as const).map((r) => (
+                  <button
+                    key={r}
+                    type="button"
+                    onClick={() => setRange(r)}
+                    className={`px-2.5 py-1 rounded-lg text-xs font-bold transition-all ${
+                      range === r ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500'
+                    }`}
+                  >
+                    {r}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         </div>
 

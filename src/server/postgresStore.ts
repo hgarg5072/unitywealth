@@ -4,6 +4,7 @@ import {
   HoldingSnapshotBreakdown,
   RebalanceSnapshotMeta,
   WealthSnapshotRecord,
+  DailyWealthRecord,
   NotificationRecord,
   RealEstateProperty,
   HouseholdTaxPlanningBundle,
@@ -44,6 +45,7 @@ let lastPgError: string | null = null;
 
 // In-memory fallback maps ONLY populated when PostgreSQL is unavailable (local dev without DATABASE_URL)
 const fallbackSnapshots = new Map<string, Map<string, WealthSnapshotRecord>>();
+const fallbackDailyWealth = new Map<string, Map<string, DailyWealthRecord>>();
 const fallbackNotifications = new Map<string, NotificationRecord[]>();
 const fallbackStateKeys = new Map<string, any>();
 const fallbackRealEstate = new Map<string, RealEstateProperty[]>();
@@ -193,6 +195,23 @@ export async function initPostgresStore(): Promise<{
         activities JSONB NOT NULL DEFAULT '[]'::jsonb,
         updated_at BIGINT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS uw_daily_wealth (
+        household_id TEXT NOT NULL,
+        date_key TEXT NOT NULL,
+        total_net_worth_inr DOUBLE PRECISION NOT NULL,
+        equity_inr DOUBLE PRECISION NOT NULL DEFAULT 0,
+        debt_inr DOUBLE PRECISION NOT NULL DEFAULT 0,
+        indian_equity_inr DOUBLE PRECISION NOT NULL DEFAULT 0,
+        foreign_equity_inr DOUBLE PRECISION NOT NULL DEFAULT 0,
+        real_estate_equity_inr DOUBLE PRECISION NOT NULL DEFAULT 0,
+        fx_rate_inr DOUBLE PRECISION NOT NULL DEFAULT 84,
+        member_breakdown JSONB NOT NULL DEFAULT '[]'::jsonb,
+        updated_at BIGINT NOT NULL,
+        PRIMARY KEY (household_id, date_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_uw_daily_wealth_hh_date
+        ON uw_daily_wealth (household_id, date_key DESC);
 
       CREATE TABLE IF NOT EXISTS uw_app_state (
         state_key TEXT PRIMARY KEY,
@@ -678,6 +697,130 @@ export async function saveRewardsHubPg(
   );
 
   return merged;
+}
+
+export async function getDailyWealthPg(
+  householdId: string,
+  limitDays = 400
+): Promise<DailyWealthRecord[]> {
+  if (!householdId) return [];
+  if (!pgReady || !pool) {
+    const map = fallbackDailyWealth.get(householdId);
+    if (!map) return [];
+    return Array.from(map.values())
+      .sort((a, b) => a.dateKey.localeCompare(b.dateKey))
+      .slice(-limitDays);
+  }
+  try {
+    const res = await pool.query(
+      `SELECT household_id, date_key, total_net_worth_inr, equity_inr, debt_inr,
+              indian_equity_inr, foreign_equity_inr, real_estate_equity_inr,
+              fx_rate_inr, member_breakdown, updated_at
+       FROM uw_daily_wealth
+       WHERE household_id = $1
+       ORDER BY date_key DESC
+       LIMIT $2`,
+      [householdId, limitDays]
+    );
+    return res.rows
+      .map((r: any) => ({
+        householdId: r.household_id,
+        dateKey: r.date_key,
+        totalNetWorthINR: Number(r.total_net_worth_inr) || 0,
+        equityINR: Number(r.equity_inr) || 0,
+        debtINR: Number(r.debt_inr) || 0,
+        indianEquityINR: Number(r.indian_equity_inr) || 0,
+        foreignEquityINR: Number(r.foreign_equity_inr) || 0,
+        realEstateEquityINR: Number(r.real_estate_equity_inr) || 0,
+        fxRateINR: Number(r.fx_rate_inr) || FX_FALLBACK_RATE,
+        memberBreakdown: Array.isArray(r.member_breakdown) ? r.member_breakdown : [],
+        updatedAt: Number(r.updated_at) || Date.now()
+      }))
+      .reverse();
+  } catch (err: any) {
+    console.warn("[Postgres] getDailyWealthPg warning:", err.message);
+    return [];
+  }
+}
+
+export async function upsertDailyWealthPg(record: DailyWealthRecord): Promise<DailyWealthRecord> {
+  const clean: DailyWealthRecord = {
+    householdId: record.householdId,
+    dateKey: record.dateKey,
+    totalNetWorthINR: Math.round(Number(record.totalNetWorthINR) || 0),
+    equityINR: Math.round(Number(record.equityINR) || 0),
+    debtINR: Math.round(Number(record.debtINR) || 0),
+    indianEquityINR: Math.round(Number(record.indianEquityINR) || 0),
+    foreignEquityINR: Math.round(Number(record.foreignEquityINR) || 0),
+    realEstateEquityINR: Math.round(Number(record.realEstateEquityINR) || 0),
+    fxRateINR: Number(record.fxRateINR) || FX_FALLBACK_RATE,
+    memberBreakdown: Array.isArray(record.memberBreakdown) ? record.memberBreakdown : [],
+    updatedAt: Date.now()
+  };
+
+  if (!clean.householdId || !/^\d{4}-\d{2}-\d{2}$/.test(clean.dateKey)) return clean;
+
+  if (!pgReady || !pool) {
+    if (!fallbackDailyWealth.has(clean.householdId)) {
+      fallbackDailyWealth.set(clean.householdId, new Map());
+    }
+    fallbackDailyWealth.get(clean.householdId)!.set(clean.dateKey, clean);
+    return clean;
+  }
+
+  await pool.query(
+    `INSERT INTO uw_daily_wealth (
+       household_id, date_key, total_net_worth_inr, equity_inr, debt_inr,
+       indian_equity_inr, foreign_equity_inr, real_estate_equity_inr,
+       fx_rate_inr, member_breakdown, updated_at
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11)
+     ON CONFLICT (household_id, date_key)
+     DO UPDATE SET
+       total_net_worth_inr = EXCLUDED.total_net_worth_inr,
+       equity_inr = EXCLUDED.equity_inr,
+       debt_inr = EXCLUDED.debt_inr,
+       indian_equity_inr = EXCLUDED.indian_equity_inr,
+       foreign_equity_inr = EXCLUDED.foreign_equity_inr,
+       real_estate_equity_inr = EXCLUDED.real_estate_equity_inr,
+       fx_rate_inr = EXCLUDED.fx_rate_inr,
+       member_breakdown = EXCLUDED.member_breakdown,
+       updated_at = EXCLUDED.updated_at`,
+    [
+      clean.householdId,
+      clean.dateKey,
+      clean.totalNetWorthINR,
+      clean.equityINR,
+      clean.debtINR,
+      clean.indianEquityINR,
+      clean.foreignEquityINR,
+      clean.realEstateEquityINR,
+      clean.fxRateINR,
+      JSON.stringify(clean.memberBreakdown),
+      clean.updatedAt
+    ]
+  );
+
+  return clean;
+}
+
+export async function listStateKeysByPrefixPg(prefix: string): Promise<{ key: string; payload: any }[]> {
+  if (!pgReady || !pool) {
+    const out: { key: string; payload: any }[] = [];
+    for (const [k, v] of fallbackStateKeys.entries()) {
+      if (k.startsWith(prefix)) out.push({ key: k, payload: v });
+    }
+    return out;
+  }
+  try {
+    const res = await pool.query(
+      "SELECT state_key, payload FROM uw_app_state WHERE state_key LIKE $1 LIMIT 100",
+      [`${prefix}%`]
+    );
+    return res.rows.map((r: any) => ({ key: r.state_key, payload: r.payload }));
+  } catch (err: any) {
+    console.warn("[Postgres] listStateKeysByPrefixPg warning:", err.message);
+    return [];
+  }
 }
 
 export async function addNotificationPg(

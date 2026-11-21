@@ -58,7 +58,7 @@ const FAMILY_PRESETS: {
 }[] = [
   { id: 'epf', label: 'EPF / PPF', ticker: 'EPF-PPF', assetClass: 'Debt', currency: 'INR', provider: 'EPFO / Bank', hint: 'Provident Fund balance' },
   { id: 'fd', label: 'Bank Fixed Deposit', ticker: 'BANK-FD', assetClass: 'Debt', currency: 'INR', provider: 'Bank FD', hint: 'Total FD principal + interest' },
-  { id: 'sgb', label: 'Gold / SGB', ticker: 'GOLD-SGB', assetClass: 'Equity', currency: 'INR', provider: 'SGB / Gold', hint: 'Sovereign Gold Bonds or Gold value' },
+  { id: 'sgb', label: '24K Gold / SGB (Live)', ticker: 'GOLD24K.IN', assetClass: 'Equity', currency: 'INR', provider: '24K Gold / SGB', hint: 'Tracks live India 24K ₹/gram rate' },
   { id: 'nps', label: 'NPS Tier I/II', ticker: 'NPS-CORPUS', assetClass: 'Mutual Fund', currency: 'INR', provider: 'NPS', hint: 'National Pension System corpus' },
   { id: 'cash_inr', label: 'Savings / Cash (₹)', ticker: 'CASH-INR', assetClass: 'Debt', currency: 'INR', provider: 'Bank Sweep', hint: 'Emergency fund / liquid cash' },
   { id: 'us_cash', label: 'US Treasury / Cash ($)', ticker: 'US-CASH', assetClass: 'Debt', currency: 'USD', provider: 'US Broker', hint: 'USD money market / HYSA' }
@@ -101,6 +101,15 @@ export function QuickAddModal({
   const [presetTitle, setPresetTitle] = useState('EPF / PPF Corpus');
   const [presetAmount, setPresetAmount] = useState('');
   const [presetInst, setPresetInst] = useState('EPFO / Bank');
+  const [goldEntryMode, setGoldEntryMode] = useState<'grams' | 'fixed'>('grams');
+  const [goldGramsInput, setGoldGramsInput] = useState('');
+  const [liveGold24k, setLiveGold24k] = useState<{
+    perGramINR: number;
+    per10GramINR: number;
+    changePct: number;
+    source: string;
+    loading: boolean;
+  }>({ perGramINR: 0, per10GramINR: 0, changePct: 0, source: '', loading: false });
 
   // Upload Mode State
   const [brokerHint, setBrokerHint] = useState('');
@@ -251,15 +260,67 @@ export function QuickAddModal({
     }
   };
 
+  useEffect(() => {
+    if (!isOpen || mode !== 'preset' || selectedPresetId !== 'sgb') return;
+    if (liveGold24k.perGramINR > 0) return;
+    let active = true;
+    setLiveGold24k((prev) => ({ ...prev, loading: true }));
+    fetch('/api/gold-24k')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => {
+        if (active && d?.perGramINR > 0) {
+          setLiveGold24k({
+            perGramINR: Number(d.perGramINR),
+            per10GramINR: Number(d.per10GramINR || Math.round(d.perGramINR * 10)),
+            changePct: Number(d.changePct || 0),
+            source: String(d.source || 'Live'),
+            loading: false
+          });
+        } else if (active) {
+          setLiveGold24k((prev) => ({ ...prev, loading: false }));
+        }
+      })
+      .catch(() => {
+        if (active) setLiveGold24k((prev) => ({ ...prev, loading: false }));
+      });
+    return () => {
+      active = false;
+    };
+  }, [isOpen, mode, selectedPresetId, liveGold24k.perGramINR]);
+
   const submitPresetEntry = async () => {
     const preset = FAMILY_PRESETS.find((p) => p.id === selectedPresetId) || FAMILY_PRESETS[0];
+    if (selectedPresetId === 'sgb' && goldEntryMode === 'grams') {
+      const grams = parseFloat(goldGramsInput) || 0;
+      const perGram = liveGold24k.perGramINR || 0;
+      if (!(grams > 0) || !(perGram > 0)) return;
+      setIsSubmitting(true);
+      try {
+        await onSaveHolding({
+          ownerId,
+          ticker: 'GOLD24K.IN',
+          originalName: presetTitle.trim() || '24K Gold (Live)',
+          quantity: grams,
+          currentPrice: perGram,
+          currency: 'INR',
+          assetClass: 'Equity',
+          provider: presetInst.trim() || '24K Gold / SGB',
+          source: 'Live'
+        });
+        onClose();
+      } finally {
+        setIsSubmitting(false);
+      }
+      return;
+    }
+
     const amt = parseFloat(presetAmount) || 0;
     if (!(amt > 0)) return;
     setIsSubmitting(true);
     try {
       await onSaveHolding({
         ownerId,
-        ticker: preset.ticker,
+        ticker: selectedPresetId === 'sgb' ? 'GOLD-SGB' : preset.ticker,
         originalName: presetTitle.trim() || preset.label,
         quantity: 1,
         currentPrice: amt,
@@ -653,24 +714,103 @@ export function QuickAddModal({
                 </div>
               </div>
 
-              <div>
-                <label className="block text-xs font-bold text-slate-500 uppercase mb-1">
-                  Current Total Value ({FAMILY_PRESETS.find((p) => p.id === selectedPresetId)?.currency || 'INR'})
-                </label>
-                <input
-                  type="number"
-                  aria-label="Current Total Value"
-                  step="any"
-                  value={presetAmount}
-                  onChange={(e) => setPresetAmount(e.target.value)}
-                  placeholder="Enter total current value (e.g. 1500000)"
-                  className="w-full px-3.5 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm font-bold"
-                />
-              </div>
+              {selectedPresetId === 'sgb' ? (
+                <div className="space-y-3 p-3.5 rounded-2xl bg-amber-50/70 border border-amber-200">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <div className="text-xs font-black text-amber-900">
+                      {liveGold24k.loading
+                        ? 'Fetching live 24K India gold rate...'
+                        : liveGold24k.perGramINR > 0
+                        ? `Live 24K Gold (India): ₹${liveGold24k.perGramINR.toLocaleString('en-IN', { maximumFractionDigits: 0 })}/g (₹${liveGold24k.per10GramINR.toLocaleString('en-IN')}/10g)`
+                        : 'Live 24K Gold Rate'}
+                    </div>
+                    <div className="inline-flex rounded-lg bg-white border border-amber-200 p-0.5 text-[10px] font-bold">
+                      <button
+                        type="button"
+                        onClick={() => setGoldEntryMode('grams')}
+                        className={`px-2 py-1 rounded-md ${
+                          goldEntryMode === 'grams' ? 'bg-amber-600 text-white' : 'text-slate-600'
+                        }`}
+                      >
+                        By Grams (Live 24K)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setGoldEntryMode('fixed')}
+                        className={`px-2 py-1 rounded-md ${
+                          goldEntryMode === 'fixed' ? 'bg-amber-600 text-white' : 'text-slate-600'
+                        }`}
+                      >
+                        Fixed ₹
+                      </button>
+                    </div>
+                  </div>
+
+                  {goldEntryMode === 'grams' ? (
+                    <div className="space-y-2">
+                      <label className="block text-xs font-bold text-amber-900 uppercase">
+                        Gold Weight in Grams (auto-updates daily with live 24K price)
+                      </label>
+                      <input
+                        type="number"
+                        aria-label="Gold weight in grams"
+                        step="any"
+                        value={goldGramsInput}
+                        onChange={(e) => setGoldGramsInput(e.target.value)}
+                        placeholder="e.g. 50 or 100 grams"
+                        className="w-full px-3.5 py-3 bg-white border border-amber-200 rounded-xl text-sm font-bold"
+                      />
+                      {parseFloat(goldGramsInput) > 0 && liveGold24k.perGramINR > 0 && (
+                        <div className="text-xs font-bold text-emerald-700">
+                          Live Value: ₹
+                          {Math.round(parseFloat(goldGramsInput) * liveGold24k.perGramINR).toLocaleString('en-IN')}{' '}
+                          ({parseFloat(goldGramsInput)}g × ₹
+                          {liveGold24k.perGramINR.toLocaleString('en-IN', { maximumFractionDigits: 0 })}/g)
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div>
+                      <label className="block text-xs font-bold text-slate-500 uppercase mb-1">
+                        Fixed Total Value (INR)
+                      </label>
+                      <input
+                        type="number"
+                        aria-label="Current Total Value"
+                        step="any"
+                        value={presetAmount}
+                        onChange={(e) => setPresetAmount(e.target.value)}
+                        placeholder="Enter fixed value (e.g. 500000)"
+                        className="w-full px-3.5 py-3 bg-white border border-slate-200 rounded-xl text-sm font-bold"
+                      />
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 uppercase mb-1">
+                    Current Total Value ({FAMILY_PRESETS.find((p) => p.id === selectedPresetId)?.currency || 'INR'})
+                  </label>
+                  <input
+                    type="number"
+                    aria-label="Current Total Value"
+                    step="any"
+                    value={presetAmount}
+                    onChange={(e) => setPresetAmount(e.target.value)}
+                    placeholder="Enter total current value (e.g. 1500000)"
+                    className="w-full px-3.5 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm font-bold"
+                  />
+                </div>
+              )}
 
               <button
                 type="button"
-                disabled={isSubmitting || !(parseFloat(presetAmount) > 0)}
+                disabled={
+                  isSubmitting ||
+                  (selectedPresetId === 'sgb' && goldEntryMode === 'grams'
+                    ? !(parseFloat(goldGramsInput) > 0 && liveGold24k.perGramINR > 0)
+                    : !(parseFloat(presetAmount) > 0))
+                }
                 onClick={submitPresetEntry}
                 className="w-full py-3.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-xl font-bold text-sm shadow-md transition-all"
               >
