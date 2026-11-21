@@ -575,9 +575,118 @@ export function CardsMilesView({
         loungeNotes: preset?.loungeNotes,
         updatedAt: Date.now()
       };
+      const entry: PointsActivityEntry = {
+        id: `act_re_${Date.now()}`,
+        date: today,
+        type: 'real_estate_sync',
+        fromLabel: methodName,
+        toAccountId: created.id,
+        toLabel: created.cardName,
+        pointsIn: Math.round(totalPoints),
+        estimatedValueINR: Math.round(totalPoints * created.pointValueINR),
+        notes: `Synced from Real Estate swipes (${methodName})`
+      };
       await persistPatch(
-        { creditCards: [...bundle.creditCards, created] },
+        {
+          creditCards: [...bundle.creditCards, created],
+          activities: [entry, ...(bundle.activities || [])]
+        },
         `Created ${created.cardName} with ${Math.round(totalPoints).toLocaleString('en-IN')} pts from Real Estate!`
+      );
+    }
+  };
+
+  const handleUndoActivity = async (act: PointsActivityEntry) => {
+    let nextCards = [...bundle.creditCards];
+    let nextProgs = [...bundle.loyaltyPrograms];
+
+    if (act.type === 'real_estate_sync' && act.toAccountId) {
+      const target = nextCards.find((c) => c.id === act.toAccountId);
+      if (target) {
+        const remaining = Math.max(0, target.pointsBalance - (act.pointsIn || 0));
+        if (target.id.startsWith('cc_re_') && remaining <= 0) {
+          nextCards = nextCards.filter((c) => c.id !== target.id);
+        } else {
+          nextCards = nextCards.map((c) =>
+            c.id === target.id ? { ...c, pointsBalance: remaining, updatedAt: Date.now() } : c
+          );
+        }
+      }
+    } else if (act.type === 'transfer') {
+      if (act.fromAccountId && act.pointsOut) {
+        nextCards = nextCards.map((c) =>
+          c.id === act.fromAccountId
+            ? {
+                ...c,
+                pointsBalance: c.pointsBalance + (act.pointsOut || 0),
+                transferCapUsed: Math.max(0, (c.transferCapUsed || 0) - (act.pointsOut || 0)),
+                updatedAt: Date.now()
+              }
+            : c
+        );
+      }
+      if (act.toAccountId && act.pointsIn) {
+        nextProgs = nextProgs.map((p) =>
+          p.id === act.toAccountId
+            ? {
+                ...p,
+                pointsBalance: Math.max(0, p.pointsBalance - (act.pointsIn || 0)),
+                updatedAt: Date.now()
+              }
+            : p
+        );
+      }
+    }
+
+    const nextActivities = (bundle.activities || []).filter((a) => a.id !== act.id);
+    await persistPatch(
+      { creditCards: nextCards, loyaltyPrograms: nextProgs, activities: nextActivities },
+      `Undid ${act.type === 'real_estate_sync' ? 'Real Estate sync' : 'transfer'} for ${act.toLabel || 'account'}.`
+    );
+  };
+
+  const handleUndoRealEstateCardRow = async (methodName: string, totalPoints: number) => {
+    const methodLow = methodName.toLowerCase();
+    // 1. Check if there is a logged real_estate_sync activity for this method
+    const matchingAct = (bundle.activities || []).find(
+      (a) =>
+        a.type === 'real_estate_sync' &&
+        ((a.fromLabel || '').toLowerCase() === methodLow ||
+          (a.notes || '').toLowerCase().includes(`(${methodLow})`) ||
+          (a.toLabel || '').toLowerCase().includes(methodLow))
+    );
+    if (matchingAct) {
+      await handleUndoActivity(matchingAct);
+      return;
+    }
+    // 2. Fallback: remove an auto-created cc_re_* card matching this methodName (synced before activity logging)
+    const autoCard = bundle.creditCards.find(
+      (c) =>
+        c.id.startsWith('cc_re_') &&
+        (c.cardName.toLowerCase().includes(methodLow) || methodLow.includes(c.cardName.toLowerCase()))
+    );
+    if (autoCard) {
+      await persistPatch(
+        { creditCards: bundle.creditCards.filter((c) => c.id !== autoCard.id) },
+        `Removed synced card ${autoCard.cardName}.`
+      );
+      return;
+    }
+    // 3. Fallback: subtract synced points from matching card
+    const matchCard = bundle.creditCards.find(
+      (c) =>
+        c.cardName.toLowerCase().includes(methodLow) || methodLow.includes(c.cardName.toLowerCase())
+    );
+    if (matchCard) {
+      await persistPatch(
+        {
+          creditCards: bundle.creditCards.map((c) =>
+            c.id === matchCard.id
+              ? { ...c, pointsBalance: Math.max(0, c.pointsBalance - Math.round(totalPoints)), updatedAt: Date.now() }
+              : c
+          )
+        },
+        `Subtracted ${Math.round(totalPoints).toLocaleString('en-IN')} pts from ${matchCard.cardName}.`
       );
     }
   };
@@ -631,7 +740,7 @@ export function CardsMilesView({
             onClick={() => openProgramEditor()}
             className="px-3 py-1.5 rounded-xl bg-indigo-50 hover:bg-indigo-100 text-indigo-700 text-xs font-bold inline-flex items-center gap-1.5"
           >
-            <Plus size={13} /> Add Hotel / Airline
+            <Plus size={13} /> Add Loyalty Program
           </button>
         </div>
       </div>
@@ -781,7 +890,7 @@ export function CardsMilesView({
                   onClick={() => openProgramEditor()}
                   className="px-4 py-2.5 rounded-xl bg-indigo-600 text-white text-xs font-bold inline-flex items-center gap-1.5"
                 >
-                  <Plane size={14} /> Add Marriott / Accor / Airline
+                  <Plane size={14} /> Add Loyalty Program
                 </button>
                 {realEstateCardPoints.length > 0 && (
                   <button
@@ -1460,6 +1569,20 @@ export function CardsMilesView({
                           </button>
                           <button
                             type="button"
+                            title="Delete card"
+                            aria-label={`Delete ${c.cardName}`}
+                            onClick={() =>
+                              persistPatch(
+                                { creditCards: bundle.creditCards.filter((item) => item.id !== c.id) },
+                                `Removed ${c.cardName}`
+                              )
+                            }
+                            className="p-1.5 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50"
+                          >
+                            <Trash size={13} />
+                          </button>
+                          <button
+                            type="button"
                             onClick={() => setExpandedCards((prev) => ({ ...prev, [c.id]: !prev[c.id] }))}
                             className="p-1 text-slate-400"
                             aria-label="Toggle card details"
@@ -1809,7 +1932,7 @@ export function CardsMilesView({
 
           {visiblePrograms.length === 0 ? (
             <div className="bg-white p-8 rounded-2xl border border-slate-200 text-center text-xs text-slate-500">
-              No hotel or airline accounts added yet. Click <strong>+ Add Hotel / Airline</strong> above to add Marriott Bonvoy, Accor ALL, KrisFlyer, Avios, and more.
+              No hotel or airline accounts added yet. Click <strong>+ Add Loyalty Program</strong> above to track your hotels, airlines, miles, and vouchers.
             </div>
           ) : (
             <div className="space-y-3">
@@ -2296,8 +2419,8 @@ export function CardsMilesView({
                 <div className="text-[10px] font-black text-slate-400 uppercase tracking-wider">
                   Recent Transfers &amp; Sync Log
                 </div>
-                <div className="divide-y divide-slate-100 max-h-52 overflow-y-auto">
-                  {bundle.activities.slice(0, 10).map((act) => (
+                <div className="divide-y divide-slate-100 max-h-60 overflow-y-auto">
+                  {bundle.activities.slice(0, 15).map((act) => (
                     <div key={act.id} className="py-2 flex items-center justify-between gap-2 text-xs">
                       <div className="min-w-0">
                         <span className="font-mono text-[10px] text-slate-400 mr-2">{act.date}</span>
@@ -2311,9 +2434,35 @@ export function CardsMilesView({
                           </span>
                         )}
                       </div>
-                      <span className="font-mono font-bold text-emerald-700 shrink-0">
-                        +{Math.round(act.pointsIn || 0).toLocaleString('en-IN')} pts
-                      </span>
+                      <div className="flex items-center gap-2 shrink-0">
+                        <span className="font-mono font-bold text-emerald-700">
+                          +{Math.round(act.pointsIn || 0).toLocaleString('en-IN')} pts
+                        </span>
+                        <button
+                          type="button"
+                          disabled={isBusy}
+                          onClick={() => handleUndoActivity(act)}
+                          title="Undo this action and revert point balances"
+                          className="px-2 py-0.5 rounded-md bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-700 text-[10px] font-bold"
+                        >
+                          Undo
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isBusy}
+                          aria-label="Delete log entry only"
+                          title="Delete log entry without changing balances"
+                          onClick={() =>
+                            persistPatch(
+                              { activities: (bundle.activities || []).filter((a) => a.id !== act.id) },
+                              'Removed activity log entry.'
+                            )
+                          }
+                          className="p-1 text-slate-400 hover:text-rose-600"
+                        >
+                          <Trash size={12} />
+                        </button>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -2328,7 +2477,7 @@ export function CardsMilesView({
                 <Award size={14} className="text-emerald-600" /> Real Estate Swipe Points Bridge
               </h3>
               <p className="text-xs text-slate-500 mt-0.5">
-                Points already logged from your Real Estate card swipes. Click <strong>Sync</strong> to add them to a matching card balance.
+                Points already logged from your Real Estate card swipes. Sync them into a card balance or undo a sync anytime.
               </p>
             </div>
 
@@ -2338,24 +2487,60 @@ export function CardsMilesView({
               </p>
             ) : (
               <div className="divide-y divide-slate-100">
-                {realEstateCardPoints.map((row) => (
-                  <div key={row.paymentMethod} className="py-2.5 flex items-center justify-between gap-2 text-xs">
-                    <div>
-                      <div className="font-bold text-slate-800">{row.paymentMethod}</div>
-                      <div className="text-[11px] text-slate-500">
-                        {Math.round(row.totalPoints).toLocaleString('en-IN')} pts across {row.swipeCount} swipe(s)
+                {realEstateCardPoints.map((row) => {
+                  const mLow = row.paymentMethod.toLowerCase();
+                  const alreadySynced =
+                    (bundle.activities || []).some(
+                      (a) =>
+                        a.type === 'real_estate_sync' &&
+                        ((a.fromLabel || '').toLowerCase() === mLow ||
+                          (a.notes || '').toLowerCase().includes(`(${mLow})`) ||
+                          (a.toLabel || '').toLowerCase().includes(mLow))
+                    ) ||
+                    bundle.creditCards.some(
+                      (c) =>
+                        c.id.startsWith('cc_re_') &&
+                        (c.cardName.toLowerCase().includes(mLow) || mLow.includes(c.cardName.toLowerCase()))
+                    );
+
+                  return (
+                    <div key={row.paymentMethod} className="py-2.5 flex items-center justify-between gap-2 text-xs">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="font-bold text-slate-800">{row.paymentMethod}</span>
+                          {alreadySynced && (
+                            <span className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 text-[9px] font-black uppercase">
+                              Synced
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-slate-500">
+                          {Math.round(row.totalPoints).toLocaleString('en-IN')} pts across {row.swipeCount} swipe(s)
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        {alreadySynced && (
+                          <button
+                            type="button"
+                            disabled={isBusy}
+                            onClick={() => handleUndoRealEstateCardRow(row.paymentMethod, row.totalPoints)}
+                            className="px-2.5 py-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 border border-rose-200 text-rose-700 text-[11px] font-bold inline-flex items-center gap-1"
+                          >
+                            <Trash size={11} /> Undo Sync
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          disabled={isBusy}
+                          onClick={() => handleSyncRealEstateCard(row.paymentMethod, row.totalPoints)}
+                          className="px-3 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 text-[11px] font-bold"
+                        >
+                          + Sync to Card
+                        </button>
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      disabled={isBusy}
-                      onClick={() => handleSyncRealEstateCard(row.paymentMethod, row.totalPoints)}
-                      className="px-3 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 text-[11px] font-bold shrink-0"
-                    >
-                      + Sync to Card
-                    </button>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
           </div>
